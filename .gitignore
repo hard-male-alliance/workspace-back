@@ -1,0 +1,13 @@
+# @brief 忽略本地生成物 / Ignore local build artefacts.
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+coverage.xml
+htmlcov/
+.coverage
+artifacts/
+*.log

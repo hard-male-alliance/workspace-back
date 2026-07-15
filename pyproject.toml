@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-job-workspace-backend"
+version = "0.1.0"
+description = "AI 赋能求职 Workspace 的模块化单体后端"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { file = "LICENSE" }
+authors = [{ name = "AI Job Workspace" }]
+dependencies = [
+  "alembic>=1.16,<2",
+  "asyncpg>=0.30,<1",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "json5>=0.12,<1",
+  "jsonschema>=4.23,<5",
+  "langchain-core>=1.0,<2",
+  "pgvector>=0.3,<1",
+  "psycopg[binary]>=3.2,<4",
+  "pydantic>=2.11,<3",
+  "sqlalchemy[asyncio]>=2.0.40,<3",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+gui = ["PyQt6>=6.8,<7"]
+dev = [
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.11,<1",
+]
+
+[project.scripts]
+workspace-backend = "backend.__main__:main"
+workspace-dashboard = "dashboard.__main__:main"
+workspace-dashboard-gui = "dashboard.gui:main"
+workspace-dbctl = "dbctl.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/backend", "src/dashboard", "src/dbctl", "src/workspace_shared"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+# 中文 Doxygen 文档必须保留中文标点；RUF001/RUF002 对其报错没有质量收益。
+ignore = ["E501", "RUF001", "RUF002"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unused_ignores = true
+packages = ["backend", "dashboard", "dbctl", "workspace_shared"]
+
+[[tool.mypy.overrides]]
+module = ["jsonschema"]
+ignore_missing_imports = true

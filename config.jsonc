@@ -1,0 +1,129 @@
+// @brief 本地开发的无密钥配置 / Secret-free local development configuration.
+// @note 凭证只通过环境变量提供；此文件可安全提交。
+{
+  "environment": "development",
+  "workspace": {
+    "default_actor_id": "usr_local_demo",
+    "default_workspace_id": "ws_local_demo",
+    "default_resource_owner_id": "usr_local_demo"
+  },
+  "network": {
+    "bind_host": "127.0.0.1",
+    "bind_port": 8000,
+    "public_base_url": "http://127.0.0.1:8000",
+    // trusted_proxy_hmac 只接受这些实际 TCP 对端的签名断言；不读取 X-Forwarded-For。
+    "trusted_proxy_cidrs": ["127.0.0.1/32"],
+    "outbound_proxy_url": null,
+    "connect_timeout_ms": 3000,
+    "read_timeout_ms": 15000
+  },
+  "database": {
+    "mode": "memory",
+    "application_dsn_env": "AIWS_APP_DATABASE_DSN",
+    "migrator_dsn_env": "AIWS_MIGRATOR_DATABASE_DSN",
+    "admin_dsn_env": "AIWS_ADMIN_DATABASE_DSN",
+    "dashboard_dsn_env": "AIWS_DASHBOARD_DATABASE_DSN",
+    "pool_size": 10,
+    "max_overflow": 10,
+    "connect_timeout_ms": 3000,
+    "statement_timeout_ms": 30000,
+    "lock_timeout_ms": 3000
+  },
+  "runtime": {
+    "shutdown_grace_ms": 10000,
+    "request_timeout_ms": 30000,
+    "llm_concurrency": 8,
+    "render_concurrency": 2,
+    "knowledge_concurrency": 2,
+    "interview_concurrency": 16,
+    "job_queue_capacity": 256,
+    "sse_heartbeat_ms": 15000
+  },
+  "resume_rendering": {
+    "adapter": "mock",
+    "xelatex_command": "xelatex",
+    "timeout_ms": 30000,
+    "max_input_bytes": 1048576,
+    "max_output_bytes": 10485760,
+    "memory_limit_bytes": 536870912,
+    "allowed_font_directories": [],
+    "artifact_directory": "artifacts"
+  },
+  "ai": {
+    "provider": "mock",
+    "model": "mock-deterministic-v1",
+    "data_region": "private_deployment",
+    "fallback_providers": [],
+    "api_key_env": "AIWS_LLM_API_KEY",
+    "base_url": null,
+    "embedding_provider": "mock",
+    "embedding_model": "mock-embedding-1024",
+    "embedding_model_revision": "v1",
+    "embedding_dimension": 1024,
+    "embedding_distance_metric": "cosine",
+    "embedding_normalization": "l2",
+    "provider_rate_limit": {
+      "max_concurrent_requests": 4,
+      "requests_per_minute": 60,
+      "acquire_timeout_ms": 1000
+    },
+    "metering": {
+      "input_cost_microusd_per_million_tokens": 0,
+      "output_cost_microusd_per_million_tokens": 0
+    }
+  },
+  "observability": {
+    "enabled": true,
+    "queue_capacity": 2048,
+    "batch_size": 100,
+    "flush_interval_ms": 1000,
+    "retention_days": 30,
+    "drop_policy": "drop_newest"
+  },
+  "logging": {
+    "level": "INFO",
+    "persist_structured_events": true
+  },
+  "security": {
+    "identity_mode": "development_mock",
+    "trusted_proxy_hmac_secret_env": "AIWS_TRUSTED_PROXY_HMAC_SECRET",
+    "trusted_proxy_max_clock_skew_seconds": 300
+  },
+  "operator_interface": {
+    "api_bind_host": "127.0.0.1",
+    "api_bind_port": 8010,
+    "default_window_minutes": 60
+  },
+  "dashboard": {
+    "enabled": true,
+    "api": {"host": "127.0.0.1", "port": 8010, "prefix": "/dashboard/v1"},
+    "query": {"default_window_minutes": 60, "max_window_hours": 24, "max_samples": 5000, "timeout_ms": 3000},
+    "observability_view": "observability.dashboard_metric_samples",
+    "access": {
+      "mode": "mock",
+      "operator_id": "workspace_dashboard",
+      "token_env": "AIWS_DASHBOARD_OPERATOR_TOKEN",
+      "token_header": "X-Dashboard-Operator-Token"
+    },
+    "health": {
+      "warning_error_rate": 0.01,
+      "critical_error_rate": 0.05,
+      "warning_latency_ms": 1000,
+      "critical_latency_ms": 3000,
+      "warning_saturation": 0.7,
+      "critical_saturation": 0.9
+    }
+  },
+  "database_administration": {
+    "database_name": "ai_job_workspace",
+    "owner_role": "workspace_owner",
+    "migrator_role": "workspace_migrator",
+    "app_role": "workspace_app",
+    "dashboard_role": "workspace_dashboard",
+    "schemas": ["identity", "resume", "agent", "interview", "knowledge", "observability"],
+    "observability_schema": "observability",
+    "local_postgres_user": "postgres",
+    "maintenance_database": "postgres",
+    "password_env_by_role": {}
+  }
+}
