@@ -15,6 +15,7 @@ from backend.application.services import (
     InterviewApplicationService,
     KnowledgeApplicationService,
     ResumeApplicationService,
+    ResumeProposalApplicationService,
     ScopedKeyLocks,
     ServiceDependencies,
 )
@@ -25,6 +26,7 @@ from backend.domain.ports import (
     InterviewRepository,
     JobRepository,
     KnowledgeRepository,
+    ResumeProposalRepository,
     ResumeRepository,
     TelemetryWriter,
 )
@@ -59,6 +61,7 @@ class WorkspaceRuntimeRepository(
     KnowledgeRepository,
     JobRepository,
     ArtifactRepository,
+    ResumeProposalRepository,
     Protocol,
 ):
     """@brief 后端运行时需要的聚合 Repository 交集 / Aggregate repository intersection needed at runtime.
@@ -77,6 +80,7 @@ class BackendContainer:
     contracts: ContractValidator
     idempotency: IdempotencyRegistry | PostgresIdempotencyRegistry
     resume: ResumeApplicationService
+    proposals: ResumeProposalApplicationService
     agent: AgentApplicationService
     interview: InterviewApplicationService
     knowledge: KnowledgeApplicationService
@@ -169,12 +173,14 @@ async def build_container(settings: BackendSettings, project_root: Path) -> Asyn
                 dependencies,
                 locks,
             )
+            proposals = ResumeProposalApplicationService(storage, resume, knowledge, locks)
             container = BackendContainer(
                 settings=settings,
                 identity=identity,
                 contracts=ContractValidator(project_root / "contract" / "ai-job-workspace.contract.schema.json"),
                 idempotency=idempotency,
                 resume=resume,
+                proposals=proposals,
                 agent=AgentApplicationService(storage, provider, dependencies, locks),
                 interview=InterviewApplicationService(storage, storage, dependencies, locks),
                 knowledge=knowledge,

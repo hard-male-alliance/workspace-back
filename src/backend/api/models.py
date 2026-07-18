@@ -25,6 +25,18 @@ class MockResumeCreateRequest(MockContractAdapter):
     template_version: str = Field(default="1.0", min_length=1, max_length=128)
 
 
+class MockResumeProposalCreateRequest(MockContractAdapter):
+    """Temporary phase-one request for evidence-grounded Proposal generation."""
+
+    instruction: str = Field(min_length=1, max_length=4000)
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    source_ids: list[str] = Field(default_factory=list, max_length=100)
+    draft_text: str | None = Field(default=None, min_length=1, max_length=200000)
+    target: dict[str, Any] = Field(default_factory=lambda: {"entity_type": "profile"})
+    field_path: list[str] = Field(default_factory=lambda: ["summary"], min_length=1, max_length=20)
+    render_hint: Literal["none", "preview", "final"] = "preview"
+
+
 class MockConversationCreateRequest(MockContractAdapter):
     """@brief Conversation 创建的 mock 请求 / Mock request for conversation creation."""
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import secrets
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -17,7 +18,18 @@ from backend.config import AISettings, NetworkSettings
 from backend.domain.agent import AgentRunRecord, AgentRunStatus, ConversationRecord, MessageRecord
 from backend.domain.common import DomainError, Job, Problem, iso_timestamp, utc_now
 from backend.domain.interview import InterviewSessionRecord, InterviewStatus
-from backend.domain.knowledge import EmbeddingSpace, KnowledgeChunk, KnowledgeSourceRecord
+from backend.domain.knowledge import (
+    EmbeddingSpace,
+    KnowledgeAgentVisibility,
+    KnowledgeChunk,
+    KnowledgeClassification,
+    KnowledgeContentType,
+    KnowledgeDocumentPart,
+    KnowledgeLifecycle,
+    KnowledgeSourceRecord,
+    KnowledgeSourceRole,
+    KnowledgeTrustLevel,
+)
 from backend.domain.ports import (
     AgentRepository,
     ArtifactRepository,
@@ -27,7 +39,13 @@ from backend.domain.ports import (
     ModelProvider,
     Renderer,
     ResumeKnowledgeBridge,
+    ResumeProposalRepository,
     ResumeRepository,
+)
+from backend.domain.proposal import (
+    ProposalCitation,
+    ResumeProposalOperation,
+    ResumeProposalRecord,
 )
 from backend.domain.resume import ResumeRecord, create_empty_document
 from backend.infrastructure.concurrency import BackpressureError, BoundedTaskSupervisor
@@ -376,7 +394,13 @@ class ResumeApplicationService:
             job_type="resume.render",
             created_at=utc_now(),
             request_id=request_id,
-            extensions={"resume_id": resume_id, "resume_revision": int(request["resume_revision"]), "artifacts": [], "diagnostics": []},
+            extensions={
+                "resume_id": resume_id,
+                "resume_revision": int(request["resume_revision"]),
+                "render_profile": str(request["mode"]),
+                "artifacts": [],
+                "diagnostics": [],
+            },
         )
         await self._jobs.create_job(scope, job)
         try:
@@ -494,11 +518,7 @@ class ResumeApplicationService:
 
     @staticmethod
     def _render_job_dict(job: Job) -> dict[str, Any]:
-        """@brief 构建 ResumeRenderJob 视图 / Build a ResumeRenderJob view.
-
-        @param job 基础 Job / Base job.
-        @return ResumeRenderJob / ResumeRenderJob.
-        """
+        """Build the public ResumeRenderJob view."""
         payload = job.as_dict()
         payload.update(
             {
@@ -510,6 +530,158 @@ class ResumeApplicationService:
         )
         return payload
 
+
+class ResumeProposalApplicationService:
+    """Create evidence-grounded proposals and apply only explicit human decisions."""
+
+    def __init__(
+        self,
+        repository: ResumeProposalRepository,
+        resumes: ResumeApplicationService,
+        knowledge: KnowledgeApplicationService,
+        locks: ScopedKeyLocks,
+    ) -> None:
+        self._repository = repository
+        self._resumes = resumes
+        self._knowledge = knowledge
+        self._locks = locks
+
+    async def create_mock_proposal(
+        self,
+        scope: ActorScope,
+        resume_id: str,
+        request: dict[str, Any],
+    ) -> ResumeProposalRecord:
+        """Create a deterministic phase-one AI Proposal from authorized evidence."""
+        resume = await self._resumes.get_resume(scope, resume_id)
+        evidence = await self._knowledge.proposal_evidence(
+            scope,
+            str(request["instruction"]),
+            list(request.get("source_ids", [])),
+        )
+        if not evidence:
+            raise DomainError(
+                Problem(
+                    "resume.proposal_evidence_required",
+                    422,
+                    "A factual Resume proposal requires retrievable personal knowledge evidence",
+                )
+            )
+        timestamp = utc_now()
+        operation_id = new_opaque_id("op")
+        draft_text = str(request.get("draft_text") or evidence[0]["text"])
+        _assert_numeric_claims_grounded(draft_text, evidence)
+        citations = tuple(
+            ProposalCitation(
+                source_id=str(item["source_id"]),
+                source_version_id=str(item["source_version_id"]),
+                chunk_id=str(item["chunk_id"]),
+                quote=str(item["text"])[:500],
+                trust_level=KnowledgeTrustLevel(str(item["trust_level"])),
+                metadata=deepcopy(item["metadata"]),
+            )
+            for item in evidence[:5]
+        )
+        operation = ResumeProposalOperation(
+            id=operation_id,
+            operation={
+                "operation_id": operation_id,
+                "op": "set_field",
+                "target": deepcopy(request.get("target") or {"entity_type": "profile"}),
+                "field_path": list(request.get("field_path") or ["summary"]),
+                "value": _rich_text(draft_text),
+            },
+            reason=str(request["instruction"]),
+            atomic_group_id=new_opaque_id("grp"),
+            citations=citations,
+            trust_level=(
+                KnowledgeTrustLevel.USER_PROVIDED
+                if request.get("draft_text")
+                else KnowledgeTrustLevel.GENERATED
+            ),
+        )
+        proposal = ResumeProposalRecord(
+            scope=scope,
+            id=new_opaque_id("prop"),
+            created_at=timestamp,
+            updated_at=timestamp,
+            resume_id=resume_id,
+            base_revision=resume.revision,
+            source_run_id=new_opaque_id("run"),
+            title=str(request.get("title") or "AI 简历修改建议"),
+            summary=f"基于 {len(citations)} 条知识证据生成，等待用户确认。",
+            operations=[operation],
+            expires_at=timestamp + timedelta(days=7),
+            render_hint={"mode": str(request.get("render_hint", "preview"))},
+        )
+        await self._repository.create_proposal(scope, proposal)
+        return proposal
+
+    async def get_proposal(
+        self, scope: ActorScope, proposal_id: str
+    ) -> ResumeProposalRecord:
+        """Read a proposal and persist expiration when its deadline has passed."""
+        record = await self._repository.get_proposal(scope, proposal_id)
+        if record is None:
+            raise DomainError(Problem("resume.proposal_not_found", 404, "Resume proposal was not found"))
+        if record.expire_if_needed():
+            await self._repository.save_proposal(scope, record)
+        return record
+
+    async def decide(
+        self,
+        scope: ActorScope,
+        proposal_id: str,
+        request: dict[str, Any],
+        request_id: str | None,
+    ) -> ResumeProposalRecord:
+        """Serialize decisions, reject stale bases, then apply selected atomic groups."""
+        async with self._locks.hold(scope, f"proposal:{proposal_id}"):
+            proposal = await self.get_proposal(scope, proposal_id)
+            selected = proposal.select_operations(
+                str(request["decision"]), list(request.get("operation_ids", []))
+            )
+            if str(request["decision"]) == "reject":
+                proposal.mark_decided("reject", [], scope.actor_id, request.get("comment"))
+                await self._repository.save_proposal(scope, proposal)
+                return proposal
+            resume = await self._resumes.get_resume(scope, proposal.resume_id)
+            if resume.revision != proposal.base_revision:
+                proposal.mark_conflicted()
+                await self._repository.save_proposal(scope, proposal)
+                raise DomainError(
+                    Problem(
+                        "resume.proposal_conflict",
+                        412,
+                        "Resume proposal is based on a stale revision",
+                        extensions={"current_revision": resume.revision},
+                    )
+                )
+            render_hint = "preview"
+            if isinstance(proposal.render_hint, dict):
+                candidate = proposal.render_hint.get("mode")
+                if candidate in {"none", "preview", "final"}:
+                    render_hint = str(candidate)
+            application_result = await self._resumes.apply_operations(
+                scope,
+                proposal.resume_id,
+                {
+                    "client_batch_id": f"batch_{proposal.id}_{proposal.revision}",
+                    "base_revision": proposal.base_revision,
+                    "conflict_strategy": "reject",
+                    "operations": [deepcopy(operation.operation) for operation in selected],
+                    "render_hint": render_hint,
+                    "extensions": {"aiws": {"proposal_id": proposal.id}},
+                },
+                resume.etag(),
+                request_id,
+            )
+            proposal.application_result = application_result
+            proposal.mark_decided(
+                str(request["decision"]), selected, scope.actor_id, request.get("comment")
+            )
+            await self._repository.save_proposal(scope, proposal)
+            return proposal
 
 class AgentApplicationService:
     """@brief 流式 Agent、tool approval 和持久化消息服务 / Streaming Agent, tool-approval, and persisted-message service."""
@@ -1361,8 +1533,21 @@ class KnowledgeApplicationService:
         source_id = _resume_knowledge_source_id(document, resume_id)
         timestamp = utc_now()
         config = _resume_source_config(resume_id)
-        content = _resume_source_content(document)
+        document_parts = _resume_source_parts(document)
+        content = "\n".join(part.text for part in document_parts)
         name = _resume_source_name(document)
+        classification = KnowledgeClassification(
+            source_role=KnowledgeSourceRole.RESUME_CURRENT,
+            content_type=KnowledgeContentType.GENERAL,
+            trust_level=KnowledgeTrustLevel.USER_PROVIDED,
+            lifecycle=KnowledgeLifecycle.CURRENT,
+            visibility=(
+                KnowledgeAgentVisibility.RESUME_ASSISTANT,
+                KnowledgeAgentVisibility.INTERVIEW_AGENT,
+                KnowledgeAgentVisibility.GENERAL_AGENT,
+            ),
+        )
+        source_metadata = {"resume_id": resume_id, "resume_revision": int(document.get("revision", 1))}
         async with self._locks.hold(scope, source_id):
             existing = await self._repository.get_source(scope, source_id)
             if existing is None:
@@ -1376,6 +1561,9 @@ class KnowledgeApplicationService:
                     config=config,
                     visibility=_default_visibility(),
                     mock_content=content,
+                    classification=classification,
+                    source_metadata=source_metadata,
+                    document_parts=document_parts,
                 )
                 await self._repository.create_source(scope, source)
             else:
@@ -1384,6 +1572,9 @@ class KnowledgeApplicationService:
                 source.name = name
                 source.config = config
                 source.mock_content = content
+                source.classification = classification
+                source.source_metadata = source_metadata
+                source.document_parts = document_parts
                 source.ingestion_status = "stale" if source.source_version_id is not None else "not_started"
                 source.updated_at = timestamp
                 source.revision += 1
@@ -1594,6 +1785,8 @@ class KnowledgeApplicationService:
                 source.id in excluded
                 or not source.enabled
                 or source.ingestion_status != "ready"
+                or source.classification.lifecycle is not KnowledgeLifecycle.CURRENT
+                or not _classification_allows(source.classification, agent_scope)
                 or not _is_allowed(source.visibility, agent_scope, "retrieve")
             ):
                 continue
@@ -1606,6 +1799,50 @@ class KnowledgeApplicationService:
         return [
             _search_result(score, source, chunk, include_quotes)
             for score, source, chunk in results[: int(request["top_k"])]
+        ]
+
+    async def proposal_evidence(
+        self,
+        scope: ActorScope,
+        query: str,
+        source_ids: list[str],
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Return current, Resume-authorized chunks for Proposal grounding."""
+        requested = set(source_ids)
+        query_tokens = set(query.lower().split())
+        ranked: list[tuple[float, KnowledgeSourceRecord, KnowledgeChunk]] = []
+        for source in await self._repository.list_sources(scope):
+            if (
+                (requested and source.id not in requested)
+                or not source.enabled
+                or source.ingestion_status != "ready"
+                or source.classification.lifecycle is not KnowledgeLifecycle.CURRENT
+                or not _classification_allows(source.classification, "resume_assistant")
+                or not _is_allowed(source.visibility, "resume_assistant", "retrieve")
+            ):
+                continue
+            for chunk in source.chunks:
+                score = _lexical_score(query_tokens, chunk.text)
+                ranked.append((score, source, chunk))
+        ranked.sort(key=lambda item: (item[0], -item[2].ordinal), reverse=True)
+        if any(score > 0 for score, _, _ in ranked):
+            ranked = [item for item in ranked if item[0] > 0]
+        return [
+            {
+                "source_id": source.id,
+                "source_version_id": chunk.source_version_id,
+                "chunk_id": chunk.id,
+                "text": chunk.text,
+                "trust_level": chunk.classification.trust_level.value,
+                "metadata": {
+                    "score": score,
+                    "classification": chunk.classification.as_dict(),
+                    **deepcopy(chunk.metadata),
+                },
+            }
+            for score, source, chunk in ranked[:limit]
+            if chunk.text.strip()
         ]
 
     async def _ingest(
@@ -1675,7 +1912,24 @@ class KnowledgeApplicationService:
                     )
                 )
             source_version_id = new_opaque_id("srcver")
-            parts = _chunk_text(source.mock_content)
+            semantic_parts = source.document_parts or [
+                KnowledgeDocumentPart(
+                    text=source.mock_content,
+                    content_type=source.classification.content_type,
+                    metadata=deepcopy(source.source_metadata),
+                )
+            ]
+            chunk_inputs: list[tuple[str, KnowledgeClassification, dict[str, Any]]] = []
+            for part in semantic_parts:
+                part_classification = KnowledgeClassification(
+                    source_role=source.classification.source_role,
+                    content_type=part.content_type,
+                    trust_level=source.classification.trust_level,
+                    lifecycle=source.classification.lifecycle,
+                    visibility=source.classification.visibility,
+                )
+                for text in _chunk_text(part.text):
+                    chunk_inputs.append((text, part_classification, deepcopy(part.metadata)))
             source.chunks = [
                 KnowledgeChunk(
                     new_opaque_id("chunk"),
@@ -1685,8 +1939,10 @@ class KnowledgeApplicationService:
                     index,
                     text,
                     _deterministic_vector(text, space.dimension),
+                    classification,
+                    metadata,
                 )
-                for index, text in enumerate(parts)
+                for index, (text, classification, metadata) in enumerate(chunk_inputs)
             ]
             source.source_version_id = source_version_id
             source.ingestion_status = "ready"
@@ -2178,6 +2434,124 @@ def _resume_source_content(document: dict[str, Any]) -> str:
     return "\n".join(fragments)
 
 
+def _resume_source_parts(document: dict[str, Any]) -> list[KnowledgeDocumentPart]:
+    """Extract semantic Resume chunks while preserving stable section/item provenance."""
+    revision = int(document.get("revision", 1))
+    parts: list[KnowledgeDocumentPart] = []
+
+    def append_part(
+        value: object,
+        content_type: KnowledgeContentType,
+        metadata: dict[str, Any],
+    ) -> None:
+        container = {"profile": value} if content_type is KnowledgeContentType.PROFILE else {"sections": [value]}
+        text = _resume_source_content(container)
+        if text:
+            parts.append(
+                KnowledgeDocumentPart(
+                    text=text,
+                    content_type=content_type,
+                    metadata={"resume_revision": revision, **metadata},
+                )
+            )
+
+    title = document.get("title")
+    if isinstance(title, str) and title.strip():
+        parts.append(
+            KnowledgeDocumentPart(
+                text=" ".join(title.split()),
+                content_type=KnowledgeContentType.PROFILE,
+                metadata={
+                    "resume_revision": revision,
+                    "entity_type": "document",
+                    "field": "title",
+                },
+            )
+        )
+    profile = document.get("profile")
+    if isinstance(profile, dict):
+        append_part(profile, KnowledgeContentType.PROFILE, {"entity_type": "profile"})
+    sections = document.get("sections")
+    if isinstance(sections, list):
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            section_id = section.get("section_id")
+            section_kind = str(section.get("kind", "general"))
+            content_type = _resume_content_type(section_kind)
+            section_without_items = {key: value for key, value in section.items() if key != "items"}
+            append_part(
+                section_without_items,
+                content_type,
+                {"entity_type": "section", "section_id": section_id, "section_kind": section_kind},
+            )
+            items = section.get("items")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("item_id") or item.get("id")
+                append_part(
+                    item,
+                    content_type,
+                    {
+                        "entity_type": "item",
+                        "section_id": section_id,
+                        "section_kind": section_kind,
+                        "item_id": item_id,
+                    },
+                )
+    if parts:
+        return parts
+    fallback = _resume_source_content(document)
+    return [
+        KnowledgeDocumentPart(
+            text=fallback,
+            content_type=KnowledgeContentType.GENERAL,
+            metadata={"resume_revision": revision, "entity_type": "document"},
+        )
+    ]
+
+
+def _resume_content_type(section_kind: str) -> KnowledgeContentType:
+    """Map contract section kinds into the stable knowledge taxonomy."""
+    return {
+        "education": KnowledgeContentType.EDUCATION,
+        "experience": KnowledgeContentType.WORK_EXPERIENCE,
+        "work_experience": KnowledgeContentType.WORK_EXPERIENCE,
+        "projects": KnowledgeContentType.PROJECT,
+        "project": KnowledgeContentType.PROJECT,
+        "skills": KnowledgeContentType.SKILL,
+        "skill": KnowledgeContentType.SKILL,
+        "achievements": KnowledgeContentType.ACHIEVEMENT,
+        "certifications": KnowledgeContentType.CERTIFICATE,
+        "publications": KnowledgeContentType.PUBLICATION,
+        "open_source": KnowledgeContentType.OPEN_SOURCE,
+        "summary": KnowledgeContentType.PROFILE,
+    }.get(section_kind, KnowledgeContentType.GENERAL)
+
+
+def _assert_numeric_claims_grounded(
+    draft_text: str, evidence: list[dict[str, Any]]
+) -> None:
+    """Reject measurable claims whose numbers do not occur in authorized evidence."""
+    claim_numbers = set(re.findall(r"(?<!\w)\d+(?:\.\d+)?%?", draft_text.lower()))
+    if not claim_numbers:
+        return
+    evidence_text = " ".join(str(item.get("text", "")) for item in evidence).lower()
+    unsupported = sorted(number for number in claim_numbers if number not in evidence_text)
+    if unsupported:
+        raise DomainError(
+            Problem(
+                "resume.proposal_unsupported_numeric_claim",
+                422,
+                "A numeric Resume claim is not present in the selected knowledge evidence",
+                extensions={"unsupported_numbers": unsupported},
+            )
+        )
+
+
 def _validate_resume_source(source: KnowledgeSourceRecord, resume_id: str) -> None:
     """@brief 验证 source ID 没有被重用给另一资源 / Verify that a source ID was not reused for another resource.
 
@@ -2266,6 +2640,20 @@ def _is_allowed(policy: dict[str, Any], agent_scope: str, operation: str) -> boo
     return policy.get("default_effect") == "allow"
 
 
+def _classification_allows(
+    classification: KnowledgeClassification, agent_scope: str
+) -> bool:
+    """Apply the taxonomy visibility gate in addition to the formal grant policy."""
+    requested = {
+        "resume_assistant": KnowledgeAgentVisibility.RESUME_ASSISTANT,
+        "interview_agent": KnowledgeAgentVisibility.INTERVIEW_AGENT,
+        "general_chat": KnowledgeAgentVisibility.GENERAL_AGENT,
+    }.get(agent_scope)
+    if requested is None:
+        return False
+    return requested in classification.visibility
+
+
 def _lexical_score(query_tokens: set[str], text: str) -> float:
     """@brief 为 mock retrieval 计算可重复词法分数 / Calculate a repeatable lexical score for mock retrieval.
 
@@ -2305,7 +2693,13 @@ def _search_result(
         },
         "text": chunk.text,
         "score": score,
-        "metadata": {"embedding_space_id": chunk.embedding_space_id, "ordinal": chunk.ordinal},
+        "metadata": {
+            "embedding_space_id": chunk.embedding_space_id,
+            "ordinal": chunk.ordinal,
+            "chunk_id": chunk.id,
+            "classification": chunk.classification.as_dict(),
+            **deepcopy(chunk.metadata),
+        },
     }
 
 

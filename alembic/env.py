@@ -99,8 +99,6 @@ def _run_sync_migrations(connection: Connection) -> None:
 
     @note 这是唯一允许 Alembic 同步 machinery 运行的边界。
     """
-    connection.execute(text(f"SET ROLE {_owner_role_identifier()}"))
-    connection.execute(text(f"CREATE SCHEMA IF NOT EXISTS {_VERSION_TABLE_SCHEMA}"))
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
@@ -110,6 +108,8 @@ def _run_sync_migrations(connection: Connection) -> None:
         compare_server_default=True,
     )
     with context.begin_transaction():
+        connection.execute(text(f"SET LOCAL ROLE {_owner_role_identifier()}"))
+        connection.execute(text(f"CREATE SCHEMA IF NOT EXISTS {_VERSION_TABLE_SCHEMA}"))
         context.run_migrations()
 
 

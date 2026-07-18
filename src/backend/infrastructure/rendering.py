@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import os
-import resource
 import shutil
 import signal
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,15 @@ from typing import Any
 from backend.config import RendererSettings
 from backend.domain.common import DomainError, Problem
 from workspace_shared.ids import new_opaque_id
+
+_resource: Any = importlib.import_module("resource") if os.name == "posix" else None
+"""@brief POSIX resource 模块；非 POSIX 平台保持为空 / POSIX resource module, absent elsewhere."""
+
+_killpg: Callable[[int, int], None] | None = getattr(os, "killpg", None)
+"""@brief POSIX 进程组信号函数 / POSIX process-group signal function."""
+
+_sigkill: int | None = getattr(signal, "SIGKILL", None)
+"""@brief POSIX 强制终止信号 / POSIX force-termination signal."""
 
 _PIPE_READ_CHUNK_BYTES = 16 * 1024
 """@brief 单次诊断 pipe 读取上限 / Maximum bytes read from one diagnostic pipe at a time."""
@@ -118,6 +128,15 @@ class SandboxedXeLaTeXRenderer:
         @return PDF bytes and semantic source map / PDF 字节与语义 source map.
         @raise DomainError sandbox 缺失、超时或编译失败时抛出 / Raised for a missing sandbox, timeout, or compilation failure.
         """
+        if _resource is None or _killpg is None or _sigkill is None:
+            raise DomainError(
+                Problem(
+                    "resume.renderer_sandbox_unavailable",
+                    503,
+                    "Secure XeLaTeX sandbox is unavailable",
+                    detail="Real XeLaTeX rendering requires a POSIX process sandbox.",
+                )
+            )
         bubblewrap = shutil.which("bwrap")
         if bubblewrap is None:
             raise DomainError(
@@ -324,11 +343,14 @@ def _resource_limiter(settings: RendererSettings) -> Any:
     @param settings 渲染限制 / Render limits.
     @return POSIX pre-exec callable / POSIX pre-exec callable.
     """
+    if _resource is None:
+        raise RuntimeError("POSIX resource limits are unavailable on this platform")
+
     def limit_resources() -> None:
         """@brief 在 child 中设置 rlimit / Set rlimits in the child."""
-        resource.setrlimit(resource.RLIMIT_AS, (settings.memory_limit_bytes, settings.memory_limit_bytes))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (settings.max_output_bytes, settings.max_output_bytes))
-        resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
+        _resource.setrlimit(_resource.RLIMIT_AS, (settings.memory_limit_bytes, settings.memory_limit_bytes))
+        _resource.setrlimit(_resource.RLIMIT_FSIZE, (settings.max_output_bytes, settings.max_output_bytes))
+        _resource.setrlimit(_resource.RLIMIT_NPROC, (32, 32))
 
     return limit_resources
 
@@ -454,9 +476,12 @@ async def _terminate_process_group(
     不可信进程可能忽略 SIGTERM 并继续写入。
     """
 
+    if _sigkill is None:
+        raise RuntimeError("POSIX process-group termination is unavailable on this platform")
+
     process_group_id = process.pid
     if force:
-        _signal_process_group(process_group_id, signal.SIGKILL)
+        _signal_process_group(process_group_id, _sigkill)
         await _wait_and_discard_process_output(
             process,
             timeout_seconds=_PROCESS_KILL_REAP_SECONDS,
@@ -468,14 +493,14 @@ async def _terminate_process_group(
         timeout_seconds=_PROCESS_TERMINATION_GRACE_SECONDS,
     )
     if not terminated or _process_group_exists(process_group_id):
-        _signal_process_group(process_group_id, signal.SIGKILL)
+        _signal_process_group(process_group_id, _sigkill)
         await _wait_and_discard_process_output(
             process,
             timeout_seconds=_PROCESS_KILL_REAP_SECONDS,
         )
 
 
-def _signal_process_group(process_group_id: int, signal_number: signal.Signals) -> None:
+def _signal_process_group(process_group_id: int, signal_number: int) -> None:
     """@brief 向独立编译进程组发送信号 / Send a signal to the isolated compiler process group.
 
     @param process_group_id 独立 session 的 PGID / PGID of the isolated session.
@@ -484,8 +509,10 @@ def _signal_process_group(process_group_id: int, signal_number: signal.Signals) 
     @note 进程组已经退出不是失败；这使成功、超时、取消和错误路径能安全共享清理逻辑。
     """
 
+    if _killpg is None:
+        raise RuntimeError("POSIX process-group signaling is unavailable on this platform")
     try:
-        os.killpg(process_group_id, signal_number)
+        _killpg(process_group_id, signal_number)
     except ProcessLookupError:
         return
     except PermissionError:
@@ -544,8 +571,10 @@ def _process_group_exists(process_group_id: int) -> bool:
     @return 进程组仍可被信号寻址时为真 / True when the process group can still receive a signal.
     """
 
+    if _killpg is None:
+        raise RuntimeError("POSIX process-group signaling is unavailable on this platform")
     try:
-        os.killpg(process_group_id, 0)
+        _killpg(process_group_id, 0)
     except ProcessLookupError:
         return False
     except PermissionError:

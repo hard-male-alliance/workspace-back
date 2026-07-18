@@ -143,8 +143,8 @@ async def install_tenant_scope(
             "actor_id": scope.actor_id,
             "workspace_id": scope.workspace_id,
             "resource_owner_id": scope.resource_owner_id,
-            "statement_timeout_ms": statement_timeout_ms,
-            "lock_timeout_ms": lock_timeout_ms,
+            "statement_timeout_ms": str(statement_timeout_ms),
+            "lock_timeout_ms": str(lock_timeout_ms),
         },
     )
 

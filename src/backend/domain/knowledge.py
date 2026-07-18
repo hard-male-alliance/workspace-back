@@ -4,10 +4,121 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from backend.domain.common import iso_timestamp
 from workspace_shared.tenancy import ActorScope
+
+
+class KnowledgeSourceRole(StrEnum):
+    """Role a source plays in grounding an AI decision."""
+
+    PERSONAL_EVIDENCE = "personal_evidence"
+    RESUME_CURRENT = "resume_current"
+    RESUME_HISTORY = "resume_history"
+    JOB_TARGET = "job_target"
+    EXTERNAL_REFERENCE = "external_reference"
+    AI_GENERATED_DRAFT = "ai_generated_draft"
+
+
+class KnowledgeContentType(StrEnum):
+    """Semantic content category used for filtering and prompt assembly."""
+
+    PROFILE = "profile"
+    EDUCATION = "education"
+    WORK_EXPERIENCE = "work_experience"
+    PROJECT = "project"
+    SKILL = "skill"
+    ACHIEVEMENT = "achievement"
+    CERTIFICATE = "certificate"
+    PUBLICATION = "publication"
+    OPEN_SOURCE = "open_source"
+    JOB_REQUIREMENT = "job_requirement"
+    GENERAL = "general"
+
+
+class KnowledgeTrustLevel(StrEnum):
+    """How strongly a knowledge item may be treated as a factual claim."""
+
+    VERIFIED = "verified"
+    USER_PROVIDED = "user_provided"
+    INFERRED = "inferred"
+    GENERATED = "generated"
+    USER_CONFIRMED = "user_confirmed"
+
+
+class KnowledgeLifecycle(StrEnum):
+    """Lifecycle state used to keep stale resume revisions out of retrieval."""
+
+    PENDING = "pending"
+    CURRENT = "current"
+    STALE = "stale"
+    ARCHIVED = "archived"
+    DELETED = "deleted"
+
+
+class KnowledgeAgentVisibility(StrEnum):
+    """Named consumers allowed to use an item as context."""
+
+    RESUME_ASSISTANT = "resume_assistant"
+    INTERVIEW_AGENT = "interview_agent"
+    GENERAL_AGENT = "general_agent"
+    PRIVATE_ONLY = "private_only"
+    NONE = "none"
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeClassification:
+    """Orthogonal, machine-readable knowledge classification."""
+
+    source_role: KnowledgeSourceRole = KnowledgeSourceRole.PERSONAL_EVIDENCE
+    content_type: KnowledgeContentType = KnowledgeContentType.GENERAL
+    trust_level: KnowledgeTrustLevel = KnowledgeTrustLevel.USER_PROVIDED
+    lifecycle: KnowledgeLifecycle = KnowledgeLifecycle.CURRENT
+    visibility: tuple[KnowledgeAgentVisibility, ...] = (
+        KnowledgeAgentVisibility.RESUME_ASSISTANT,
+        KnowledgeAgentVisibility.INTERVIEW_AGENT,
+        KnowledgeAgentVisibility.GENERAL_AGENT,
+    )
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the stable persistence/API representation."""
+        return {
+            "source_role": self.source_role.value,
+            "content_type": self.content_type.value,
+            "trust_level": self.trust_level.value,
+            "lifecycle": self.lifecycle.value,
+            "visibility": [value.value for value in self.visibility],
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> KnowledgeClassification:
+        """Rehydrate classification while accepting records written before phase one."""
+        if not isinstance(value, dict):
+            return cls()
+        raw_visibility = value.get("visibility")
+        visibility = (
+            tuple(KnowledgeAgentVisibility(str(item)) for item in raw_visibility)
+            if isinstance(raw_visibility, list)
+            else cls().visibility
+        )
+        return cls(
+            source_role=KnowledgeSourceRole(str(value.get("source_role", cls().source_role.value))),
+            content_type=KnowledgeContentType(str(value.get("content_type", cls().content_type.value))),
+            trust_level=KnowledgeTrustLevel(str(value.get("trust_level", cls().trust_level.value))),
+            lifecycle=KnowledgeLifecycle(str(value.get("lifecycle", cls().lifecycle.value))),
+            visibility=visibility,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeDocumentPart:
+    """A semantic input unit preserving its Resume section/item provenance."""
+
+    text: str
+    content_type: KnowledgeContentType
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +156,9 @@ class KnowledgeSourceRecord:
     source_version_id: str | None = None
     chunks: list[KnowledgeChunk] = field(default_factory=list)
     mock_content: str = ""
+    classification: KnowledgeClassification = field(default_factory=KnowledgeClassification)
+    source_metadata: dict[str, Any] = field(default_factory=dict)
+    document_parts: list[KnowledgeDocumentPart] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         """@brief 转换为公开 KnowledgeSource / Convert to public KnowledgeSource.
@@ -72,7 +186,12 @@ class KnowledgeSourceRecord:
             },
             "sync_schedule": None,
             "enabled": self.enabled,
-            "extensions": {},
+            "extensions": {
+                "aiws": {
+                    "classification": self.classification.as_dict(),
+                    "source_metadata": self.source_metadata,
+                }
+            },
         }
 
 
@@ -87,3 +206,5 @@ class KnowledgeChunk:
     ordinal: int
     text: str
     vector: tuple[float, ...]
+    classification: KnowledgeClassification = field(default_factory=KnowledgeClassification)
+    metadata: dict[str, Any] = field(default_factory=dict)
