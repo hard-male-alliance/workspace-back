@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -87,6 +88,7 @@ async def _wait_for_file(path: Path) -> None:
     raise AssertionError(f"test subprocess did not create {path}")
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group semantics are required")
 @pytest.mark.asyncio
 async def test_renderer_kills_the_whole_process_group_when_combined_pipe_output_exceeds_limit(
     tmp_path: Path,
@@ -124,6 +126,7 @@ async def test_renderer_kills_the_whole_process_group_when_combined_pipe_output_
     assert not marker.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group semantics are required")
 @pytest.mark.asyncio
 async def test_renderer_cancellation_kills_the_whole_process_group(
     tmp_path: Path,
@@ -193,3 +196,19 @@ def test_limited_pdf_rejects_oversized_file_before_opening_it(
         rendering._read_limited_pdf(artifact, 64)
 
     assert raised.value.problem.code == "resume.invalid_pdf"
+
+
+@pytest.mark.skipif(os.name == "posix", reason="Non-POSIX fail-closed behavior only")
+@pytest.mark.asyncio
+async def test_renderer_fails_closed_without_a_posix_sandbox(tmp_path: Path) -> None:
+    """@brief 非 POSIX 平台明确拒绝真实渲染 / Fail closed on non-POSIX platforms.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @return 无返回值 / No return value.
+    """
+
+    renderer = rendering.SandboxedXeLaTeXRenderer(_renderer_settings(tmp_path))
+    with pytest.raises(DomainError) as raised:
+        await renderer.render(_resume_document())
+
+    assert raised.value.problem.code == "resume.renderer_sandbox_unavailable"

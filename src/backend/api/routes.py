@@ -16,6 +16,7 @@ from backend.api.models import (
     MockKnowledgeSourceCreateRequest,
     MockMessageCreateRequest,
     MockResumeCreateRequest,
+    MockResumeProposalCreateRequest,
     MockToolApprovalDecision,
 )
 from backend.composition import BackendContainer
@@ -315,6 +316,73 @@ async def create_render_job(request: Request, resume_id: str) -> JSONResponse:
         return await _container(request).resume.create_render_job(scope, resume_id, body, _request_id(request))
 
     return await _idempotent(request, scope, "/resumes/{resume_id}/render-jobs", body, 202, operation)
+
+
+@router.post(
+    "/resumes/{resume_id}/proposals",
+    status_code=201,
+    openapi_extra={
+        "x-contract-status": "mock",
+        "x-pending-contract": "ResumeProposalCreateRequest",
+    },
+)
+async def create_resume_proposal(
+    request: Request, resume_id: str, body: MockResumeProposalCreateRequest
+) -> JSONResponse:
+    """Create a phase-one evidence-grounded AI Proposal (explicit mock adapter)."""
+    scope = _scope_from_headers(request)
+
+    async def operation() -> dict[str, Any]:
+        proposal = await _container(request).proposals.create_mock_proposal(
+            scope, resume_id, body.model_dump(mode="json")
+        )
+        payload = proposal.as_dict()
+        _container(request).contracts.validate_declared("ResumeProposal", payload)
+        return payload
+
+    return await _idempotent(
+        request,
+        scope,
+        "/resumes/{resume_id}/proposals",
+        body.model_dump(mode="json"),
+        201,
+        operation,
+    )
+
+
+@router.get("/resume-proposals/{proposal_id}")
+async def get_resume_proposal(request: Request, proposal_id: str) -> dict[str, Any]:
+    """Get a formal ResumeProposal with evidence metadata in extensions."""
+    proposal = await _container(request).proposals.get_proposal(
+        _scope_from_headers(request), proposal_id
+    )
+    payload = proposal.as_dict()
+    _container(request).contracts.validate_declared("ResumeProposal", payload)
+    return payload
+
+
+@router.post("/resume-proposals/{proposal_id}/decisions")
+async def decide_resume_proposal(request: Request, proposal_id: str) -> JSONResponse:
+    """Accept whole atomic groups or reject a formal ResumeProposal."""
+    body = await _formal_payload(request, "ProposalDecisionRequest")
+    scope = _scope_from_headers(request)
+
+    async def operation() -> dict[str, Any]:
+        proposal = await _container(request).proposals.decide(
+            scope, proposal_id, body, _request_id(request)
+        )
+        payload = proposal.as_dict()
+        _container(request).contracts.validate_declared("ResumeProposal", payload)
+        return payload
+
+    return await _idempotent(
+        request,
+        scope,
+        "/resume-proposals/{proposal_id}/decisions",
+        body,
+        200,
+        operation,
+    )
 
 
 @router.get("/resume-render-jobs/{job_id}")

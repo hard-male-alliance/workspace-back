@@ -17,7 +17,7 @@ import hmac
 import json
 import secrets
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -43,8 +43,23 @@ from backend.domain.agent import (
 from backend.domain.common import DomainError, Job, JobStatus, Problem
 from backend.domain.interview import InterviewSessionRecord as DomainInterviewSessionRecord
 from backend.domain.interview import InterviewStatus
-from backend.domain.knowledge import EmbeddingSpace, KnowledgeChunk
+from backend.domain.knowledge import (
+    EmbeddingSpace,
+    KnowledgeChunk,
+    KnowledgeClassification,
+    KnowledgeContentType,
+    KnowledgeDocumentPart,
+    KnowledgeTrustLevel,
+)
 from backend.domain.knowledge import KnowledgeSourceRecord as DomainKnowledgeSourceRecord
+from backend.domain.proposal import (
+    ProposalCitation,
+    ResumeProposalOperation,
+    ResumeProposalStatus,
+)
+from backend.domain.proposal import (
+    ResumeProposalRecord as DomainResumeProposalRecord,
+)
 from backend.domain.resume import ResumeRecord
 from backend.infrastructure.idempotency import IdempotentResponse
 from backend.infrastructure.persistence.database import AsyncDatabase
@@ -107,6 +122,15 @@ from backend.infrastructure.persistence.models import (
 )
 from backend.infrastructure.persistence.models import (
     ResumeDocumentRecord as ResumeDocumentOrmRecord,
+)
+from backend.infrastructure.persistence.models import (
+    ResumeProposalOperationRecord as ResumeProposalOperationOrmRecord,
+)
+from backend.infrastructure.persistence.models import (
+    ResumeProposalRecord as ResumeProposalOrmRecord,
+)
+from backend.infrastructure.persistence.models import (
+    ResumeRenderJobRecord as ResumeRenderJobOrmRecord,
 )
 from backend.infrastructure.persistence.models import (
     ResumeRevisionRecord as ResumeRevisionOrmRecord,
@@ -665,6 +689,197 @@ class PostgresWorkspaceRepository:
             batch_hashes=batch_hashes,
             batch_results=batch_results,
             changed_targets=changed_targets,
+        )
+
+    async def create_proposal(
+        self, scope: ActorScope, record: DomainResumeProposalRecord
+    ) -> None:
+        """Create or idempotently persist a Resume AI Proposal."""
+        _assert_record_scope(scope, record.scope)
+        async with self._database.transaction(scope) as session:
+            await _ensure_scope_identities(session, scope)
+            row = await _scoped_one(session, ResumeProposalOrmRecord, scope, record.id, lock=True)
+            if row is None:
+                row = ResumeProposalOrmRecord(
+                    id=record.id,
+                    workspace_id=scope.workspace_id,
+                    resource_owner_id=scope.resource_owner_id,
+                    resume_id=record.resume_id,
+                    agent_run_id=None,
+                    base_revision_no=record.base_revision,
+                    status=record.status.value,
+                    decision_payload=None,
+                    decided_by_actor_id=record.decided_by_actor_id,
+                    decided_at=record.decided_at,
+                    expires_at=record.expires_at,
+                    created_at=record.created_at,
+                    updated_at=record.updated_at,
+                    revision=record.revision,
+                    extensions={},
+                )
+                session.add(row)
+                await session.flush()
+            await self._write_proposal_locked(session, scope, row, record)
+
+    async def get_proposal(
+        self, scope: ActorScope, proposal_id: str
+    ) -> DomainResumeProposalRecord | None:
+        """Read a tenant-scoped Resume AI Proposal and its ordered operations."""
+        async with self._database.read_session(scope) as session:
+            row = await _scoped_one(session, ResumeProposalOrmRecord, scope, proposal_id)
+            if row is None:
+                return None
+            operation_rows = (
+                await session.scalars(
+                    scoped_select(ResumeProposalOperationOrmRecord, scope)
+                    .where(ResumeProposalOperationOrmRecord.proposal_id == proposal_id)
+                    .order_by(ResumeProposalOperationOrmRecord.ordinal.asc())
+                )
+            ).all()
+            return self._proposal_from_rows(scope, row, operation_rows)
+
+    async def save_proposal(
+        self, scope: ActorScope, record: DomainResumeProposalRecord
+    ) -> None:
+        """Persist a Proposal terminal decision using a row-level revision guard."""
+        _assert_record_scope(scope, record.scope)
+        async with self._database.transaction(scope) as session:
+            row = await _scoped_one(session, ResumeProposalOrmRecord, scope, record.id, lock=True)
+            if row is None:
+                raise RuntimeError("cannot save a proposal that does not exist in this scope")
+            if record.revision < int(row.revision):
+                raise RuntimeError("stale proposal write would overwrite a newer decision")
+            await self._write_proposal_locked(session, scope, row, record)
+
+    async def _write_proposal_locked(
+        self,
+        session: AsyncSession,
+        scope: ActorScope,
+        row: Any,
+        record: DomainResumeProposalRecord,
+    ) -> None:
+        """Write Proposal state and replace its normalized operation projection."""
+        row.status = record.status.value
+        row.base_revision_no = record.base_revision
+        row.decided_by_actor_id = record.decided_by_actor_id
+        row.decided_at = record.decided_at
+        row.expires_at = record.expires_at
+        row.updated_at = record.updated_at
+        row.revision = record.revision
+        row.decision_payload = _with_runtime(
+            row.decision_payload,
+            {
+                "source_run_id": record.source_run_id,
+                "title": record.title,
+                "summary": record.summary,
+                "selected_operation_ids": list(record.selected_operation_ids),
+                "decision_comment": record.decision_comment,
+                "render_hint": deepcopy(record.render_hint),
+                "application_result": deepcopy(record.application_result),
+            },
+        )
+        await session.execute(
+            delete(ResumeProposalOperationOrmRecord).where(
+                ResumeProposalOperationOrmRecord.workspace_id == scope.workspace_id,
+                ResumeProposalOperationOrmRecord.resource_owner_id == scope.resource_owner_id,
+                ResumeProposalOperationOrmRecord.proposal_id == record.id,
+            )
+        )
+        await session.flush()
+        for ordinal, operation in enumerate(record.operations):
+            session.add(
+                ResumeProposalOperationOrmRecord(
+                    id=operation.id,
+                    workspace_id=scope.workspace_id,
+                    resource_owner_id=scope.resource_owner_id,
+                    proposal_id=record.id,
+                    ordinal=ordinal,
+                    operation_type=str(operation.operation.get("op", "unknown")),
+                    payload={
+                        "operation": deepcopy(operation.operation),
+                        "reason": operation.reason,
+                        "atomic_group_id": operation.atomic_group_id,
+                        "trust_level": operation.trust_level.value,
+                        "citations": [citation.as_dict() for citation in operation.citations],
+                    },
+                    decision=(
+                        "accepted" if operation.id in record.selected_operation_ids else None
+                    ),
+                    extensions={},
+                )
+            )
+
+    @staticmethod
+    def _proposal_from_rows(
+        scope: ActorScope, row: Any, operation_rows: Sequence[Any]
+    ) -> DomainResumeProposalRecord:
+        """Rehydrate the Proposal aggregate from its normalized rows."""
+        runtime = _runtime_payload(row.decision_payload)
+        operations: list[ResumeProposalOperation] = []
+        for operation_row in operation_rows:
+            payload = _as_json_object(operation_row.payload)
+            citations: list[ProposalCitation] = []
+            raw_citations = payload.get("citations")
+            if isinstance(raw_citations, list):
+                for raw in raw_citations:
+                    if not isinstance(raw, dict):
+                        continue
+                    citations.append(
+                        ProposalCitation(
+                            source_id=str(raw.get("source_id", "")),
+                            source_version_id=str(raw.get("source_version_id", "")),
+                            chunk_id=str(raw.get("chunk_id", "")),
+                            quote=str(raw.get("quote", "")),
+                            trust_level=KnowledgeTrustLevel(
+                                str(raw.get("trust_level", "generated"))
+                            ),
+                            metadata=_as_json_object(raw.get("metadata")),
+                        )
+                    )
+            operations.append(
+                ResumeProposalOperation(
+                    id=str(operation_row.id),
+                    operation=_as_json_object(payload.get("operation")),
+                    reason=str(payload.get("reason", "")),
+                    atomic_group_id=str(payload.get("atomic_group_id", operation_row.id)),
+                    citations=tuple(citations),
+                    trust_level=KnowledgeTrustLevel(
+                        str(payload.get("trust_level", "generated"))
+                    ),
+                )
+            )
+        return DomainResumeProposalRecord(
+            scope=scope,
+            id=str(row.id),
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            resume_id=str(row.resume_id),
+            base_revision=int(row.base_revision_no),
+            source_run_id=str(runtime.get("source_run_id", "run_unknown")),
+            title=str(runtime.get("title", "Resume proposal")),
+            summary=str(runtime.get("summary", "")),
+            operations=operations,
+            status=ResumeProposalStatus(str(row.status)),
+            revision=int(row.revision),
+            expires_at=row.expires_at,
+            selected_operation_ids=_as_string_list(runtime.get("selected_operation_ids")),
+            decision_comment=(
+                str(runtime["decision_comment"])
+                if isinstance(runtime.get("decision_comment"), str)
+                else None
+            ),
+            decided_by_actor_id=row.decided_by_actor_id,
+            decided_at=row.decided_at,
+            render_hint=(
+                _as_json_object(runtime.get("render_hint"))
+                if isinstance(runtime.get("render_hint"), dict)
+                else None
+            ),
+            application_result=(
+                _as_json_object(runtime.get("application_result"))
+                if isinstance(runtime.get("application_result"), dict)
+                else None
+            ),
         )
 
     async def create_conversation(
@@ -1649,6 +1864,16 @@ class PostgresWorkspaceRepository:
                 "mock_content": record.mock_content,
                 "source_version_id": record.source_version_id,
                 "enabled": record.enabled,
+                "classification": record.classification.as_dict(),
+                "source_metadata": deepcopy(record.source_metadata),
+                "document_parts": [
+                    {
+                        "text": part.text,
+                        "content_type": part.content_type.value,
+                        "metadata": deepcopy(part.metadata),
+                    }
+                    for part in record.document_parts
+                ],
             },
         )
         await self._write_visibility_policy(session, scope, record)
@@ -1828,9 +2053,13 @@ class PostgresWorkspaceRepository:
                     ordinal=chunk.ordinal,
                     text_content=chunk.text,
                     content_hash=_json_hash(chunk.text),
-                    origin={"source_id": record.id, "source_version_id": source_version_id},
+                    origin={
+                        "source_id": record.id,
+                        "source_version_id": source_version_id,
+                        "metadata": deepcopy(chunk.metadata),
+                    },
                     token_count=len(chunk.text.split()),
-                    extensions={},
+                    extensions={"aiws": {"classification": chunk.classification.as_dict()}},
                 )
             )
             session.add(
@@ -1891,11 +2120,38 @@ class PostgresWorkspaceRepository:
                         ordinal=int(chunk_row.ordinal),
                         text=str(chunk_row.text_content),
                         vector=tuple(float(value) for value in embedding.embedding),
+                        classification=KnowledgeClassification.from_dict(
+                            _as_json_object(chunk_row.extensions)
+                            .get("aiws", {})
+                            .get("classification")
+                            if isinstance(_as_json_object(chunk_row.extensions).get("aiws"), dict)
+                            else None
+                        ),
+                        metadata=_as_json_object(
+                            _as_json_object(chunk_row.origin).get("metadata")
+                        ),
                     )
                 )
         source_type = runtime.get("source_type")
         mock_content_candidate = runtime.get("mock_content")
         mock_content = mock_content_candidate if isinstance(mock_content_candidate, str) else ""
+        document_parts: list[KnowledgeDocumentPart] = []
+        raw_parts = runtime.get("document_parts")
+        if isinstance(raw_parts, list):
+            for part in raw_parts:
+                if not isinstance(part, dict) or not isinstance(part.get("text"), str):
+                    continue
+                try:
+                    content_type = KnowledgeContentType(str(part.get("content_type", "general")))
+                except ValueError:
+                    content_type = KnowledgeContentType.GENERAL
+                document_parts.append(
+                    KnowledgeDocumentPart(
+                        text=str(part["text"]),
+                        content_type=content_type,
+                        metadata=_as_json_object(part.get("metadata")),
+                    )
+                )
         return DomainKnowledgeSourceRecord(
             scope=scope,
             id=str(row.id),
@@ -1911,6 +2167,9 @@ class PostgresWorkspaceRepository:
             source_version_id=source_version_id if isinstance(source_version_id, str) else None,
             chunks=chunks,
             mock_content=mock_content,
+            classification=KnowledgeClassification.from_dict(runtime.get("classification")),
+            source_metadata=_as_json_object(runtime.get("source_metadata")),
+            document_parts=document_parts,
         )
 
     @staticmethod
@@ -1959,6 +2218,9 @@ class PostgresWorkspaceRepository:
                 )
                 session.add(row)
             self._write_job_row(row, job)
+            if job.job_type == "resume.render":
+                await session.flush()
+                await self._sync_resume_render_job(session, scope, job)
 
     async def get_job(self, scope: ActorScope, job_id: str) -> Job | None:
         """@brief 读取范围内 Job / Read a scoped Job.
@@ -1982,6 +2244,117 @@ class PostgresWorkspaceRepository:
             if row is None:
                 raise RuntimeError("cannot save a job outside the supplied scope")
             self._write_job_row(row, job)
+            if job.job_type == "resume.render":
+                await self._sync_resume_render_job(session, scope, job)
+
+    async def _sync_resume_render_job(
+        self,
+        session: AsyncSession,
+        scope: ActorScope,
+        job: Job,
+    ) -> None:
+        """Persist the Resume-specific link for a unified render Job."""
+        resume_id = job.extensions.get("resume_id")
+        resume_revision = job.extensions.get("resume_revision")
+        if (
+            not isinstance(resume_id, str)
+            or isinstance(resume_revision, bool)
+            or not isinstance(resume_revision, int)
+        ):
+            raise ValueError("resume render job requires a resume id and revision")
+
+        resume = await _scoped_one(session, ResumeDocumentOrmRecord, scope, resume_id)
+        revision_statement = scoped_select(ResumeRevisionOrmRecord, scope).where(
+            ResumeRevisionOrmRecord.resume_id == resume_id,
+            ResumeRevisionOrmRecord.revision_no == resume_revision,
+        )
+        revision_row = (await session.scalars(revision_statement)).first()
+        if resume is None or revision_row is None:
+            raise ValueError("resume render job references an unknown scoped resume revision")
+
+        link_statement = (
+            scoped_select(ResumeRenderJobOrmRecord, scope)
+            .where(ResumeRenderJobOrmRecord.job_id == job.id)
+            .with_for_update()
+        )
+        link = (await session.scalars(link_statement)).first()
+        artifact_id = await self._render_job_artifact_id(
+            session,
+            scope,
+            job,
+            resume_id,
+            str(revision_row.id),
+        )
+        diagnostics = job.extensions.get("diagnostics")
+        diagnostics_payload = (
+            deepcopy(diagnostics)
+            if isinstance(diagnostics, dict)
+            else {"items": deepcopy(diagnostics) if isinstance(diagnostics, list) else []}
+        )
+        timestamp = job.finished_at or job.started_at or job.created_at
+        render_profile = job.extensions.get("render_profile", "preview")
+        if not isinstance(render_profile, str) or not render_profile:
+            raise ValueError("resume render job requires a render profile")
+
+        if link is None:
+            link = ResumeRenderJobOrmRecord(
+                id=_stable_id("renderjob", job.id),
+                workspace_id=scope.workspace_id,
+                resource_owner_id=scope.resource_owner_id,
+                job_id=job.id,
+                resume_id=resume_id,
+                resume_revision_id=str(revision_row.id),
+                artifact_id=artifact_id,
+                render_profile=render_profile,
+                diagnostics=diagnostics_payload,
+                created_at=job.created_at,
+                updated_at=timestamp,
+                revision=1,
+                extensions={},
+            )
+            session.add(link)
+            return
+
+        link.resume_id = resume_id
+        link.resume_revision_id = str(revision_row.id)
+        if artifact_id is not None:
+            link.artifact_id = artifact_id
+        link.render_profile = render_profile
+        link.diagnostics = diagnostics_payload
+        link.updated_at = timestamp
+        link.revision = int(link.revision) + 1
+
+    @staticmethod
+    async def _render_job_artifact_id(
+        session: AsyncSession,
+        scope: ActorScope,
+        job: Job,
+        resume_id: str,
+        resume_revision_id: str,
+    ) -> str | None:
+        """Return and validate the first persisted artifact linked by a render Job."""
+        artifacts = job.extensions.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            return None
+        first_artifact = artifacts[0]
+        if not isinstance(first_artifact, dict):
+            raise ValueError("resume render job artifact metadata is invalid")
+        artifact_id = first_artifact.get("id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            raise ValueError("resume render job artifact id is invalid")
+        artifact = await _scoped_one(
+            session,
+            RenderArtifactOrmRecord,
+            scope,
+            artifact_id,
+        )
+        if (
+            artifact is None
+            or str(artifact.resume_id) != resume_id
+            or str(artifact.resume_revision_id) != resume_revision_id
+        ):
+            raise ValueError("resume render job artifact references a different resume revision")
+        return artifact_id
 
     @staticmethod
     def _write_job_row(row: Any, job: Job) -> None:

@@ -10,6 +10,7 @@ from backend.domain.agent import AgentRunRecord, ConversationRecord, MessageReco
 from backend.domain.common import Job
 from backend.domain.interview import InterviewSessionRecord
 from backend.domain.knowledge import EmbeddingSpace, KnowledgeSourceRecord
+from backend.domain.proposal import ResumeProposalRecord
 from backend.domain.resume import ResumeRecord
 from workspace_shared.tenancy import ActorScope
 
@@ -24,6 +25,7 @@ class InMemoryWorkspaceRepository:
         """@brief 初始化各聚合存储 / Initialize aggregate stores."""
         self._lock = asyncio.Lock()
         self._resumes: dict[str, ResumeRecord] = {}
+        self._proposals: dict[str, ResumeProposalRecord] = {}
         self._conversations: dict[str, ConversationRecord] = {}
         self._messages: dict[str, tuple[ActorScope, MessageRecord]] = {}
         self._runs: dict[str, AgentRunRecord] = {}
@@ -71,6 +73,24 @@ class InMemoryWorkspaceRepository:
         @param record 简历聚合 / Resume aggregate.
         """
         await self.create_resume(scope, record)
+
+    async def create_proposal(self, scope: ActorScope, record: ResumeProposalRecord) -> None:
+        """Persist a tenant-scoped Resume proposal."""
+        async with self._lock:
+            _assert_scope(scope, record.scope)
+            self._proposals[record.id] = record
+
+    async def get_proposal(
+        self, scope: ActorScope, proposal_id: str
+    ) -> ResumeProposalRecord | None:
+        """Read a tenant-scoped Resume proposal."""
+        async with self._lock:
+            record = self._proposals.get(proposal_id)
+            return record if record is not None and _same_scope(scope, record.scope) else None
+
+    async def save_proposal(self, scope: ActorScope, record: ResumeProposalRecord) -> None:
+        """Persist a Resume proposal decision."""
+        await self.create_proposal(scope, record)
 
     async def create_conversation(self, scope: ActorScope, record: ConversationRecord) -> None:
         """@brief 保存新会话 / Persist a new conversation.

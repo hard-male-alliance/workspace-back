@@ -544,7 +544,7 @@ class ResumeProposalRecord(Base, TenantScopedMixin):
     __tablename__ = "proposals"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'accepted', 'partially_accepted', 'rejected', 'expired')",
+            "status IN ('pending', 'accepted', 'partially_accepted', 'rejected', 'expired', 'conflicted')",
             name="resume_proposals_status",
         ),
         Index("ix_resume_proposals_resume_status", "resume_id", "status"),

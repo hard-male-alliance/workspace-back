@@ -9,6 +9,7 @@ from backend.domain.agent import AgentRunRecord, ConversationRecord, MessageReco
 from backend.domain.common import Job
 from backend.domain.interview import InterviewSessionRecord
 from backend.domain.knowledge import EmbeddingSpace, KnowledgeSourceRecord
+from backend.domain.proposal import ResumeProposalRecord
 from backend.domain.resume import ResumeRecord
 from workspace_shared.observability import TelemetryRecord
 from workspace_shared.tenancy import ActorScope
@@ -45,6 +46,21 @@ class ResumeRepository(Protocol):
         @param scope workspace 范围 / Workspace scope.
         @param record 简历聚合 / Resume aggregate.
         """
+
+
+class ResumeProposalRepository(Protocol):
+    """Persistence port for reviewable Resume AI proposals."""
+
+    async def create_proposal(self, scope: ActorScope, record: ResumeProposalRecord) -> None:
+        """Persist a new proposal within the supplied tenant scope."""
+
+    async def get_proposal(
+        self, scope: ActorScope, proposal_id: str
+    ) -> ResumeProposalRecord | None:
+        """Read a proposal without crossing workspace or owner boundaries."""
+
+    async def save_proposal(self, scope: ActorScope, record: ResumeProposalRecord) -> None:
+        """Persist proposal decision state."""
 
 
 class ResumeKnowledgeBridge(Protocol):
