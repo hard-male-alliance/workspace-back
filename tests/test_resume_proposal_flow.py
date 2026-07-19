@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, cast
 
 from fastapi.testclient import TestClient
 
@@ -49,7 +49,7 @@ def _create_ready_evidence(client: TestClient) -> dict[str, Any]:
         headers=idempotency_headers("proposal-evidence-create-0001"),
     )
     assert response.status_code == 201, response.text
-    source = response.json()
+    source = cast(dict[str, Any], response.json())
     job_response = client.post(
         f"/api/v1/knowledge-sources/{source['id']}/ingestion-jobs",
         headers=idempotency_headers("proposal-evidence-ingest-0001"),
@@ -71,7 +71,7 @@ def _create_resume(client: TestClient, key: str) -> dict[str, Any]:
         headers=idempotency_headers(key),
     )
     assert response.status_code == 201, response.text
-    return response.json()
+    return cast(dict[str, Any], response.json())
 
 
 def _create_proposal(
@@ -88,7 +88,7 @@ def _create_proposal(
         headers=idempotency_headers(key),
     )
     assert response.status_code == 201, response.text
-    return response.json()
+    return cast(dict[str, Any], response.json())
 
 
 def test_evidence_grounded_proposal_accepts_reindexes_and_renders(
