@@ -11,6 +11,8 @@ import pytest
 from sqlalchemy import delete
 
 from backend.domain.common import Job, iso_timestamp, utc_now
+from backend.domain.knowledge import KnowledgeTrustLevel
+from backend.domain.proposal import ResumeProposalOperation, ResumeProposalRecord
 from backend.domain.resume import ResumeRecord, create_empty_document
 from backend.infrastructure.persistence.database import AsyncDatabase, AsyncDatabaseOptions
 from backend.infrastructure.persistence.models import (
@@ -47,6 +49,7 @@ async def test_render_job_link_tracks_revision_profile_and_artifact() -> None:
     resume_id = f"res_render_it_{suffix}"
     job_id = f"job_render_it_{suffix}"
     artifact_id = f"art_render_it_{suffix}"
+    proposal_id = f"prop_render_it_{suffix}"
     database = AsyncDatabase(
         AsyncDatabaseOptions(
             dsn=_postgres_test_dsn(),
@@ -85,6 +88,37 @@ async def test_render_job_link_tracks_revision_profile_and_artifact() -> None:
 
     try:
         await repository.create_resume(scope, resume)
+        now = utc_now()
+        proposal = ResumeProposalRecord(
+            scope=scope,
+            id=proposal_id,
+            created_at=now,
+            updated_at=now,
+            resume_id=resume_id,
+            base_revision=1,
+            source_run_id=f"run_render_it_{suffix}",
+            title="PostgreSQL proposal discovery",
+            summary="Verify proposal discovery after a page reload.",
+            operations=[
+                ResumeProposalOperation(
+                    id=f"op_render_it_{suffix}",
+                    operation={
+                        "operation_id": f"op_render_it_{suffix}",
+                        "op": "set_field",
+                        "target": {"entity_type": "profile"},
+                        "field_path": ["summary"],
+                        "value": {"type": "doc", "content": []},
+                    },
+                    reason="PostgreSQL integration coverage",
+                    atomic_group_id=f"grp_render_it_{suffix}",
+                    trust_level=KnowledgeTrustLevel.GENERATED,
+                )
+            ],
+        )
+        await repository.create_proposal(scope, proposal)
+        discovered_proposals = await repository.list_proposals(scope, resume_id)
+        assert [item.id for item in discovered_proposals] == [proposal_id]
+        assert discovered_proposals[0].operations[0].id == f"op_render_it_{suffix}"
         await repository.create_job(scope, job)
 
         async with database.read_session(scope) as session:
@@ -131,6 +165,10 @@ async def test_render_job_link_tracks_revision_profile_and_artifact() -> None:
             pdf,
             {"artifact_id": artifact_id, "pages": []},
         )
+        discovered_artifacts = await repository.list_artifacts(scope, resume_id)
+        assert [item["id"] for item in discovered_artifacts] == [artifact_id]
+        assert discovered_artifacts[0]["resume_id"] == resume_id
+        assert "content" not in discovered_artifacts[0]
         diagnostic = {"severity": "info", "message": "integration render completed"}
         job.extensions["artifacts"] = [artifact]
         job.extensions["diagnostics"] = [diagnostic]

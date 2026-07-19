@@ -88,6 +88,18 @@ class InMemoryWorkspaceRepository:
             record = self._proposals.get(proposal_id)
             return record if record is not None and _same_scope(scope, record.scope) else None
 
+    async def list_proposals(
+        self, scope: ActorScope, resume_id: str
+    ) -> list[ResumeProposalRecord]:
+        """List scoped proposals for one Resume in newest-first order."""
+        async with self._lock:
+            records = [
+                record
+                for record in self._proposals.values()
+                if _same_scope(scope, record.scope) and record.resume_id == resume_id
+            ]
+            return sorted(records, key=lambda record: (record.updated_at, record.id), reverse=True)
+
     async def save_proposal(self, scope: ActorScope, record: ResumeProposalRecord) -> None:
         """Persist a Resume proposal decision."""
         await self.create_proposal(scope, record)
@@ -346,6 +358,25 @@ class InMemoryWorkspaceRepository:
             if item is None or not _same_scope(scope, item[0]):
                 return None
             return deepcopy(item[1]), item[2], deepcopy(item[3])
+
+    async def list_artifacts(
+        self, scope: ActorScope, resume_id: str
+    ) -> list[dict[str, Any]]:
+        """List scoped render-artifact metadata for one Resume."""
+        async with self._lock:
+            artifacts = [
+                deepcopy(item[1])
+                for item in self._artifacts.values()
+                if _same_scope(scope, item[0]) and item[1].get("resume_id") == resume_id
+            ]
+            return sorted(
+                artifacts,
+                key=lambda artifact: (
+                    str(artifact.get("updated_at", "")),
+                    str(artifact.get("id", "")),
+                ),
+                reverse=True,
+            )
 
 
 def _same_scope(left: ActorScope, right: ActorScope) -> bool:

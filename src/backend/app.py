@@ -12,6 +12,7 @@ from time import perf_counter
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -304,6 +305,33 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
             problem.as_dict(getattr(request.state, "request_id", None), request.url.path),
             status_code=500,
             media_type="application/problem+json",
+        )
+
+    if resolved_settings.network.cors_allowed_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(resolved_settings.network.cors_allowed_origins),
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+            allow_headers=[
+                "Accept",
+                "Content-Type",
+                "Idempotency-Key",
+                "If-Match",
+                "If-None-Match",
+                "Last-Event-ID",
+                "Range",
+                "X-Request-Id",
+            ],
+            expose_headers=[
+                "Accept-Ranges",
+                "Content-Length",
+                "Content-Range",
+                "ETag",
+                "Location",
+                "X-Request-Id",
+            ],
+            max_age=600,
         )
 
     return app

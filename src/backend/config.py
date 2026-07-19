@@ -46,6 +46,7 @@ class NetworkSettings:
     bind_host: str
     bind_port: int
     public_base_url: str
+    cors_allowed_origins: tuple[str, ...]
     trusted_proxy_cidrs: tuple[IPv4Network | IPv6Network, ...]
     outbound_proxy_url: str | None
     connect_timeout_ms: int
@@ -256,6 +257,9 @@ class BackendSettings:
                 bind_host=_require_string(network, "bind_host"),
                 bind_port=_require_positive_int(network, "bind_port"),
                 public_base_url=_require_string(network, "public_base_url").rstrip("/"),
+                cors_allowed_origins=_require_cors_allowed_origins(
+                    network.get("cors_allowed_origins", [])
+                ),
                 trusted_proxy_cidrs=_require_trusted_proxy_cidrs(
                     network.get("trusted_proxy_cidrs")
                 ),
@@ -411,6 +415,38 @@ def _require_trusted_proxy_cidrs(value: object) -> tuple[IPv4Network | IPv6Netwo
         except ValueError as error:
             raise ConfigurationError("network.trusted_proxy_cidrs contains an invalid CIDR") from error
     return tuple(networks)
+
+
+def _require_cors_allowed_origins(value: object) -> tuple[str, ...]:
+    """读取浏览器可访问产品 API 的精确 Origin allowlist。"""
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigurationError("network.cors_allowed_origins must be a string array")
+    origins: list[str] = []
+    for item in value:
+        if item == "*":
+            raise ConfigurationError("network.cors_allowed_origins must not contain a wildcard")
+        try:
+            parsed = urlsplit(item)
+        except ValueError as error:
+            raise ConfigurationError(
+                "network.cors_allowed_origins contains an invalid origin"
+            ) from error
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ConfigurationError(
+                "network.cors_allowed_origins entries must be exact http(s) origins"
+            )
+        origin = item.rstrip("/")
+        if origin not in origins:
+            origins.append(origin)
+    return tuple(origins)
 
 
 def _require_positive_int(mapping: dict[str, Any], key: str) -> int:
