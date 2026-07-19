@@ -18,6 +18,9 @@ from backend.application.services import (
 from backend.config import BackendSettings
 from backend.infrastructure.concurrency import BoundedTaskSupervisor, WorkLimits
 from backend.infrastructure.contracts import ContractValidator
+from backend.infrastructure.embeddings import DeterministicEmbeddingProvider
+from backend.infrastructure.knowledge_parsing import LocalKnowledgeFileParser
+from backend.infrastructure.knowledge_storage import LocalKnowledgeBlobStorage
 from backend.infrastructure.memory import InMemoryWorkspaceRepository
 from backend.infrastructure.rendering import MockRenderer
 from backend.infrastructure.telemetry import BufferedTelemetrySink, InMemoryTelemetryWriter
@@ -168,11 +171,20 @@ async def test_render_hint_backpressure_returns_a_persisted_failed_job_and_idemp
     dependencies = ServiceDependencies(
         settings.network,
         settings.ai,
+        settings.knowledge,
         supervisor,
         BufferedTelemetrySink(InMemoryTelemetryWriter(), 8, 1, 10, "drop_newest"),
     )
     locks = ScopedKeyLocks()
-    knowledge = KnowledgeApplicationService(repository, repository, dependencies, locks)
+    knowledge = KnowledgeApplicationService(
+        repository,
+        repository,
+        LocalKnowledgeBlobStorage(PROJECT_ROOT / ".pytest_cache" / "knowledge-blobs"),
+        LocalKnowledgeFileParser(settings.knowledge.max_extracted_characters),
+        DeterministicEmbeddingProvider(settings.ai.embedding_dimension),
+        dependencies,
+        locks,
+    )
     service = ResumeApplicationService(
         repository,
         repository,

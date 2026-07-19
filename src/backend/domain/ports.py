@@ -8,7 +8,12 @@ from typing import Any, Protocol
 from backend.domain.agent import AgentRunRecord, ConversationRecord, MessageRecord
 from backend.domain.common import Job
 from backend.domain.interview import InterviewSessionRecord
-from backend.domain.knowledge import EmbeddingSpace, KnowledgeSourceRecord
+from backend.domain.knowledge import (
+    EmbeddingSpace,
+    KnowledgeSourceRecord,
+    ParsedKnowledgeDocument,
+    StoredKnowledgeBlob,
+)
 from backend.domain.proposal import ResumeProposalRecord
 from backend.domain.resume import ResumeRecord
 from workspace_shared.observability import TelemetryRecord
@@ -243,6 +248,55 @@ class KnowledgeRepository(Protocol):
         @param scope workspace 范围 / Workspace scope.
         @param space embedding space / Embedding space.
         """
+
+    async def rank_chunks_by_vector(
+        self,
+        scope: ActorScope,
+        chunk_ids: list[str],
+        embedding_space_id: str,
+        query_vector: tuple[float, ...],
+        limit: int,
+    ) -> list[tuple[str, float]]:
+        """Rank an authorized chunk subset with the configured vector space."""
+
+
+class KnowledgeBlobStorage(Protocol):
+    """Private binary storage used by file-backed knowledge sources."""
+
+    async def put(
+        self,
+        scope: ActorScope,
+        file_id: str,
+        filename: str,
+        content_type: str,
+        content: bytes,
+    ) -> StoredKnowledgeBlob:
+        """Persist validated bytes and return opaque storage metadata."""
+
+    async def read(self, scope: ActorScope, storage_key: str) -> bytes:
+        """Read bytes only when the key belongs to the supplied actor scope."""
+
+    async def delete(self, scope: ActorScope, storage_key: str) -> None:
+        """Delete a blob owned by the supplied actor scope if it exists."""
+
+
+class KnowledgeFileParser(Protocol):
+    """Parser boundary for bounded, supported knowledge files."""
+
+    async def parse(
+        self,
+        filename: str,
+        content_type: str,
+        content: bytes,
+    ) -> ParsedKnowledgeDocument:
+        """Parse bytes into semantic parts or raise a stable domain error."""
+
+
+class EmbeddingProvider(Protocol):
+    """Replaceable embedding adapter with an immutable configured dimension."""
+
+    async def embed(self, texts: list[str]) -> list[tuple[float, ...]]:
+        """Return one normalized vector for each input text."""
 
 
 class JobRepository(Protocol):

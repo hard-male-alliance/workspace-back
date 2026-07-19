@@ -40,6 +40,13 @@
     "job_queue_capacity": 256,
     "sse_heartbeat_ms": 15000
   },
+  "knowledge": {
+    "blob_directory": "data/knowledge-blobs",
+    "max_upload_bytes": 10485760,
+    "max_extracted_characters": 1000000,
+    "chunk_max_characters": 800,
+    "chunk_overlap_characters": 80
+  },
   "resume_rendering": {
     "adapter": "mock",
     "xelatex_command": "xelatex",
