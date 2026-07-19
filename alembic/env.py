@@ -13,7 +13,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from alembic import context
 from sqlalchemy import Connection, pool, text
@@ -24,8 +24,8 @@ SOURCE_ROOT = REPOSITORY_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from backend.infrastructure.persistence.database import normalize_asyncpg_dsn  # type: ignore[import-untyped]
-from backend.infrastructure.persistence.models import Base  # type: ignore[import-untyped]
+from backend.infrastructure.persistence.database import normalize_asyncpg_dsn
+from backend.infrastructure.persistence.models import Base
 
 config = context.config
 target_metadata = Base.metadata
@@ -51,7 +51,7 @@ def _migration_url() -> str:
         raise RuntimeError(
             "missing Alembic sqlalchemy.url or AIWS_MIGRATOR_DATABASE_DSN for migration"
         )
-    return cast(str, normalize_asyncpg_dsn(url))
+    return normalize_asyncpg_dsn(url)
 
 
 def _owner_role_identifier() -> str:
