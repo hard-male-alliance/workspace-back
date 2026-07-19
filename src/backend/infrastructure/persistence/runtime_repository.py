@@ -215,6 +215,19 @@ def _json_hash(value: object) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _source_content_hash(record: DomainKnowledgeSourceRecord) -> str:
+    """Prefer a validated file digest; otherwise hash the runtime text payload."""
+    candidate = record.config.get("sha256")
+    if (
+        record.source_type == "file"
+        and isinstance(candidate, str)
+        and len(candidate) == 64
+        and all(character in "0123456789abcdef" for character in candidate.lower())
+    ):
+        return candidate.lower()
+    return _json_hash(record.mock_content)
+
+
 def _bytes_hash(value: bytes) -> str:
     """@brief 计算二进制内容 SHA-256 / Compute a SHA-256 for binary content.
 
@@ -1822,6 +1835,43 @@ class PostgresWorkspaceRepository:
                 )
             )
 
+    async def rank_chunks_by_vector(
+        self,
+        scope: ActorScope,
+        chunk_ids: list[str],
+        embedding_space_id: str,
+        query_vector: tuple[float, ...],
+        limit: int,
+    ) -> list[tuple[str, float]]:
+        """Use pgvector cosine distance over an already authorized chunk subset."""
+        if not chunk_ids or limit <= 0:
+            return []
+        if len(query_vector) != 1024:
+            raise ValueError("v0.1 PostgreSQL vector search requires 1024 dimensions")
+        distance = KnowledgeEmbeddingOrmRecord.embedding.cosine_distance(
+            list(query_vector)
+        ).label("distance")
+        statement = (
+            select(KnowledgeEmbeddingOrmRecord.chunk_id, distance)
+            .where(
+                KnowledgeEmbeddingOrmRecord.workspace_id == scope.workspace_id,
+                KnowledgeEmbeddingOrmRecord.resource_owner_id == scope.resource_owner_id,
+                KnowledgeEmbeddingOrmRecord.embedding_space_id == embedding_space_id,
+                KnowledgeEmbeddingOrmRecord.chunk_id.in_(chunk_ids),
+            )
+            .order_by(distance.asc())
+            .limit(limit)
+        )
+        async with self._database.read_session(scope) as session:
+            rows = (await session.execute(statement)).all()
+        return [
+            (
+                str(chunk_id),
+                min(1.0, max(0.0, (float(1.0 - distance_value) + 1.0) / 2.0)),
+            )
+            for chunk_id, distance_value in rows
+        ]
+
     @staticmethod
     def _storage_source_type(source_type: str) -> str:
         """@brief 将 mock 扩展类型降级到数据库受限 enum / Lower mock extension types to the database enum.
@@ -1841,7 +1891,10 @@ class PostgresWorkspaceRepository:
         return {
             "not_started": "new",
             "queued": "queued",
+            "fetching": "indexing",
+            "parsing": "indexing",
             "chunking": "indexing",
+            "embedding": "indexing",
             "ready": "ready",
             "stale": "stale",
             "failed": "failed",
@@ -1890,9 +1943,11 @@ class PostgresWorkspaceRepository:
                 "visibility": deepcopy(record.visibility),
                 "mock_content": record.mock_content,
                 "source_version_id": record.source_version_id,
+                "ingestion_status": record.ingestion_status,
                 "enabled": record.enabled,
                 "classification": record.classification.as_dict(),
                 "source_metadata": deepcopy(record.source_metadata),
+                "private_metadata": deepcopy(record.private_metadata),
                 "document_parts": [
                     {
                         "text": part.text,
@@ -2022,14 +2077,17 @@ class PostgresWorkspaceRepository:
                 resource_owner_id=scope.resource_owner_id,
                 source_id=record.id,
                 version_no=int(maximum if maximum is not None else 0) + 1,
-                content_hash=_json_hash(record.mock_content),
+                content_hash=_source_content_hash(record),
                 origin={"source_type": record.source_type, "config": deepcopy(record.config)},
-                parser_metadata={"runtime": {"mock_content": record.mock_content}},
+                parser_metadata=deepcopy(record.source_metadata),
                 indexed_at=record.updated_at,
                 created_at=record.updated_at,
                 updated_at=record.updated_at,
                 revision=1,
-                extensions={},
+                extensions=_with_runtime(
+                    {},
+                    {"private_metadata": deepcopy(record.private_metadata)},
+                ),
             )
             session.add(version_row)
             await session.flush()
@@ -2190,12 +2248,17 @@ class PostgresWorkspaceRepository:
             visibility=_as_json_object(runtime.get("visibility")),
             revision=int(row.revision),
             enabled=bool(runtime.get("enabled", True)),
-            ingestion_status=self._domain_ingestion_state(str(row.ingestion_state)),
+            ingestion_status=(
+                str(runtime["ingestion_status"])
+                if isinstance(runtime.get("ingestion_status"), str)
+                else self._domain_ingestion_state(str(row.ingestion_state))
+            ),
             source_version_id=source_version_id if isinstance(source_version_id, str) else None,
             chunks=chunks,
             mock_content=mock_content,
             classification=KnowledgeClassification.from_dict(runtime.get("classification")),
             source_metadata=_as_json_object(runtime.get("source_metadata")),
+            private_metadata=_as_json_object(runtime.get("private_metadata")),
             document_parts=document_parts,
         )
 

@@ -10,4 +10,5 @@ coverage.xml
 htmlcov/
 .coverage
 artifacts/
+data/knowledge-blobs/
 *.log

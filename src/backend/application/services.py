@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from backend.config import AISettings, NetworkSettings
+from backend.config import AISettings, KnowledgeSettings, NetworkSettings
 from backend.domain.agent import AgentRunRecord, AgentRunStatus, ConversationRecord, MessageRecord
 from backend.domain.common import DomainError, Job, Problem, iso_timestamp, utc_now
 from backend.domain.interview import InterviewSessionRecord, InterviewStatus
@@ -29,12 +29,16 @@ from backend.domain.knowledge import (
     KnowledgeSourceRecord,
     KnowledgeSourceRole,
     KnowledgeTrustLevel,
+    StoredKnowledgeBlob,
 )
 from backend.domain.ports import (
     AgentRepository,
     ArtifactRepository,
+    EmbeddingProvider,
     InterviewRepository,
     JobRepository,
+    KnowledgeBlobStorage,
+    KnowledgeFileParser,
     KnowledgeRepository,
     ModelProvider,
     Renderer,
@@ -143,6 +147,7 @@ class ServiceDependencies:
 
     network: NetworkSettings
     ai: AISettings
+    knowledge: KnowledgeSettings
     supervisor: BoundedTaskSupervisor
     telemetry: BufferedTelemetrySink
 
@@ -1528,6 +1533,9 @@ class KnowledgeApplicationService:
         self,
         repository: KnowledgeRepository,
         jobs: JobRepository,
+        blob_storage: KnowledgeBlobStorage,
+        file_parser: KnowledgeFileParser,
+        embedding_provider: EmbeddingProvider,
         dependencies: ServiceDependencies,
         locks: ScopedKeyLocks,
     ) -> None:
@@ -1540,6 +1548,9 @@ class KnowledgeApplicationService:
         """
         self._repository = repository
         self._jobs = jobs
+        self._blob_storage = blob_storage
+        self._file_parser = file_parser
+        self._embedding_provider = embedding_provider
         self._dependencies = dependencies
         self._locks = locks
 
@@ -1666,6 +1677,132 @@ class KnowledgeApplicationService:
         )
         await self._repository.create_source(scope, record)
         return record
+
+    async def create_file_source(
+        self,
+        scope: ActorScope,
+        *,
+        filename: str,
+        content_type: str,
+        content: bytes,
+        name: str | None,
+        request_id: str | None,
+    ) -> tuple[KnowledgeSourceRecord, dict[str, Any]]:
+        """Create, privately store, and enqueue one uploaded knowledge file."""
+        normalized_filename, normalized_content_type = _validate_knowledge_file(
+            filename,
+            content_type,
+            content,
+            self._dependencies.knowledge.max_upload_bytes,
+        )
+        source_id = new_opaque_id("src")
+        file_id = new_opaque_id("file")
+        blob = await self._blob_storage.put(
+            scope,
+            file_id,
+            normalized_filename,
+            normalized_content_type,
+            content,
+        )
+        timestamp = utc_now()
+        record = KnowledgeSourceRecord(
+            scope=scope,
+            id=source_id,
+            created_at=timestamp,
+            updated_at=timestamp,
+            name=(name or normalized_filename).strip(),
+            source_type="file",
+            config=_file_source_config(blob),
+            visibility=_default_visibility(),
+            source_metadata={
+                "filename": blob.filename,
+                "content_type": blob.content_type,
+                "size_bytes": blob.size_bytes,
+                "sha256": blob.sha256,
+            },
+            private_metadata={"storage_key": blob.storage_key},
+        )
+        persisted = False
+        try:
+            await self._repository.create_source(scope, record)
+            persisted = True
+            async with self._locks.hold(scope, source_id):
+                job = await self._create_ingestion_job_locked(
+                    scope,
+                    record,
+                    request_id,
+                    raise_on_backpressure=True,
+                )
+        except BaseException:
+            if not persisted:
+                await self._blob_storage.delete(scope, blob.storage_key)
+            raise
+        return record, job
+
+    async def replace_file_source(
+        self,
+        scope: ActorScope,
+        source_id: str,
+        *,
+        filename: str,
+        content_type: str,
+        content: bytes,
+        request_id: str | None,
+    ) -> tuple[KnowledgeSourceRecord, dict[str, Any]]:
+        """Attach immutable new file bytes to a stable source and enqueue a new version."""
+        normalized_filename, normalized_content_type = _validate_knowledge_file(
+            filename,
+            content_type,
+            content,
+            self._dependencies.knowledge.max_upload_bytes,
+        )
+        blob = await self._blob_storage.put(
+            scope,
+            new_opaque_id("file"),
+            normalized_filename,
+            normalized_content_type,
+            content,
+        )
+        attached = False
+        try:
+            async with self._locks.hold(scope, source_id):
+                source = await self.get_source(scope, source_id)
+                if source.source_type != "file":
+                    raise DomainError(
+                        Problem(
+                            "knowledge.source_not_file",
+                            409,
+                            "Only file knowledge sources accept uploaded versions",
+                        )
+                    )
+                source.config = _file_source_config(blob)
+                source.source_metadata = {
+                    "filename": blob.filename,
+                    "content_type": blob.content_type,
+                    "size_bytes": blob.size_bytes,
+                    "sha256": blob.sha256,
+                }
+                source.private_metadata = {"storage_key": blob.storage_key}
+                source.document_parts = []
+                source.mock_content = ""
+                source.ingestion_status = (
+                    "stale" if source.source_version_id is not None else "not_started"
+                )
+                source.updated_at = utc_now()
+                source.revision += 1
+                await self._repository.save_source(scope, source)
+                attached = True
+                job = await self._create_ingestion_job_locked(
+                    scope,
+                    source,
+                    request_id,
+                    raise_on_backpressure=True,
+                )
+        except BaseException:
+            if not attached:
+                await self._blob_storage.delete(scope, blob.storage_key)
+            raise
+        return source, job
 
     async def list_sources(self, scope: ActorScope) -> list[KnowledgeSourceRecord]:
         """@brief 列出范围内知识来源 / List scoped knowledge sources.
@@ -1811,9 +1948,8 @@ class KnowledgeApplicationService:
             candidates = [source for source in candidates if source.id in source_filter]
         elif source_filter:
             candidates = [source for source in candidates if source.id in source_filter]
-        query_tokens = set(str(request["query"]).lower().split())
         agent_scope = str(selection.get("agent_scope", "general_chat"))
-        results: list[tuple[float, KnowledgeSourceRecord, KnowledgeChunk]] = []
+        allowed: list[tuple[KnowledgeSourceRecord, KnowledgeChunk]] = []
         for source in candidates:
             if (
                 source.id in excluded
@@ -1824,11 +1960,8 @@ class KnowledgeApplicationService:
                 or not _is_allowed(source.visibility, agent_scope, "retrieve")
             ):
                 continue
-            for chunk in source.chunks:
-                score = _lexical_score(query_tokens, chunk.text)
-                if score > 0:
-                    results.append((score, source, chunk))
-        results.sort(key=lambda item: item[0], reverse=True)
+            allowed.extend((source, chunk) for chunk in source.chunks)
+        results = await self._rank_chunks(str(request["query"]), allowed)
         include_quotes = bool(request["include_quotes"])
         return [
             _search_result(score, source, chunk, include_quotes)
@@ -1844,8 +1977,7 @@ class KnowledgeApplicationService:
     ) -> list[dict[str, Any]]:
         """Return current, Resume-authorized chunks for Proposal grounding."""
         requested = set(source_ids)
-        query_tokens = set(query.lower().split())
-        ranked: list[tuple[float, KnowledgeSourceRecord, KnowledgeChunk]] = []
+        allowed: list[tuple[KnowledgeSourceRecord, KnowledgeChunk]] = []
         for source in await self._repository.list_sources(scope):
             if (
                 (requested and source.id not in requested)
@@ -1856,12 +1988,8 @@ class KnowledgeApplicationService:
                 or not _is_allowed(source.visibility, "resume_assistant", "retrieve")
             ):
                 continue
-            for chunk in source.chunks:
-                score = _lexical_score(query_tokens, chunk.text)
-                ranked.append((score, source, chunk))
-        ranked.sort(key=lambda item: (item[0], -item[2].ordinal), reverse=True)
-        if any(score > 0 for score, _, _ in ranked):
-            ranked = [item for item in ranked if item[0] > 0]
+            allowed.extend((source, chunk) for chunk in source.chunks)
+        ranked = await self._rank_chunks(query, allowed)
         return [
             {
                 "source_id": source.id,
@@ -1878,6 +2006,54 @@ class KnowledgeApplicationService:
             for score, source, chunk in ranked[:limit]
             if chunk.text.strip()
         ]
+
+    async def _rank_chunks(
+        self,
+        query: str,
+        allowed: list[tuple[KnowledgeSourceRecord, KnowledgeChunk]],
+    ) -> list[tuple[float, KnowledgeSourceRecord, KnowledgeChunk]]:
+        """Hybrid-rank an already authorized chunk subset."""
+        if not allowed:
+            return []
+        spaces = {chunk.embedding_space_id for _, chunk in allowed}
+        if len(spaces) != 1:
+            raise DomainError(
+                Problem(
+                    "knowledge.embedding_space_mismatch",
+                    409,
+                    "Authorized chunks span incompatible embedding spaces",
+                )
+            )
+        query_vectors = await self._embedding_provider.embed([query])
+        if len(query_vectors) != 1:
+            raise RuntimeError("embedding provider returned an invalid query batch")
+        chunk_by_id = {chunk.id: (source, chunk) for source, chunk in allowed}
+        ranked_vectors = await self._repository.rank_chunks_by_vector(
+            allowed[0][0].scope,
+            list(chunk_by_id),
+            next(iter(spaces)),
+            query_vectors[0],
+            len(chunk_by_id),
+        )
+        vector_scores = dict(ranked_vectors)
+        query_tokens = set(query.lower().split())
+        ranked = [
+            (
+                min(
+                    1.0,
+                    max(
+                        0.0,
+                        0.65 * vector_scores.get(chunk.id, 0.0)
+                        + 0.35 * _lexical_score(query_tokens, chunk.text),
+                    ),
+                ),
+                source,
+                chunk,
+            )
+            for source, chunk in allowed
+        ]
+        ranked.sort(key=lambda item: (item[0], -item[2].ordinal), reverse=True)
+        return ranked
 
     async def _ingest(
         self,
@@ -1921,7 +2097,56 @@ class KnowledgeApplicationService:
                     service="backend.worker",
                 )
                 return
-            job.phase = "indexing"
+            job.phase = "parsing"
+            source.ingestion_status = "parsing"
+            await self._repository.save_source(scope, source)
+            if source.source_type == "file":
+                raw_storage_key = source.private_metadata.get("storage_key")
+                raw_filename = source.config.get("filename")
+                raw_content_type = source.config.get("content_type")
+                if (
+                    not isinstance(raw_storage_key, str)
+                    or not raw_storage_key
+                    or not isinstance(raw_filename, str)
+                    or not raw_filename
+                    or not isinstance(raw_content_type, str)
+                    or not raw_content_type
+                ):
+                    raise DomainError(
+                        Problem(
+                            "knowledge.file_storage_metadata_invalid",
+                            500,
+                            "Stored knowledge file metadata is invalid",
+                        )
+                    )
+                storage_key = raw_storage_key
+                filename = raw_filename
+                content_type = raw_content_type
+                try:
+                    raw_content = await self._blob_storage.read(scope, storage_key)
+                except FileNotFoundError as error:
+                    raise DomainError(
+                        Problem(
+                            "knowledge.file_blob_not_found",
+                            409,
+                            "Stored knowledge file bytes are unavailable",
+                        )
+                    ) from error
+                parsed = await self._file_parser.parse(filename, content_type, raw_content)
+                semantic_parts = list(parsed.parts)
+                source.source_metadata = {
+                    **source.source_metadata,
+                    "parser": deepcopy(parsed.metadata),
+                }
+            else:
+                semantic_parts = source.document_parts or [
+                    KnowledgeDocumentPart(
+                        text=source.mock_content,
+                        content_type=source.classification.content_type,
+                        metadata=deepcopy(source.source_metadata),
+                    )
+                ]
+            job.phase = "embedding"
             source.ingestion_status = "chunking"
             await self._repository.save_source(scope, source)
             space = await self._repository.get_embedding_space(scope)
@@ -1946,13 +2171,6 @@ class KnowledgeApplicationService:
                     )
                 )
             source_version_id = new_opaque_id("srcver")
-            semantic_parts = source.document_parts or [
-                KnowledgeDocumentPart(
-                    text=source.mock_content,
-                    content_type=source.classification.content_type,
-                    metadata=deepcopy(source.source_metadata),
-                )
-            ]
             chunk_inputs: list[tuple[str, KnowledgeClassification, dict[str, Any]]] = []
             for part in semantic_parts:
                 part_classification = KnowledgeClassification(
@@ -1962,8 +2180,31 @@ class KnowledgeApplicationService:
                     lifecycle=source.classification.lifecycle,
                     visibility=source.classification.visibility,
                 )
-                for text in _chunk_text(part.text):
-                    chunk_inputs.append((text, part_classification, deepcopy(part.metadata)))
+                for chunk_index, text in enumerate(
+                    _chunk_text(
+                        part.text,
+                        self._dependencies.knowledge.chunk_max_characters,
+                        self._dependencies.knowledge.chunk_overlap_characters,
+                    )
+                ):
+                    metadata = {**deepcopy(part.metadata), "chunk_index": chunk_index}
+                    chunk_inputs.append((text, part_classification, metadata))
+            source.ingestion_status = "embedding"
+            await self._repository.save_source(scope, source)
+            vectors = await self._embedding_provider.embed(
+                [text for text, _, _ in chunk_inputs]
+            )
+            if len(vectors) != len(chunk_inputs) or any(
+                len(vector) != space.dimension for vector in vectors
+            ):
+                raise DomainError(
+                    Problem(
+                        "knowledge.embedding_response_invalid",
+                        502,
+                        "Embedding provider returned incompatible vectors",
+                        retryable=True,
+                    )
+                )
             source.chunks = [
                 KnowledgeChunk(
                     new_opaque_id("chunk"),
@@ -1972,7 +2213,7 @@ class KnowledgeApplicationService:
                     space.id,
                     index,
                     text,
-                    _deterministic_vector(text, space.dimension),
+                    vectors[index],
                     classification,
                     metadata,
                 )
@@ -2605,6 +2846,72 @@ def _validate_resume_source(source: KnowledgeSourceRecord, resume_id: str) -> No
     )
 
 
+def _file_source_config(blob: StoredKnowledgeBlob) -> dict[str, Any]:
+    """Build the formal public FileSourceConfig without leaking a storage key."""
+    return {
+        "source_type": "file",
+        "file_id": blob.file_id,
+        "filename": blob.filename,
+        "content_type": blob.content_type,
+        "sha256": blob.sha256,
+    }
+
+
+def _validate_knowledge_file(
+    filename: str,
+    content_type: str,
+    content: bytes,
+    max_upload_bytes: int,
+) -> tuple[str, str]:
+    """Validate bounded file metadata, extension, MIME, and basic magic bytes."""
+    normalized_filename = filename.strip()
+    if not normalized_filename or len(normalized_filename) > 300:
+        raise DomainError(
+            Problem("knowledge.filename_invalid", 422, "Knowledge filename is invalid")
+        )
+    if len(content) == 0:
+        raise DomainError(
+            Problem("knowledge.file_empty", 422, "Knowledge file cannot be empty")
+        )
+    if len(content) > max_upload_bytes:
+        raise DomainError(
+            Problem(
+                "knowledge.file_too_large",
+                413,
+                "Knowledge file exceeds the configured upload limit",
+            )
+        )
+    _, separator, suffix = normalized_filename.lower().rpartition(".")
+    allowed = {
+        "txt": "text/plain",
+        "md": "text/markdown",
+        "markdown": "text/markdown",
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+    expected = allowed.get(suffix) if separator else None
+    if expected is None:
+        raise DomainError(
+            Problem("knowledge.file_type_unsupported", 422, "Knowledge file type is unsupported")
+        )
+    normalized_content_type = content_type.lower().split(";", 1)[0].strip()
+    if normalized_content_type in {"", "application/octet-stream"}:
+        normalized_content_type = expected
+    if normalized_content_type != expected:
+        raise DomainError(
+            Problem(
+                "knowledge.file_type_mismatch",
+                422,
+                "Knowledge filename and content type do not match",
+            )
+        )
+    if suffix == "pdf" and not content.startswith(b"%PDF-"):
+        raise DomainError(Problem("knowledge.pdf_invalid", 422, "PDF signature is invalid"))
+    if suffix == "docx" and not content.startswith(b"PK"):
+        raise DomainError(Problem("knowledge.docx_invalid", 422, "DOCX signature is invalid"))
+    return normalized_filename, normalized_content_type
+
+
 def _mock_source_config(source_type: str, name: str, content: str, location: str | None) -> dict[str, Any]:
     """@brief 构造合法但明确 mock 的来源 config / Build a valid but explicitly mock source config.
 
@@ -2632,7 +2939,11 @@ def _zero_ingestion_stats() -> dict[str, int]:
     return {"documents": 0, "chunks": 0, "embedded_tokens": 0, "skipped": 0}
 
 
-def _chunk_text(content: str, max_characters: int = 800) -> list[str]:
+def _chunk_text(
+    content: str,
+    max_characters: int = 800,
+    overlap_characters: int = 80,
+) -> list[str]:
     """@brief 稳定切分文本 / Split text deterministically.
 
     @param content 已解析纯文本 / Parsed plain text.
@@ -2641,21 +2952,27 @@ def _chunk_text(content: str, max_characters: int = 800) -> list[str]:
     """
     normalized = content.strip()
     if not normalized:
-        return [""]
-    return [normalized[offset : offset + max_characters] for offset in range(0, len(normalized), max_characters)]
-
-
-def _deterministic_vector(text: str, dimension: int) -> tuple[float, ...]:
-    """@brief 生成确定性 mock embedding / Generate a deterministic mock embedding.
-
-    @param text 待嵌入文本 / Text to embed.
-    @param dimension embedding 维度 / Embedding dimension.
-    @return L2 归一化向量 / L2-normalized vector.
-    """
-    digest = hashlib.sha256(text.encode("utf-8")).digest()
-    values = [((digest[index % len(digest)] / 255.0) * 2 - 1) for index in range(dimension)]
-    norm = sum(value * value for value in values) ** 0.5
-    return tuple(value / norm for value in values) if norm else tuple(0.0 for _ in values)
+        return []
+    chunks: list[str] = []
+    start = 0
+    boundary_window = max(80, max_characters // 3)
+    while start < len(normalized):
+        hard_end = min(start + max_characters, len(normalized))
+        end = hard_end
+        if hard_end < len(normalized):
+            window_start = max(start + 1, hard_end - boundary_window)
+            for marker in ("\n\n", "\n", "。", ". ", "；", "; ", "，", ", ", " "):
+                candidate = normalized.rfind(marker, window_start, hard_end)
+                if candidate >= window_start:
+                    end = candidate + len(marker)
+                    break
+        value = normalized[start:end].strip()
+        if value:
+            chunks.append(value)
+        if end >= len(normalized):
+            break
+        start = max(end - overlap_characters, start + 1)
+    return chunks
 
 
 def _is_allowed(policy: dict[str, Any], agent_scope: str, operation: str) -> bool:
@@ -2721,7 +3038,15 @@ def _search_result(
             "source_version_id": chunk.source_version_id,
             "title": source.name,
             "uri": source.config.get("url") or source.config.get("repository_url"),
-            "locator": {"page": None, "line_start": None, "line_end": None, "time_start_ms": None, "time_end_ms": None, "symbol": None, "path": None},
+            "locator": {
+                "page": chunk.metadata.get("page"),
+                "line_start": chunk.metadata.get("line_start"),
+                "line_end": chunk.metadata.get("line_end"),
+                "time_start_ms": None,
+                "time_end_ms": None,
+                "symbol": chunk.metadata.get("heading"),
+                "path": chunk.metadata.get("path"),
+            },
             "quote": chunk.text[:4000] if include_quotes else None,
             "score": score,
         },

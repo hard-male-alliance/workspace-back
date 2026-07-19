@@ -5,14 +5,26 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated, Any, cast
 
-from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    Header,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from backend.api.models import (
+    KnowledgeFileUploadResponse,
     KnowledgeSourceListResponse,
     MockConversationCreateRequest,
     MockEndRequest,
@@ -39,6 +51,29 @@ _MAX_IDEMPOTENCY_KEY_LENGTH = 256
 
 _DEFAULT_PAGE_LIMIT = 20
 _MAX_PAGE_LIMIT = 100
+
+_UPLOAD_READ_SIZE = 64 * 1024
+
+
+async def _read_bounded_upload(upload: UploadFile, maximum_bytes: int) -> bytes:
+    """Read multipart content without accepting a body beyond the configured limit."""
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        while chunk := await upload.read(_UPLOAD_READ_SIZE):
+            size += len(chunk)
+            if size > maximum_bytes:
+                raise DomainError(
+                    Problem(
+                        "knowledge.file_too_large",
+                        413,
+                        "Knowledge file exceeds the configured upload limit",
+                    )
+                )
+            chunks.append(chunk)
+    finally:
+        await upload.close()
+    return b"".join(chunks)
 
 
 def _container(request: Request) -> BackendContainer:
@@ -759,6 +794,118 @@ async def create_knowledge_source(request: Request, body: MockKnowledgeSourceCre
         return source.as_dict()
 
     return await _idempotent(request, scope, "/knowledge-sources", body.model_dump(mode="json"), 201, operation)
+
+
+@router.post(
+    "/knowledge-sources/uploads",
+    status_code=202,
+    response_model=KnowledgeFileUploadResponse,
+    openapi_extra={
+        "x-contract-status": "mock",
+        "x-pending-contract": "Direct multipart alternative to UploadSession",
+    },
+)
+async def upload_knowledge_source(
+    request: Request,
+    file: Annotated[UploadFile, File()],
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=_MAX_IDEMPOTENCY_KEY_LENGTH),
+    ],
+    name: Annotated[str | None, Form(max_length=300)] = None,
+) -> JSONResponse:
+    """Create and enqueue a bounded TXT, Markdown, PDF, or DOCX source."""
+    del idempotency_key
+    scope = _scope_from_headers(request)
+    content = await _read_bounded_upload(
+        file,
+        _container(request).settings.knowledge.max_upload_bytes,
+    )
+    filename = file.filename or ""
+    content_type = file.content_type or ""
+    body_fingerprint = {
+        "filename": filename,
+        "content_type": content_type,
+        "name": name,
+        "size_bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+    async def operation() -> dict[str, Any]:
+        source, job = await _container(request).knowledge.create_file_source(
+            scope,
+            filename=filename,
+            content_type=content_type,
+            content=content,
+            name=name,
+            request_id=_request_id(request),
+        )
+        return {"source": source.as_dict(), "ingestion_job": job}
+
+    return await _idempotent(
+        request,
+        scope,
+        "/knowledge-sources/uploads",
+        body_fingerprint,
+        202,
+        operation,
+    )
+
+
+@router.post(
+    "/knowledge-sources/{source_id}/versions",
+    status_code=202,
+    response_model=KnowledgeFileUploadResponse,
+    openapi_extra={
+        "x-contract-status": "mock",
+        "x-pending-contract": "Direct multipart source-version upload",
+    },
+)
+async def upload_knowledge_source_version(
+    request: Request,
+    source_id: str,
+    file: Annotated[UploadFile, File()],
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=_MAX_IDEMPOTENCY_KEY_LENGTH),
+    ],
+) -> JSONResponse:
+    """Upload immutable new bytes while preserving the stable source ID."""
+    del idempotency_key
+    scope = _scope_from_headers(request)
+    content = await _read_bounded_upload(
+        file,
+        _container(request).settings.knowledge.max_upload_bytes,
+    )
+    filename = file.filename or ""
+    content_type = file.content_type or ""
+    body_fingerprint = {
+        "source_id": source_id,
+        "filename": filename,
+        "content_type": content_type,
+        "size_bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+    async def operation() -> dict[str, Any]:
+        source, job = await _container(request).knowledge.replace_file_source(
+            scope,
+            source_id,
+            filename=filename,
+            content_type=content_type,
+            content=content,
+            request_id=_request_id(request),
+        )
+        return {"source": source.as_dict(), "ingestion_job": job}
+
+    return await _idempotent(
+        request,
+        scope,
+        "/knowledge-sources/{source_id}/versions",
+        body_fingerprint,
+        202,
+        operation,
+    )
 
 
 @router.get("/knowledge-sources", response_model=KnowledgeSourceListResponse)

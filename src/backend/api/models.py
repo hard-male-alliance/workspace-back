@@ -102,6 +102,18 @@ class KnowledgeSourceListResponse(BaseModel):
     page: CursorPage
 
 
+class KnowledgeFileUploadResponse(BaseModel):
+    """Temporary direct-upload response while the formal upload contract is pending."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"x-contract-status": "mock", "x-pending-contract": True},
+    )
+
+    source: dict[str, Any]
+    ingestion_job: dict[str, Any]
+
+
 class TemplateManifestListResponse(BaseModel):
     """Paginated formal TemplateManifest collection."""
 

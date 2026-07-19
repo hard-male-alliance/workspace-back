@@ -32,8 +32,11 @@ from backend.domain.ports import (
 )
 from backend.infrastructure.concurrency import BoundedTaskSupervisor, WorkLimits
 from backend.infrastructure.contracts import ContractValidator
+from backend.infrastructure.embeddings import DeterministicEmbeddingProvider
 from backend.infrastructure.idempotency import IdempotencyRegistry
 from backend.infrastructure.identity import IdentityResolver, build_identity_resolver
+from backend.infrastructure.knowledge_parsing import LocalKnowledgeFileParser
+from backend.infrastructure.knowledge_storage import LocalKnowledgeBlobStorage
 from backend.infrastructure.logging import configure_logging, remove_logging_handler
 from backend.infrastructure.memory import InMemoryWorkspaceRepository
 from backend.infrastructure.persistence import (
@@ -157,13 +160,33 @@ async def build_container(settings: BackendSettings, project_root: Path) -> Asyn
         if database is not None:
             await database.aclose()
         raise
-    dependencies = ServiceDependencies(settings.network, settings.ai, supervisor, telemetry)
+    dependencies = ServiceDependencies(
+        settings.network,
+        settings.ai,
+        settings.knowledge,
+        supervisor,
+        telemetry,
+    )
     locks = ScopedKeyLocks()
+    blob_root = settings.knowledge.blob_directory
+    if not blob_root.is_absolute():
+        blob_root = project_root / blob_root
+    blob_storage = LocalKnowledgeBlobStorage(blob_root)
+    file_parser = LocalKnowledgeFileParser(settings.knowledge.max_extracted_characters)
+    embedding_provider = DeterministicEmbeddingProvider(settings.ai.embedding_dimension)
     try:
         async with supervisor:
             telemetry.start(supervisor)
             logging_handler = configure_logging(settings.logging, telemetry)
-            knowledge = KnowledgeApplicationService(storage, storage, dependencies, locks)
+            knowledge = KnowledgeApplicationService(
+                storage,
+                storage,
+                blob_storage,
+                file_parser,
+                embedding_provider,
+                dependencies,
+                locks,
+            )
             resume = ResumeApplicationService(
                 storage,
                 storage,
