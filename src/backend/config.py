@@ -81,6 +81,17 @@ class RuntimeSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class KnowledgeSettings:
+    """File-ingestion limits and local blob-storage settings."""
+
+    blob_directory: Path
+    max_upload_bytes: int
+    max_extracted_characters: int
+    chunk_max_characters: int
+    chunk_overlap_characters: int
+
+
+@dataclass(frozen=True, slots=True)
 class RendererSettings:
     """@brief 简历编译器设置 / Resume renderer settings."""
 
@@ -202,6 +213,7 @@ class BackendSettings:
     network: NetworkSettings
     database: DatabaseSettings
     runtime: RuntimeSettings
+    knowledge: KnowledgeSettings
     renderer: RendererSettings
     ai: AISettings
     observability: ObservabilitySettings
@@ -225,6 +237,7 @@ class BackendSettings:
         network = require_mapping(root.get("network"), "network")
         database = require_mapping(root.get("database"), "database")
         runtime = require_mapping(root.get("runtime"), "runtime")
+        knowledge = require_mapping(root.get("knowledge"), "knowledge")
         renderer = require_mapping(root.get("resume_rendering"), "resume_rendering")
         ai = require_mapping(root.get("ai"), "ai")
         observability = require_mapping(root.get("observability"), "observability")
@@ -242,6 +255,14 @@ class BackendSettings:
         )
         font_directories = renderer.get("allowed_font_directories", [])
         fallback_providers = ai.get("fallback_providers", [])
+        chunk_max_characters = _require_positive_int(knowledge, "chunk_max_characters")
+        chunk_overlap_characters = _require_non_negative_int(
+            knowledge, "chunk_overlap_characters"
+        )
+        if chunk_overlap_characters >= chunk_max_characters:
+            raise ConfigurationError(
+                "knowledge.chunk_overlap_characters must be smaller than chunk_max_characters"
+            )
         if not isinstance(font_directories, list) or not all(isinstance(item, str) for item in font_directories):
             raise ConfigurationError("resume_rendering.allowed_font_directories must be a string array")
         if not isinstance(fallback_providers, list):
@@ -285,6 +306,15 @@ class BackendSettings:
                 interview_concurrency=_require_positive_int(runtime, "interview_concurrency"),
                 job_queue_capacity=_require_positive_int(runtime, "job_queue_capacity"),
                 sse_heartbeat_ms=_require_positive_int(runtime, "sse_heartbeat_ms"),
+            ),
+            knowledge=KnowledgeSettings(
+                blob_directory=Path(_require_string(knowledge, "blob_directory")),
+                max_upload_bytes=_require_positive_int(knowledge, "max_upload_bytes"),
+                max_extracted_characters=_require_positive_int(
+                    knowledge, "max_extracted_characters"
+                ),
+                chunk_max_characters=chunk_max_characters,
+                chunk_overlap_characters=chunk_overlap_characters,
             ),
             renderer=RendererSettings(
                 adapter=renderer_adapter,

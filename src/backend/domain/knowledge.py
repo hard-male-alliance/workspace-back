@@ -122,6 +122,26 @@ class KnowledgeDocumentPart:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredKnowledgeBlob:
+    """Opaque metadata for one file stored behind the blob-storage port."""
+
+    file_id: str
+    storage_key: str
+    filename: str
+    content_type: str
+    sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedKnowledgeDocument:
+    """Structured parser output with stable source locators."""
+
+    parts: tuple[KnowledgeDocumentPart, ...]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class EmbeddingSpace:
     """@brief 不可变 embedding 空间 / Immutable embedding space.
 
@@ -158,6 +178,7 @@ class KnowledgeSourceRecord:
     mock_content: str = ""
     classification: KnowledgeClassification = field(default_factory=KnowledgeClassification)
     source_metadata: dict[str, Any] = field(default_factory=dict)
+    private_metadata: dict[str, Any] = field(default_factory=dict)
     document_parts: list[KnowledgeDocumentPart] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:

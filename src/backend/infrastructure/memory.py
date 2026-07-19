@@ -301,6 +301,36 @@ class InMemoryWorkspaceRepository:
                 raise ValueError("embedding spaces are immutable; create a data migration for a new space")
             self._spaces[key] = space
 
+    async def rank_chunks_by_vector(
+        self,
+        scope: ActorScope,
+        chunk_ids: list[str],
+        embedding_space_id: str,
+        query_vector: tuple[float, ...],
+        limit: int,
+    ) -> list[tuple[str, float]]:
+        """Rank an authorized chunk subset with normalized cosine similarity."""
+        authorized = set(chunk_ids)
+        ranked: list[tuple[str, float]] = []
+        async with self._lock:
+            for source in self._sources.values():
+                if not _same_scope(scope, source.scope):
+                    continue
+                for chunk in source.chunks:
+                    if (
+                        chunk.id not in authorized
+                        or chunk.embedding_space_id != embedding_space_id
+                        or len(chunk.vector) != len(query_vector)
+                    ):
+                        continue
+                    dot = sum(
+                        left * right
+                        for left, right in zip(chunk.vector, query_vector, strict=True)
+                    )
+                    ranked.append((chunk.id, min(1.0, max(0.0, (dot + 1.0) / 2.0))))
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        return ranked[:limit]
+
     async def create_job(self, scope: ActorScope, job: Job) -> None:
         """@brief 保存新 Job / Persist a new Job.
 

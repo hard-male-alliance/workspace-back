@@ -1,5 +1,9 @@
 # v0.1.0 契约覆盖与安全边界
 
+## 2026-07-19 文件知识导入增量说明
+
+当前增加了 `POST /api/v1/knowledge-sources/uploads` 与 `POST /api/v1/knowledge-sources/{source_id}/versions`，用于 TXT、Markdown、PDF、DOCX 的直接 multipart 联调。这两个路径不是正式 UploadSession 契约，OpenAPI 中保持 `x-contract-status: mock`。已实现的领域能力包括私有 blob 存储端口、不可变来源版本、结构化 locator、异步解析/切块/embedding、pgvector 与词法混合检索；尚未冻结对象存储签名、病毒扫描、OCR、删除/保留、批量上传和生产 embedding provider 协议。详见 `docs/decisions/0002-personal-knowledge-file-ingestion.md` 与 `docs/FRONTEND_KNOWLEDGE_INGESTION_HANDOFF.md`。
+
 `contract/ai-job-workspace.contract.schema.json` 是唯一正式的机器可读数据结构来源。它不是 OpenAPI 或 AsyncAPI：目前没有完整、可发布的 `method + path + request + response + header + status` 契约包；部分已实现路由仅通过 FastAPI 暴露 OpenAPI 绑定。本文件不修改、更不推断正式契约；它记录当前实现的覆盖面和所有明确的 mock 边界。
 
 状态含义：**正式结构**表示请求使用已有 Schema 定义校验，或响应使用已有资源结构；**半正式**表示已有 `$defs` 但路径或响应包装未定义；**Mock** 表示使用 `Mock*` DTO、`x-contract-status: mock` 或 mock 传输；**未实现** 表示合同 Markdown 列出但没有路由。
