@@ -72,3 +72,58 @@ class MockToolApprovalDecision(MockContractAdapter):
     """@brief Tool approval 决策 mock 请求 / Mock request for a tool-approval decision."""
 
     decision: Literal["approved", "rejected"]
+
+
+class CursorPage(BaseModel):
+    """Opaque cursor metadata shared by browser-facing collection endpoints."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    next_cursor: str | None = None
+    has_more: bool
+    total_estimate: int | None = Field(default=None, ge=0)
+
+
+class ResumeListResponse(BaseModel):
+    """Paginated formal ResumeDocument collection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[dict[str, Any]]
+    page: CursorPage
+
+
+class KnowledgeSourceListResponse(BaseModel):
+    """Paginated formal KnowledgeSource collection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[dict[str, Any]]
+    page: CursorPage
+
+
+class TemplateManifestListResponse(BaseModel):
+    """Paginated formal TemplateManifest collection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[dict[str, Any]]
+    page: CursorPage
+
+
+class ResumeProposalListResponse(BaseModel):
+    """Paginated ResumeProposal collection for page reload recovery."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[dict[str, Any]]
+    page: CursorPage
+
+
+class RenderArtifactListResponse(BaseModel):
+    """Paginated RenderArtifact metadata collection for preview discovery."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[dict[str, Any]]
+    page: CursorPage

@@ -17,6 +17,8 @@
     "bind_port": 8000,
     // 生成短期回调/连接描述时使用的外部基址。
     "public_base_url": "https://workspace.example.cn",
+    // 浏览器可访问产品 API 的精确 Origin；生产建议同源部署并保留空数组。
+    "cors_allowed_origins": [],
     // trusted_proxy_hmac 只接受这些实际 TCP 对端的签名断言；绝不信任客户端 forwarded headers。
     "trusted_proxy_cidrs": ["127.0.0.1/32"],
     // 统一为所有外部 HTTP 客户端配置的可选代理；null 表示禁用。

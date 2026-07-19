@@ -46,6 +46,7 @@ from backend.domain.proposal import (
     ProposalCitation,
     ResumeProposalOperation,
     ResumeProposalRecord,
+    ResumeProposalStatus,
 )
 from backend.domain.resume import ResumeRecord, create_empty_document
 from backend.infrastructure.concurrency import BackpressureError, BoundedTaskSupervisor
@@ -448,6 +449,13 @@ class ResumeApplicationService:
             raise DomainError(Problem("resume.artifact_not_found", 404, "Render artifact was not found"))
         return artifact
 
+    async def list_artifacts(
+        self, scope: ActorScope, resume_id: str
+    ) -> list[dict[str, Any]]:
+        """List public artifact metadata for a scoped Resume."""
+        await self.get_resume(scope, resume_id)
+        return await self._artifacts.list_artifacts(scope, resume_id)
+
     async def _render_job(self, scope: ActorScope, document: dict[str, Any], job: Job) -> None:
         """@brief 执行实际渲染工作 / Execute the actual render work.
 
@@ -627,6 +635,32 @@ class ResumeProposalApplicationService:
         if record.expire_if_needed():
             await self._repository.save_proposal(scope, record)
         return record
+
+    async def list_proposals(
+        self,
+        scope: ActorScope,
+        resume_id: str,
+        status: str | None = None,
+    ) -> list[ResumeProposalRecord]:
+        """List proposals for page reload recovery and persist observed expirations."""
+        await self._resumes.get_resume(scope, resume_id)
+        if status is not None:
+            try:
+                expected_status = ResumeProposalStatus(status)
+            except ValueError as error:
+                raise DomainError(
+                    Problem("resume.proposal_status_invalid", 400, "Proposal status is invalid")
+                ) from error
+        else:
+            expected_status = None
+        records = await self._repository.list_proposals(scope, resume_id)
+        visible: list[ResumeProposalRecord] = []
+        for record in records:
+            if record.expire_if_needed():
+                await self._repository.save_proposal(scope, record)
+            if expected_status is None or record.status is expected_status:
+                visible.append(record)
+        return visible
 
     async def decide(
         self,

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from backend.api.models import (
+    KnowledgeSourceListResponse,
     MockConversationCreateRequest,
     MockEndRequest,
     MockKnowledgeSourceCreateRequest,
@@ -18,9 +21,14 @@ from backend.api.models import (
     MockResumeCreateRequest,
     MockResumeProposalCreateRequest,
     MockToolApprovalDecision,
+    RenderArtifactListResponse,
+    ResumeListResponse,
+    ResumeProposalListResponse,
+    TemplateManifestListResponse,
 )
 from backend.composition import BackendContainer
 from backend.domain.common import DomainError, Problem
+from backend.domain.templates import get_template_manifest, list_template_manifests
 from backend.infrastructure.identity import IdentityVerificationError, peer_is_trusted_proxy
 from workspace_shared.tenancy import ActorScope
 
@@ -28,6 +36,9 @@ router = APIRouter(prefix="/api/v1")
 
 _MAX_IDEMPOTENCY_KEY_LENGTH = 256
 """@brief 与持久化 ``VARCHAR(256)`` 对齐的 Idempotency-Key 最大长度 / Maximum Idempotency-Key length matching persistence."""
+
+_DEFAULT_PAGE_LIMIT = 20
+_MAX_PAGE_LIMIT = 100
 
 
 def _container(request: Request) -> BackendContainer:
@@ -201,8 +212,103 @@ async def _formal_payload(request: Request, entrypoint: str) -> dict[str, Any]:
     return payload
 
 
-@router.get("/resumes")
-async def list_resumes(request: Request) -> dict[str, Any]:
+def _cursor_key(item: dict[str, Any]) -> tuple[str, str]:
+    """Return the stable newest-first collection key."""
+    updated_at = item.get("updated_at")
+    item_id = item.get("id")
+    if not isinstance(updated_at, str) or not isinstance(item_id, str):
+        raise RuntimeError("cursor-paginated resources require updated_at and id")
+    return updated_at, item_id
+
+
+def _encode_cursor(item: dict[str, Any]) -> str:
+    """Encode a versioned opaque keyset cursor."""
+    updated_at, item_id = _cursor_key(item)
+    payload = json.dumps(
+        {"v": 1, "updated_at": updated_at, "id": item_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[str, str]:
+    """Decode an opaque keyset cursor without accepting arbitrary shapes."""
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.b64decode(cursor + padding, altchars=b"-_", validate=True))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise DomainError(
+            Problem("http.cursor_invalid", 400, "Pagination cursor is invalid")
+        ) from error
+    if (
+        not isinstance(payload, dict)
+        or payload.get("v") != 1
+        or not isinstance(payload.get("updated_at"), str)
+        or not isinstance(payload.get("id"), str)
+    ):
+        raise DomainError(Problem("http.cursor_invalid", 400, "Pagination cursor is invalid"))
+    return str(payload["updated_at"]), str(payload["id"])
+
+
+def _paginate(
+    items: list[dict[str, Any]], limit: int, cursor: str | None
+) -> dict[str, Any]:
+    """Apply stable keyset pagination to a scoped public collection."""
+    ordered = sorted(items, key=_cursor_key, reverse=True)
+    total_estimate = len(ordered)
+    if cursor is not None:
+        cursor_key = _decode_cursor(cursor)
+        ordered = [item for item in ordered if _cursor_key(item) < cursor_key]
+    page_items = ordered[:limit]
+    has_more = len(ordered) > limit
+    return {
+        "items": page_items,
+        "page": {
+            "next_cursor": _encode_cursor(page_items[-1]) if has_more and page_items else None,
+            "has_more": has_more,
+            "total_estimate": total_estimate,
+        },
+    }
+
+
+PageLimit = Annotated[int, Query(ge=1, le=_MAX_PAGE_LIMIT)]
+
+
+@router.get("/resume-templates", response_model=TemplateManifestListResponse)
+async def list_resume_templates(
+    request: Request,
+    locale: Annotated[str | None, Query(min_length=2, max_length=32)] = None,
+    cursor: str | None = None,
+    limit: PageLimit = _DEFAULT_PAGE_LIMIT,
+) -> dict[str, Any]:
+    """List renderer-independent, immutable Resume template manifests."""
+    manifests = list_template_manifests(locale)
+    for manifest in manifests:
+        _container(request).contracts.validate_declared("TemplateManifest", manifest)
+    return _paginate(manifests, limit, cursor)
+
+
+@router.get("/resume-templates/{template_id}/versions/{template_version}")
+async def get_resume_template(
+    request: Request, template_id: str, template_version: str
+) -> dict[str, Any]:
+    """Get one immutable public Resume template manifest."""
+    manifest = get_template_manifest(template_id, template_version)
+    if manifest is None:
+        raise DomainError(
+            Problem("resume.template_not_found", 404, "Resume template was not found")
+        )
+    _container(request).contracts.validate_declared("TemplateManifest", manifest)
+    return manifest
+
+
+@router.get("/resumes", response_model=ResumeListResponse)
+async def list_resumes(
+    request: Request,
+    cursor: str | None = None,
+    limit: PageLimit = _DEFAULT_PAGE_LIMIT,
+) -> dict[str, Any]:
     """@brief 列出当前 workspace 简历 / List resumes in the current workspace.
 
     @param request HTTP 请求 / HTTP request.
@@ -210,7 +316,7 @@ async def list_resumes(request: Request) -> dict[str, Any]:
     """
     scope = _scope_from_headers(request)
     records = await _container(request).resume.list_resumes(scope)
-    return {"items": [record.snapshot() for record in records], "page": {"next_cursor": None, "has_more": False, "total_estimate": len(records)}}
+    return _paginate([record.snapshot() for record in records], limit, cursor)
 
 
 @router.post("/resumes", status_code=201, openapi_extra={"x-contract-status": "mock", "x-pending-contract": "ResumeCreateRequest"})
@@ -350,6 +456,24 @@ async def create_resume_proposal(
     )
 
 
+@router.get("/resumes/{resume_id}/proposals", response_model=ResumeProposalListResponse)
+async def list_resume_proposals(
+    request: Request,
+    resume_id: str,
+    status: str | None = None,
+    cursor: str | None = None,
+    limit: PageLimit = _DEFAULT_PAGE_LIMIT,
+) -> dict[str, Any]:
+    """List proposals for page reload and pending-decision recovery."""
+    records = await _container(request).proposals.list_proposals(
+        _scope_from_headers(request), resume_id, status
+    )
+    items = [record.as_dict() for record in records]
+    for item in items:
+        _container(request).contracts.validate_declared("ResumeProposal", item)
+    return _paginate(items, limit, cursor)
+
+
 @router.get("/resume-proposals/{proposal_id}")
 async def get_resume_proposal(request: Request, proposal_id: str) -> dict[str, Any]:
     """Get a formal ResumeProposal with evidence metadata in extensions."""
@@ -406,6 +530,25 @@ async def get_render_artifact(request: Request, artifact_id: str) -> dict[str, A
     """
     artifact, _, _ = await _container(request).resume.get_artifact(_scope_from_headers(request), artifact_id)
     return artifact
+
+
+@router.get(
+    "/resumes/{resume_id}/render-artifacts",
+    response_model=RenderArtifactListResponse,
+)
+async def list_render_artifacts(
+    request: Request,
+    resume_id: str,
+    cursor: str | None = None,
+    limit: PageLimit = _DEFAULT_PAGE_LIMIT,
+) -> dict[str, Any]:
+    """List Resume artifact metadata so previews survive a page reload."""
+    items = await _container(request).resume.list_artifacts(
+        _scope_from_headers(request), resume_id
+    )
+    for item in items:
+        _container(request).contracts.validate_definition("RenderArtifact", item)
+    return _paginate(items, limit, cursor)
 
 
 @router.get("/render-artifacts/{artifact_id}/content")
@@ -618,8 +761,12 @@ async def create_knowledge_source(request: Request, body: MockKnowledgeSourceCre
     return await _idempotent(request, scope, "/knowledge-sources", body.model_dump(mode="json"), 201, operation)
 
 
-@router.get("/knowledge-sources")
-async def list_knowledge_sources(request: Request) -> dict[str, Any]:
+@router.get("/knowledge-sources", response_model=KnowledgeSourceListResponse)
+async def list_knowledge_sources(
+    request: Request,
+    cursor: str | None = None,
+    limit: PageLimit = _DEFAULT_PAGE_LIMIT,
+) -> dict[str, Any]:
     """@brief 列出知识来源 / List knowledge sources.
 
     @param request HTTP 请求 / HTTP request.
@@ -627,7 +774,7 @@ async def list_knowledge_sources(request: Request) -> dict[str, Any]:
     """
     scope = _scope_from_headers(request)
     sources = await _container(request).knowledge.list_sources(scope)
-    return {"items": [source.as_dict() for source in sources], "page": {"next_cursor": None, "has_more": False, "total_estimate": len(sources)}}
+    return _paginate([source.as_dict() for source in sources], limit, cursor)
 
 
 @router.get("/knowledge-sources/{source_id}")

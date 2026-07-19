@@ -11,6 +11,7 @@
     "bind_host": "127.0.0.1",
     "bind_port": 8000,
     "public_base_url": "http://127.0.0.1:8000",
+    "cors_allowed_origins": ["http://127.0.0.1:5173", "http://localhost:5173"],
     // trusted_proxy_hmac 只接受这些实际 TCP 对端的签名断言；不读取 X-Forwarded-For。
     "trusted_proxy_cidrs": ["127.0.0.1/32"],
     "outbound_proxy_url": null,

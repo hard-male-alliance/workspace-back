@@ -738,6 +738,33 @@ class PostgresWorkspaceRepository:
             ).all()
             return self._proposal_from_rows(scope, row, operation_rows)
 
+    async def list_proposals(
+        self, scope: ActorScope, resume_id: str
+    ) -> list[DomainResumeProposalRecord]:
+        """List proposals for one scoped Resume in newest-first order."""
+        async with self._database.read_session(scope) as session:
+            rows = (
+                await session.scalars(
+                    scoped_select(ResumeProposalOrmRecord, scope)
+                    .where(ResumeProposalOrmRecord.resume_id == resume_id)
+                    .order_by(
+                        ResumeProposalOrmRecord.updated_at.desc(),
+                        ResumeProposalOrmRecord.id.desc(),
+                    )
+                )
+            ).all()
+            records: list[DomainResumeProposalRecord] = []
+            for row in rows:
+                operation_rows = (
+                    await session.scalars(
+                        scoped_select(ResumeProposalOperationOrmRecord, scope)
+                        .where(ResumeProposalOperationOrmRecord.proposal_id == row.id)
+                        .order_by(ResumeProposalOperationOrmRecord.ordinal.asc())
+                    )
+                ).all()
+                records.append(self._proposal_from_rows(scope, row, operation_rows))
+            return records
+
     async def save_proposal(
         self, scope: ActorScope, record: DomainResumeProposalRecord
     ) -> None:
@@ -2547,6 +2574,29 @@ class PostgresWorkspaceRepository:
                     "sha256": str(row.content_sha256),
                 }
             return metadata, bytes(blob.content), deepcopy(blob.source_map)
+
+    async def list_artifacts(
+        self, scope: ActorScope, resume_id: str
+    ) -> list[dict[str, Any]]:
+        """List public artifact metadata for one scoped Resume without loading blobs."""
+        async with self._database.read_session(scope) as session:
+            rows = (
+                await session.scalars(
+                    scoped_select(RenderArtifactOrmRecord, scope)
+                    .where(RenderArtifactOrmRecord.resume_id == resume_id)
+                    .order_by(
+                        RenderArtifactOrmRecord.updated_at.desc(),
+                        RenderArtifactOrmRecord.id.desc(),
+                    )
+                )
+            ).all()
+            artifacts: list[dict[str, Any]] = []
+            for row in rows:
+                runtime = _runtime_payload(row.extensions)
+                metadata = _as_json_object(runtime.get("public_metadata"))
+                if metadata:
+                    artifacts.append(metadata)
+            return artifacts
 
 
 class PostgresTelemetryWriter:

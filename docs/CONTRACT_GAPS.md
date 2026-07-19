@@ -1,6 +1,6 @@
 # v0.1.0 契约覆盖与安全边界
 
-`contract/ai-job-workspace.contract.schema.json` 是唯一正式的机器可读数据结构来源。它不是 OpenAPI 或 AsyncAPI：目前没有机器可读的 `method + path + request + response + header + status` 绑定。本文件不修改、更不推断正式契约；它记录当前实现的覆盖面和所有明确的 mock 边界。
+`contract/ai-job-workspace.contract.schema.json` 是唯一正式的机器可读数据结构来源。它不是 OpenAPI 或 AsyncAPI：目前没有完整、可发布的 `method + path + request + response + header + status` 契约包；部分已实现路由仅通过 FastAPI 暴露 OpenAPI 绑定。本文件不修改、更不推断正式契约；它记录当前实现的覆盖面和所有明确的 mock 边界。
 
 状态含义：**正式结构**表示请求使用已有 Schema 定义校验，或响应使用已有资源结构；**半正式**表示已有 `$defs` 但路径或响应包装未定义；**Mock** 表示使用 `Mock*` DTO、`x-contract-status: mock` 或 mock 传输；**未实现** 表示合同 Markdown 列出但没有路由。
 
@@ -9,16 +9,16 @@
 | 领域 | Path | 状态 | 缺口与处置 |
 |---|---|---|---|
 | 身份、Workspace、审计 | 可信代理身份断言；`/me`、workspace/member/invitation/audit/SSE 路径 | 身份边界已实现；资源路径未实现 | HTTP/WS 已可验证 `trusted_proxy_hmac` v1 断言；`CurrentUser`、`Workspace`、`WorkspaceMember`、`AuditEvent` 仍不足以推导产品身份 API、成员资格变更、分页、审计 SSE 或授权响应契约。 |
-| 简历模板 | `/resume-templates`、preview、compatibility checks | 未实现 | `TemplateManifest` 不能替代列表、媒体 preview 或 compatibility-check 请求/结果。 |
-| 简历读取与操作 | `GET /resumes`、`GET /resumes/{id}`、历史 revision、`POST /operations` | 正式结构 | `ResumeOperationBatch`/result 已校验；列表尚未有正式 `limit`/`cursor`/`sort` 协议。 |
+| 简历模板 | `/resume-templates`、preview、compatibility checks | 列表/详情为正式结构；其余未实现 | 内置模板目录通过 `TemplateManifest` 校验并支持 `locale`、`limit`、`cursor`；媒体 preview 与 compatibility-check 请求/结果尚未实现。 |
+| 简历读取与操作 | `GET /resumes`、`GET /resumes/{id}`、历史 revision、`POST /operations` | 正式结构 | `ResumeOperationBatch`/result 已校验；列表支持有界 `limit` 与不透明 `cursor`，尚未冻结公开 sort 协议。 |
 | 简历创建及生命周期 | `POST /resumes`；PATCH/DELETE、revision 列表、restore/import/export | 创建为 Mock；其余未实现 | `MockResumeCreateRequest` 不能升级为 `ResumeCreateRequest`；metadata patch、软删除与 job 路径必须先进入合同。 |
-| Resume proposal | proposal GET/decision | 未实现 | 虽有 `ProposalDecisionRequest`，仍没有路径绑定、Proposal 响应及副作用定义。 |
-| Render | render-job、job GET、artifact metadata/content/source map | 正式结构 | `RenderJobRequest`、`ResumeRenderJob`、`PdfSourceMap` 已使用；Range/ETag 已实现。job SSE 与取消尚未实现。 |
+| Resume proposal | proposal create/list/GET/decision | 响应与 decision 为正式结构；create 为 Mock | `ResumeProposal` 与 `ProposalDecisionRequest` 已校验，支持按 Resume 恢复 pending Proposal；自然语言到 Proposal 的 create 请求仍是临时 mock adapter，真实 provider 尚未接入。 |
+| Render | render-job、job GET、artifact list/metadata/content/source map | 正式结构 | `RenderJobRequest`、`ResumeRenderJob`、`RenderArtifact`、`PdfSourceMap` 已使用；按 Resume 恢复产物、Range/ETag 已实现。job SSE 与取消尚未实现。 |
 | Conversation/Message | conversation 与 message 创建 | Mock | 当前为 `MockConversationCreateRequest` / `MockMessageCreateRequest`；资源结构不能反推创建或 PATCH body。 |
 | Conversation 管理 | list/detail/PATCH/DELETE/message pagination | 未实现 | 需先定义筛选、游标、软删除和并发语义。 |
 | Agent run | run create/GET/SSE/cancel | 正式结构，运行时回放为 Mock | `AgentRunRequest`、`AgentRun`、`AgentStreamEvent` 已校验；事件尚未形成跨重启、跨 worker 的正式重放承诺。 |
 | Tool approval / capability / structured output | approval decision；`/_mock/agent-capabilities` | Mock | `ToolApprovalDecision` 尚无路径级绑定；能力发现、`mock.tool_call` approval 与 `structured_json` 标记均是内部 mock 行为。真实 provider adapter 明确声明不支持 tool calling / structured output，直至正式请求、回调与结果契约被冻结。 |
-| Knowledge source 读取 | source/list/ingestion-job GET | 正式资源结构 | 列表分页和响应路径绑定尚未定义。 |
+| Knowledge source 读取 | source/list/ingestion-job GET | 正式资源结构 | 列表支持有界 `limit` 与不透明 `cursor`；其它过滤、排序及版本兼容仍未冻结。 |
 | Knowledge 创建、索引、搜索 | source create、ingestion create、search | 创建/索引为 Mock；搜索半正式 | 缺少 source/ingestion create 请求；`KnowledgeSearchRequest` 存在但未列为 entrypoint，`{"items": [...]}` 响应包装未冻结。 |
 | Knowledge 生命周期 | PATCH/DELETE/version/sync/SSE/access evaluation | 未实现 | 不能从 source 资源结构推导更新、删除或授权评估协议。 |
 | 上传与外部连接 | upload、connection、authorization session | 未实现 | 即便已有资源定义，multipart complete、一次性 token 和 secret 生命周期仍必须显式定义。 |
@@ -38,7 +38,7 @@
 ## 跨路径协议缺口
 
 - **Location**：当前 201/202 响应不保证 `Location`。在正式化前，创建资源/Job 的 Location、幂等重放行为和状态码都不能被客户端依赖。
-- **分页、过滤、排序**：现有列表有固定 `page` 外形，但没有正式查询参数或 cursor 编码规则。
+- **分页、过滤、排序**：Resume、KnowledgeSource、TemplateManifest、ResumeProposal 与 RenderArtifact 列表已使用 `items + page.next_cursor/has_more` 外形，并支持版本化不透明 cursor；其它列表及跨资源 sort/filter 仍未统一，客户端不得解析 cursor 内容。
 - **ETag**：Resume GET、artifact content 有 ETag；其它资源尚未统一条件请求和更新并发语义。
 - **幂等性**：memory 模式使用进程内注册表；它在重启和多 worker 下不保证 24 小时重放。PostgreSQL 模式有持久幂等记录，但客户端仍不能仅凭本文件依赖固定的 TTL、冲突 ProblemDetails、`Location` 或跨版本重放语义。
 - **SSE**：Agent SSE 支持 `Last-Event-ID`，但在持久 outbox/replay 窗口完成前，跨重启恢复、heartbeat 与过期后重新 GET 都仍是运行时 mock 行为。render/knowledge/report job SSE 尚未实现。

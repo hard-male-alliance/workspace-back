@@ -59,6 +59,11 @@ class ResumeProposalRepository(Protocol):
     ) -> ResumeProposalRecord | None:
         """Read a proposal without crossing workspace or owner boundaries."""
 
+    async def list_proposals(
+        self, scope: ActorScope, resume_id: str
+    ) -> list[ResumeProposalRecord]:
+        """List proposals for one scoped Resume in newest-first order."""
+
     async def save_proposal(self, scope: ActorScope, record: ResumeProposalRecord) -> None:
         """Persist proposal decision state."""
 
@@ -295,6 +300,13 @@ class ArtifactRepository(Protocol):
         @param artifact_id 产物 ID / Artifact ID.
         @return metadata、内容、source map 或 None / Metadata, content, source map, or None.
         """
+
+    async def list_artifacts(
+        self,
+        scope: ActorScope,
+        resume_id: str,
+    ) -> list[dict[str, Any]]:
+        """List artifact metadata for one scoped Resume in newest-first order."""
 
 
 class Renderer(Protocol):
