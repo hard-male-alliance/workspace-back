@@ -1,5 +1,5 @@
 // @brief 完整配置示例 / Complete configuration example.
-// @note 所有密码、API key 与 DSN 中的敏感部分均由环境变量提供，绝不写入此文件。
+// @note dbctl 复制本模板为被 Git 忽略的 config.jsonc，并将生成的数据库 DSN 写入副本。
 {
   // 运行环境标签；development、test、staging 或 production。
   "environment": "development",
@@ -29,11 +29,11 @@
   "database": {
     // memory 仅用于确定性开发/测试；production 必须是 postgresql。
     "mode": "memory",
-    // 运行时、迁移器和管理员的 DSN 环境变量名称。
-    "application_dsn_env": "AIWS_APP_DATABASE_DSN",
-    "migrator_dsn_env": "AIWS_MIGRATOR_DATABASE_DSN",
+    // dbctl 初始化 config.jsonc 时写入三个独立角色及随机密码；模板本身不含 secret。
+    "application_dsn": null,
+    "migrator_dsn": null,
     // Dashboard 只能使用该只读角色的独立 DSN，绝不复用 application DSN。
-    "dashboard_dsn_env": "AIWS_DASHBOARD_DATABASE_DSN",
+    "dashboard_dsn": null,
     // 单一长生命周期连接池上限，禁止请求路径临时无限建连。
     "pool_size": 10,
     "max_overflow": 10,

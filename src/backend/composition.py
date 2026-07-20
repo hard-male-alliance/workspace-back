@@ -95,7 +95,9 @@ class BackendContainer:
 
 
 @asynccontextmanager
-async def build_container(settings: BackendSettings, project_root: Path) -> AsyncIterator[BackendContainer]:
+async def build_container(
+    settings: BackendSettings, project_root: Path
+) -> AsyncIterator[BackendContainer]:
     """@brief 创建并销毁一个后端运行时 / Create and tear down one backend runtime.
 
     @param settings 后端强类型设置 / Backend typed settings.
@@ -121,12 +123,9 @@ async def build_container(settings: BackendSettings, project_root: Path) -> Asyn
     )
     database: AsyncDatabase | None = None
     if settings.database.mode == "postgresql":
-        dsn = os.environ.get(settings.database.application_dsn_env)
+        dsn = settings.database.application_dsn
         if not dsn:
-            raise RuntimeError(
-                "PostgreSQL application DSN environment variable is not configured: "
-                f"{settings.database.application_dsn_env}"
-            )
+            raise RuntimeError("PostgreSQL application DSN is not configured")
         database = AsyncDatabase(
             AsyncDatabaseOptions(
                 dsn=dsn,
@@ -139,8 +138,8 @@ async def build_container(settings: BackendSettings, project_root: Path) -> Asyn
         )
         storage: WorkspaceRuntimeRepository = PostgresWorkspaceRepository(database)
         telemetry_writer: TelemetryWriter = PostgresTelemetryWriter(database)
-        idempotency: IdempotencyRegistry | PostgresIdempotencyRegistry = PostgresIdempotencyRegistry(
-            database
+        idempotency: IdempotencyRegistry | PostgresIdempotencyRegistry = (
+            PostgresIdempotencyRegistry(database)
         )
     else:
         storage = InMemoryWorkspaceRepository()
@@ -200,7 +199,9 @@ async def build_container(settings: BackendSettings, project_root: Path) -> Asyn
             container = BackendContainer(
                 settings=settings,
                 identity=identity,
-                contracts=ContractValidator(project_root / "contract" / "ai-job-workspace.contract.schema.json"),
+                contracts=ContractValidator(
+                    project_root / "contract" / "ai-job-workspace.contract.schema.json"
+                ),
                 idempotency=idempotency,
                 resume=resume,
                 proposals=proposals,

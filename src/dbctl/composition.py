@@ -80,8 +80,8 @@ class DbctlComposition:
         """@brief 生成 bootstrap 计划但不执行 / Build a bootstrap plan without executing it.
 
         @return 可用于 dry-run 或执行的 BootstrapPlan / BootstrapPlan usable for dry-run or execution.
-        @raise DbctlConfigurationError 显式配置的密码环境变量缺失、或 DSN 身份与 role 不匹配时抛出。
-        / Raised when explicitly configured password environment is absent or DSN identity mismatches role.
+        @raise DbctlConfigurationError config.jsonc 的 DSN 身份与 dbinit role 不匹配时抛出。
+        / Raised when a config.jsonc DSN identity mismatches its dbinit role.
         """
         return BootstrapPlanBuilder().build(
             self.settings.administration,
@@ -117,7 +117,7 @@ class DbctlComposition:
         / This method is never called by backend startup; only explicit ``dbctl migrate`` invokes it.
         """
         AlembicMigrationRunner(
-            self.settings.require_migrator_dsn(self._environ),
+            self.settings.require_migrator_dsn(),
             self._repository_root / "alembic",
             self.settings.administration.owner_role,
             self.settings.administration.app_role,
@@ -161,7 +161,7 @@ class DbctlComposition:
         if request.disabled or not request.apply:
             return TelemetryPruneExecutor(None).execute(request)
         runner = PsycopgTelemetryRetentionRunner(
-            self.settings.require_migrator_dsn(self._environ),
+            self.settings.require_migrator_dsn(),
             owner_role=self.settings.administration.owner_role,
             observability_schema=self.settings.administration.observability_schema,
         )
@@ -181,7 +181,7 @@ class DbctlComposition:
         @raise DbctlConfigurationError role 不是登录身份或相应 DSN 缺失时抛出。
         / Raised when role is not a login identity or its DSN is missing.
         """
-        dsn = self.settings.require_shell_dsn(role, self._environ)
+        dsn = self.settings.require_shell_dsn(role)
         return PsqlShellLauncher(self._environ).prepare(
             dsn,
             password_policy=password_policy,
@@ -219,9 +219,9 @@ class DbctlComposition:
         """@brief 返回 dbctl 自动生成的登录角色密码 / Return dbctl-generated login-role passwords.
 
         @return 仅内存保存的登录角色密码映射 / In-memory login-role password mapping.
-        @note 密码只来自被 Git 忽略的本地 config.jsonc；DSN 与环境变量不能覆盖它们。
-        / Passwords come only from Git-ignored local config.jsonc; DSNs and environment variables
-        cannot override them.
+        @note 密码从被 Git 忽略的 config.jsonc 中三个实际 DSN 解析，环境变量不能覆盖。
+        / Passwords are parsed from the three actual DSNs in Git-ignored config.jsonc and cannot
+        be overridden by environment variables.
         """
         return dict(self.settings.role_passwords)
 

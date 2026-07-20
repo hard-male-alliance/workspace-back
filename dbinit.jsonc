@@ -1,6 +1,10 @@
 // @brief PostgreSQL 初始化声明 / PostgreSQL initialization declaration.
 // @note 本文件只描述可提交的目标状态，不得包含 DSN、密码或其他 secret。
 {
+  "database_connection": {
+    "host": "127.0.0.1",
+    "port": 5432
+  },
   "database_administration": {
     "database_name": "ai_job_workspace",
     "owner_role": "workspace_owner",

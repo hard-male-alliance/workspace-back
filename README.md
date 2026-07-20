@@ -41,22 +41,25 @@ uv run pytest
 6. 若启用 `resume_rendering.adapter: xelatex`，宿主机必须提供可工作的 OS sandbox；无法建立 sandbox 时实现会 fail closed，而不是退化为不受限的编译子进程。
 7. `ai.provider_rate_limit` 是每个实际 endpoint/credential 在单一 backend worker 内的并发与滑动一分钟请求预算；耗尽时返回可重试的 429。多 worker/Pod 部署必须按实例数向供应商申请配额，或在入口层另设全局限流。`ai.metering` 仅记录 UTF-8 字节除以 4 的可复算 token **估算**与整数 micro-USD 成本快照，保存在 `AgentRun.extensions.aiws.metering`；它不是 provider 账单，也不含系统提示词、隐式 tokenizer 或重试计费。
 
-### 环境变量与最小权限
+### 本地凭证与最小权限
 
-以下 DSN 必须是相互独立的凭证，不能以 application DSN 代替 dashboard 或 migrator DSN。生成的角色密码只写入权限为 `0600`、被 Git 忽略的本地 `config.jsonc`；DSN 和 HMAC secret 仍不得写入可提交文件、日志、systemd unit 命令行或 shell history。bootstrap 不接受管理员 DSN：POSIX 上 `auto` 优先通过 `sudo -u postgres` 验证，Windows 或找不到 sudo 时在终端提示 `bootstrap_database_user` 的 PostgreSQL 密码。
+以下 DSN 必须是相互独立的凭证，不能以 application DSN 代替 dashboard 或 migrator DSN。`dbctl` 将生成的角色与密码直接组成 DSN，写入权限为 `0600`、被 Git 忽略的本地 `config.jsonc`；DSN 和 HMAC secret 均不得进入可提交文件、日志、systemd unit 命令行或 shell history。bootstrap 不接受管理员 DSN：POSIX 上 `auto` 优先通过 `sudo -u postgres` 验证，Windows 或找不到 sudo 时在终端提示 `bootstrap_database_user` 的 PostgreSQL 密码。
 
-| 环境变量 | 使用者 | 应有身份/权限 |
+| 本地 `config.jsonc` 字段 | 使用者 | 应有身份/权限 |
 |---|---|---|
-| `AIWS_MIGRATOR_DATABASE_DSN` | `workspace-dbctl migrate`、`prune-telemetry --apply` | `workspace_migrator`；仅 migration/受控维护，可显式 `SET ROLE workspace_owner` |
-| `AIWS_APP_DATABASE_DSN` | `workspace-backend` | `workspace_app`；运行时最小 DML 权限与 RLS（row-level security）上下文 |
-| `AIWS_DASHBOARD_DATABASE_DSN` | Dashboard PostgreSQL reader、`workspace-dbctl shell --role dashboard` | `workspace_dashboard`；仅 `observability.dashboard_metric_samples` 稳定视图读权限 |
+| `database.migrator_dsn` | `workspace-dbctl migrate`、`prune-telemetry --apply` | `workspace_migrator`；仅 migration/受控维护，可显式 `SET ROLE workspace_owner` |
+| `database.application_dsn` | `workspace-backend` | `workspace_app`；运行时最小 DML 权限与 RLS（row-level security）上下文 |
+| `database.dashboard_dsn` | Dashboard PostgreSQL reader、`workspace-dbctl shell --role dashboard` | `workspace_dashboard`；仅 `observability.dashboard_metric_samples` 稳定视图读权限 |
+
+| 其他 secret 环境变量 | 使用者 | 要求 |
+|---|---|---|
 | `AIWS_TRUSTED_PROXY_HMAC_SECRET` | 入口认证代理与 backend | 至少 32 bytes；仅这两个私有工作负载可读取 |
 | `AIWS_DASHBOARD_OPERATOR_TOKEN` | Dashboard 私有 HTTP API（若启用） | 仅运维入口持有；不应出现在产品浏览器请求中 |
 | `AIWS_LLM_API_KEY`（或配置指定的变量） | non-mock 模型 provider | 仅 backend 进程可读取 |
 
 `workspace-dbctl bootstrap` 管理四个互不相同的 PostgreSQL 角色：不可登录的 `workspace_owner`、可迁移的 `workspace_migrator`、运行时 `workspace_app` 与只读 `workspace_dashboard`。角色名、数据库名、schema 与权限目标来自根目录 `dbinit.jsonc`；三个登录角色的随机密码写入本地 `config.jsonc`，owner 保持 `NOLOGIN` 且没有密码。
 
-生成节名为 `database_role_passwords`，其中 `migrator`、`app`、`dashboard` 分别对应 `dbinit.jsonc` 声明的三个登录角色。后续注入三个运行 DSN 时必须使用这些生成密码；bootstrap 不会反向读取或信任 DSN 中的密码。
+`dbinit.jsonc` 的 `database_connection` 声明非敏感的主机和端口；`dbctl` 根据它以及角色、数据库声明生成 `database.application_dsn`、`database.migrator_dsn`、`database.dashboard_dsn`。bootstrap 从这三个实际 DSN 取得相应角色密码，因此写入配置和创建角色使用的是同一份凭证。
 
 ## PostgreSQL 上线顺序
 
@@ -115,7 +118,7 @@ Dashboard 的 API 是可选的私有运维接口，不由 `workspace-dashboard` 
 uv run uvicorn dashboard.api:create_fastapi_app --factory --host 127.0.0.1 --port 8010
 ```
 
-Dashboard 的 `mock` access 仅允许根配置的 `development`/`test` 环境；`staging`/`production`（以及任意 `database.mode=postgresql`）强制 `dashboard.access.mode=operator_token`。PostgreSQL 模式只从 `AIWS_DASHBOARD_DATABASE_DSN` 读取稳定只读视图，绝不复用 application DSN。`/dashboard/v1/healthz` 不读取业务数据但也不应公网暴露；将整个 Dashboard API 保持在 loopback、受控 VPN 或 mTLS 运维网络之后。
+Dashboard 的 `mock` access 仅允许根配置的 `development`/`test` 环境；`staging`/`production`（以及任意 `database.mode=postgresql`）强制 `dashboard.access.mode=operator_token`。PostgreSQL 模式优先从 `database.dashboard_dsn` 读取稳定只读视图，绝不复用 application DSN。`/dashboard/v1/healthz` 不读取业务数据但也不应公网暴露；将整个 Dashboard API 保持在 loopback、受控 VPN 或 mTLS 运维网络之后。
 
 ## 生产身份边界：trusted proxy HMAC
 
