@@ -18,6 +18,7 @@ from .retention import (
     MAX_TELEMETRY_PRUNE_MAX_BATCHES,
     MAX_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS,
 )
+from .runners import BootstrapAccessMode
 from .shell import PasswordPolicy
 
 
@@ -56,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="仅输出脱敏 SQL 计划，不连接 PostgreSQL、不执行 SQL。",
+    )
+    bootstrap.add_argument(
+        "--access-mode",
+        choices=tuple(mode.value for mode in BootstrapAccessMode),
+        default=BootstrapAccessMode.AUTO.value,
+        help="管理权限方式：auto 优先 POSIX sudo，否则终端提示 PostgreSQL 管理密码。",
     )
 
     migrate = subparsers.add_parser(
@@ -161,7 +168,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if arguments.dry_run:
                 print(plan.render_dry_run())
                 return 0
-            result = composition.execute_bootstrap(plan)
+            result = composition.execute_bootstrap(
+                plan,
+                access_mode=BootstrapAccessMode(arguments.access_mode),
+            )
             database_status = "已创建" if result.database_created else "已存在"
             print(
                 "dbctl bootstrap 完成：目标数据库"

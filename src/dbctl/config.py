@@ -140,8 +140,10 @@ class DatabaseAdministrationSettings:
     @param schemas 由 bootstrap 拥有和授权的 schema 列表 / Schemas owned and granted by bootstrap.
     @param observability_schema Dashboard 可读取的 observability schema。
     / Observability schema that Dashboard may read.
-    @param local_postgres_user bootstrap 固定传给 ``sudo -u`` 的本机账户。
-    / Local account always passed to ``sudo -u`` during bootstrap.
+    @param local_postgres_user sudo 模式传给 ``sudo -u`` 的本机账户。
+    / Local account passed to ``sudo -u`` in sudo mode.
+    @param bootstrap_database_user 无 sudo 平台通过终端密码连接的 PostgreSQL 管理角色。
+    / PostgreSQL administrative role used for terminal-password connections without sudo.
     @param maintenance_database 管理员连接用于创建目标数据库的 maintenance database。
     / Maintenance database used by the administrator connection to create the target database.
     """
@@ -154,6 +156,7 @@ class DatabaseAdministrationSettings:
     schemas: tuple[str, ...] = _DEFAULT_BOOTSTRAP_SCHEMAS
     observability_schema: str = "observability"
     local_postgres_user: str = "postgres"
+    bootstrap_database_user: str = "postgres"
     maintenance_database: str = "postgres"
 
     def __post_init__(self) -> None:
@@ -209,6 +212,10 @@ class DatabaseAdministrationSettings:
             self.local_postgres_user
         ):
             raise DbctlConfigurationError("local_postgres_user 必须是安全的本机 Unix 账户名。")
+        bootstrap_database_user = validate_postgres_identifier(
+            self.bootstrap_database_user,
+            kind="bootstrap 数据库用户",
+        )
 
         object.__setattr__(self, "database_name", database_name)
         object.__setattr__(self, "maintenance_database", maintenance_database)
@@ -218,6 +225,7 @@ class DatabaseAdministrationSettings:
         object.__setattr__(self, "dashboard_role", role_values[DatabaseRole.DASHBOARD])
         object.__setattr__(self, "schemas", schemas)
         object.__setattr__(self, "observability_schema", observability_schema)
+        object.__setattr__(self, "bootstrap_database_user", bootstrap_database_user)
 
     def role_name(self, role: DatabaseRole) -> str:
         """@brief 获取角色类别对应的 PostgreSQL 名称 / Get the PostgreSQL name for a role category.
@@ -378,6 +386,9 @@ class DbctlConfigurationService:
                 ),
                 local_postgres_user=_text_with_default(
                     administration, "local_postgres_user", "postgres"
+                ),
+                bootstrap_database_user=_text_with_default(
+                    administration, "bootstrap_database_user", "postgres"
                 ),
                 maintenance_database=_text_with_default(
                     administration, "maintenance_database", "postgres"

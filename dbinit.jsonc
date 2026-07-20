@@ -10,6 +10,7 @@
     "schemas": ["identity", "resume", "agent", "interview", "knowledge", "observability"],
     "observability_schema": "observability",
     "local_postgres_user": "postgres",
+    "bootstrap_database_user": "postgres",
     "maintenance_database": "postgres"
   }
 }
