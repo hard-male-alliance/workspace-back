@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-import os
+import json
 import re
+import secrets
+import shutil
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -81,7 +84,6 @@ class DatabaseConnectionSettings:
     / Runtime database mode; dbctl does not use it to decide whether bootstrap may run.
     @param application_dsn_env 后端应用 DSN 的环境变量名 / Environment variable for application DSN.
     @param migrator_dsn_env Alembic 迁移 DSN 的环境变量名 / Environment variable for migrator DSN.
-    @param admin_dsn_env 管理员 DSN 的环境变量名 / Environment variable for administrator DSN.
     @param dashboard_dsn_env Dashboard 只读 DSN 的环境变量名；未配置时 shell 不提供该身份。
     / Environment variable for Dashboard read-only DSN; no shell is offered for it when absent.
     """
@@ -89,7 +91,6 @@ class DatabaseConnectionSettings:
     mode: str
     application_dsn_env: str
     migrator_dsn_env: str
-    admin_dsn_env: str
     dashboard_dsn_env: str = "AIWS_DASHBOARD_DATABASE_DSN"
 
     def __post_init__(self) -> None:
@@ -105,7 +106,6 @@ class DatabaseConnectionSettings:
         for field_name in (
             "application_dsn_env",
             "migrator_dsn_env",
-            "admin_dsn_env",
             "dashboard_dsn_env",
         ):
             value = getattr(self, field_name)
@@ -140,12 +140,10 @@ class DatabaseAdministrationSettings:
     @param schemas 由 bootstrap 拥有和授权的 schema 列表 / Schemas owned and granted by bootstrap.
     @param observability_schema Dashboard 可读取的 observability schema。
     / Observability schema that Dashboard may read.
-    @param local_postgres_user 仅 ``--local-postgres`` 模式传给 ``sudo -u`` 的本机账户。
-    / Local account passed to ``sudo -u`` only in ``--local-postgres`` mode.
+    @param local_postgres_user bootstrap 固定传给 ``sudo -u`` 的本机账户。
+    / Local account always passed to ``sudo -u`` during bootstrap.
     @param maintenance_database 管理员连接用于创建目标数据库的 maintenance database。
     / Maintenance database used by the administrator connection to create the target database.
-    @param password_env_by_role 可选角色密码环境变量映射；配置中只允许变量名，不允许密码值。
-    / Optional role-password environment mapping; configuration permits variable names, never password values.
     """
 
     database_name: str
@@ -157,7 +155,6 @@ class DatabaseAdministrationSettings:
     observability_schema: str = "observability"
     local_postgres_user: str = "postgres"
     maintenance_database: str = "postgres"
-    password_env_by_role: Mapping[DatabaseRole, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """@brief 校验权限边界和管理名称 / Validate privilege boundaries and administration names.
@@ -213,17 +210,6 @@ class DatabaseAdministrationSettings:
         ):
             raise DbctlConfigurationError("local_postgres_user 必须是安全的本机 Unix 账户名。")
 
-        normalized_password_envs: dict[DatabaseRole, str] = {}
-        for raw_role, variable_name in self.password_env_by_role.items():
-            try:
-                role = DatabaseRole(raw_role)
-            except ValueError as error:
-                raise DbctlConfigurationError("password_env_by_role 包含未知角色。") from error
-            if role is DatabaseRole.OWNER:
-                raise DbctlConfigurationError("NOLOGIN owner role 不能配置密码。")
-            _validate_environment_variable_name(variable_name, "角色密码环境变量")
-            normalized_password_envs[role] = variable_name
-
         object.__setattr__(self, "database_name", database_name)
         object.__setattr__(self, "maintenance_database", maintenance_database)
         object.__setattr__(self, "owner_role", role_values[DatabaseRole.OWNER])
@@ -232,7 +218,6 @@ class DatabaseAdministrationSettings:
         object.__setattr__(self, "dashboard_role", role_values[DatabaseRole.DASHBOARD])
         object.__setattr__(self, "schemas", schemas)
         object.__setattr__(self, "observability_schema", observability_schema)
-        object.__setattr__(self, "password_env_by_role", MappingProxyType(normalized_password_envs))
 
     def role_name(self, role: DatabaseRole) -> str:
         """@brief 获取角色类别对应的 PostgreSQL 名称 / Get the PostgreSQL name for a role category.
@@ -263,16 +248,30 @@ class DbctlSettings:
     database: DatabaseConnectionSettings
     administration: DatabaseAdministrationSettings
     observability: ObservabilityRetentionSettings
+    role_passwords: Mapping[DatabaseRole, str] = field(repr=False)
 
-    def require_admin_dsn(self, environ: Mapping[str, str]) -> str:
-        """@brief 从环境读取管理员 DSN / Read the administrator DSN from the environment.
+    def __post_init__(self) -> None:
+        """@brief 冻结本地生成的登录角色密码 / Freeze locally generated login-role passwords.
 
-        @param environ 环境变量映射 / Environment-variable mapping.
-        @return 非空管理员 DSN / Non-empty administrator DSN.
-        @raise DbctlConfigurationError 管理员 DSN 未设置时抛出；错误不回显 DSN。
-        / Raised when the administrator DSN is absent; the error never echoes the DSN.
+        @return 无返回值 / No return value.
+        @raise DbctlConfigurationError 密码映射包含 owner、未知角色或空密码时抛出。
+        / Raised when the password map contains owner, an unknown role, or an empty password.
         """
-        return _require_secret_environment_value(environ, self.database.admin_dsn_env)
+        normalized: dict[DatabaseRole, str] = {}
+        for raw_role, password in self.role_passwords.items():
+            try:
+                role = DatabaseRole(raw_role)
+            except ValueError as error:
+                raise DbctlConfigurationError("database_role_passwords 包含未知角色。") from error
+            if role is DatabaseRole.OWNER:
+                raise DbctlConfigurationError("NOLOGIN owner role 不能配置密码。")
+            if not isinstance(password, str) or not password or "\x00" in password:
+                raise DbctlConfigurationError("登录 role 密码必须是非空且不含 NUL 的字符串。")
+            normalized[role] = password
+        required_roles = {DatabaseRole.MIGRATOR, DatabaseRole.APP, DatabaseRole.DASHBOARD}
+        if set(normalized) != required_roles:
+            raise DbctlConfigurationError("database_role_passwords 必须完整包含三个登录角色。")
+        object.__setattr__(self, "role_passwords", MappingProxyType(normalized))
 
     def require_migrator_dsn(self, environ: Mapping[str, str]) -> str:
         """@brief 从环境读取迁移 DSN / Read the migrator DSN from the environment.
@@ -297,22 +296,32 @@ class DbctlSettings:
 
 
 class DbctlConfigurationService:
-    """@brief 读取并验证根 JSONC 的 dbctl 配置 / Load and validate dbctl configuration from root JSONC.
+    """@brief 读取私密运行配置与独立 dbinit 声明 / Load private runtime config and the separate dbinit declaration.
 
-    dbctl 不导入 backend 或 dashboard 的配置对象。它只读取同一事实来源（source of
-    truth）中的 ``database``、``database_administration`` 与
-    ``observability.retention_days``，并在此边界完成自己的类型与安全校验。
-    / dbctl does not import backend or dashboard configuration objects. It reads only
-    ``database``, ``database_administration``, and ``observability.retention_days`` from the
-    shared source of truth and performs its own type and safety validation at this boundary.
+    ``config.jsonc`` 是被 Git 忽略的本地运行配置，首次缺失时由 ``example.jsonc``
+    复制并写入随机登录角色密码；``dbinit.jsonc`` 是可提交、无密钥的数据库目标状态。
+    / ``config.jsonc`` is Git-ignored local runtime configuration. When absent it is copied from
+    ``example.jsonc`` and populated with random login-role passwords; ``dbinit.jsonc`` is the
+    committable, secret-free desired database state.
     """
 
-    def __init__(self, config_path: Path | str = Path("config.jsonc")) -> None:
+    def __init__(
+        self,
+        config_path: Path | str = Path("config.jsonc"),
+        dbinit_path: Path | str | None = None,
+    ) -> None:
         """@brief 初始化配置服务 / Initialize the configuration service.
 
-        @param config_path 根 JSONC 配置文件路径 / Root JSONC configuration file path.
+        @param config_path 私密运行配置路径 / Private runtime-configuration path.
+        @param dbinit_path 可提交数据库初始化声明路径；默认与 config 同目录的 dbinit.jsonc。
+        / Committable database-initialization declaration; defaults to dbinit.jsonc beside config.
         """
         self._config_path = Path(config_path)
+        self._dbinit_path = (
+            self._config_path.parent / "dbinit.jsonc"
+            if dbinit_path is None
+            else Path(dbinit_path)
+        )
 
     @property
     def config_path(self) -> Path:
@@ -322,6 +331,14 @@ class DbctlConfigurationService:
         """
         return self._config_path
 
+    @property
+    def dbinit_path(self) -> Path:
+        """@brief 返回数据库初始化声明路径 / Return the database-initialization declaration path.
+
+        @return 调用方配置的 dbinit.jsonc 路径 / Caller-configured dbinit.jsonc path.
+        """
+        return self._dbinit_path
+
     def load(self) -> DbctlSettings:
         """@brief 加载 dbctl 设置 / Load dbctl settings.
 
@@ -329,10 +346,11 @@ class DbctlConfigurationService:
         @raise DbctlConfigurationError 文件缺失、JSONC 无效或所需配置节不合规时抛出。
         / Raised for a missing file, invalid JSONC, or malformed required configuration sections.
         """
-        root = self._load_root_mapping()
+        root = self._load_or_create_private_root_mapping()
+        dbinit = self._load_mapping_file(self._dbinit_path, "dbinit")
         database = _require_mapping(root.get("database"), "database")
         administration = _require_mapping(
-            root.get("database_administration"), "database_administration"
+            dbinit.get("database_administration"), "database_administration"
         )
         observability = _require_mapping(root.get("observability"), "observability")
         return DbctlSettings(
@@ -343,9 +361,6 @@ class DbctlConfigurationService:
                 ),
                 migrator_dsn_env=_text_with_default(
                     database, "migrator_dsn_env", "AIWS_MIGRATOR_DATABASE_DSN"
-                ),
-                admin_dsn_env=_text_with_default(
-                    database, "admin_dsn_env", "AIWS_ADMIN_DATABASE_DSN"
                 ),
                 dashboard_dsn_env=_text_with_default(
                     database, "dashboard_dsn_env", "AIWS_DASHBOARD_DATABASE_DSN"
@@ -367,28 +382,113 @@ class DbctlConfigurationService:
                 maintenance_database=_text_with_default(
                     administration, "maintenance_database", "postgres"
                 ),
-                password_env_by_role=_parse_password_environment_mapping(administration),
             ),
             observability=ObservabilityRetentionSettings(
                 retention_days=_require_non_negative_int(observability, "retention_days"),
             ),
+            role_passwords=_parse_generated_role_passwords(root),
         )
 
-    def _load_root_mapping(self) -> dict[str, Any]:
-        """@brief 读取 JSONC 根对象 / Read the JSONC root object.
+    def _load_or_create_private_root_mapping(self) -> dict[str, Any]:
+        """@brief 创建或读取私密运行配置并确保登录密码存在 / Create or load private config and ensure login passwords exist.
 
-        @return 可变顶层配置字典 / Mutable top-level configuration dictionary.
-        @raise DbctlConfigurationError 文件或语法不可用时抛出，且不展示文件内容。
-        / Raised when the file or syntax is unavailable, without displaying its content.
+        @return 含三个生成密码的可变根对象 / Mutable root containing three generated passwords.
+        @raise DbctlConfigurationError 模板缺失、文件不可写或配置无效时抛出。
+        / Raised when the template is absent, the file is unwritable, or configuration is invalid.
         """
         if not self._config_path.is_file():
-            raise DbctlConfigurationError(f"dbctl 配置文件不存在：{self._config_path}")
+            template_path = self._config_path.parent / "example.jsonc"
+            if not template_path.is_file():
+                raise DbctlConfigurationError(
+                    f"config.jsonc 不存在，且未找到初始化模板：{template_path}"
+                )
+            try:
+                shutil.copyfile(template_path, self._config_path)
+            except OSError as error:
+                raise DbctlConfigurationError("无法从 example.jsonc 创建私密 config.jsonc。") from error
+        root = self._load_mapping_file(self._config_path, "dbctl 配置")
+        credentials = root.get("database_role_passwords")
+        changed = False
+        if credentials is None:
+            credentials = {}
+            root["database_role_passwords"] = credentials
+            changed = True
+        if not isinstance(credentials, dict):
+            raise DbctlConfigurationError("database_role_passwords 必须是对象。")
+        used_passwords = {
+            value for value in credentials.values() if isinstance(value, str) and value
+        }
+        for role in (DatabaseRole.MIGRATOR, DatabaseRole.APP, DatabaseRole.DASHBOARD):
+            password = credentials.get(role.value)
+            if password is None:
+                generated_password = secrets.token_urlsafe(32)
+                while generated_password in used_passwords:
+                    generated_password = secrets.token_urlsafe(32)
+                credentials[role.value] = generated_password
+                used_passwords.add(generated_password)
+                changed = True
+            elif not isinstance(password, str) or not password or "\x00" in password:
+                raise DbctlConfigurationError(
+                    f"database_role_passwords.{role.value} 必须是非空字符串。"
+                )
+        login_passwords = [
+            credentials[role.value]
+            for role in (DatabaseRole.MIGRATOR, DatabaseRole.APP, DatabaseRole.DASHBOARD)
+        ]
+        if len(set(login_passwords)) != len(login_passwords):
+            raise DbctlConfigurationError("三个登录 role 必须使用互不相同的密码。")
+        if changed:
+            self._write_private_root(root)
+        else:
+            try:
+                self._config_path.chmod(0o600)
+            except OSError as error:
+                raise DbctlConfigurationError("无法收紧 config.jsonc 文件权限。") from error
+        return root
+
+    def _write_private_root(self, root: Mapping[str, Any]) -> None:
+        """@brief 原子写入仅本机可读的私密配置 / Atomically write owner-only private configuration.
+
+        @param root 待序列化的完整配置根对象 / Complete configuration root to serialize.
+        @return 无返回值 / No return value.
+        """
+        temporary_path: Path | None = None
         try:
-            parsed = json5.loads(self._config_path.read_text(encoding="utf-8"))
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self._config_path.parent,
+                prefix=f".{self._config_path.name}.",
+                delete=False,
+            ) as temporary_file:
+                temporary_file.write(json.dumps(root, ensure_ascii=False, indent=2) + "\n")
+                temporary_path = Path(temporary_file.name)
+            temporary_path.chmod(0o600)
+            temporary_path.replace(self._config_path)
+        except OSError as error:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise DbctlConfigurationError("无法写入私密 config.jsonc。") from error
+
+    @staticmethod
+    def _load_mapping_file(path: Path, label: str) -> dict[str, Any]:
+        """@brief 加载一个 JSONC 根对象 / Load one JSONC root mapping.
+
+        @param path 待读取文件 / File to read.
+        @param label 安全错误标签 / Safe error label.
+        @return 可变顶层对象 / Mutable root mapping.
+        """
+        if not path.is_file():
+            raise DbctlConfigurationError(f"{label}文件不存在：{path}")
+        try:
+            parsed = json5.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
-            raise DbctlConfigurationError("dbctl 配置文件无法解析。") from error
+            raise DbctlConfigurationError(f"{label}文件无法解析。") from error
         if not isinstance(parsed, Mapping):
-            raise DbctlConfigurationError("dbctl 配置根必须是对象。")
+            raise DbctlConfigurationError(f"{label}根必须是对象。")
         return dict(parsed)
 
 
@@ -513,58 +613,19 @@ def _parse_schemas(administration: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(schemas)
 
 
-def _parse_password_environment_mapping(
-    administration: Mapping[str, Any],
-) -> Mapping[DatabaseRole, str]:
-    """@brief 解析可选角色密码环境变量 / Parse optional role-password environment variables.
+def _parse_generated_role_passwords(root: Mapping[str, Any]) -> dict[DatabaseRole, str]:
+    """@brief 解析私密配置中的生成密码 / Parse generated passwords from private configuration.
 
-    @param administration ``database_administration`` 配置节。
-    / ``database_administration`` configuration section.
-    @return 仅含可登录角色的密码变量映射 / Password-variable mapping for login roles only.
-    @raise DbctlConfigurationError 映射结构、角色名或重复配置无效时抛出。
-    / Raised when mapping structure, role names, or duplicate configuration is invalid.
+    @param root 私密 config.jsonc 根对象 / Private config.jsonc root mapping.
+    @return 三个可登录角色的密码映射 / Password map for the three login roles.
+    @raise DbctlConfigurationError 密码节缺失或值无效时抛出。
+    / Raised when the password section is missing or invalid.
     """
+    raw_mapping = _require_mapping(
+        root.get("database_role_passwords"),
+        "database_role_passwords",
+    )
     result: dict[DatabaseRole, str] = {}
-    raw_mapping = administration.get("role_password_envs", {})
-    if not isinstance(raw_mapping, Mapping):
-        raise DbctlConfigurationError("role_password_envs 必须是对象。")
-    for raw_role, raw_variable_name in raw_mapping.items():
-        try:
-            role = DatabaseRole(raw_role)
-        except ValueError as error:
-            raise DbctlConfigurationError("role_password_envs 包含未知角色。") from error
-        if role is DatabaseRole.OWNER:
-            raise DbctlConfigurationError("role_password_envs 不能为 owner 配置密码。")
-        _validate_environment_variable_name(raw_variable_name, "role_password_envs")
-        result[role] = raw_variable_name
-
-    aliases = {
-        "migrator_password_env": DatabaseRole.MIGRATOR,
-        "app_password_env": DatabaseRole.APP,
-        "dashboard_password_env": DatabaseRole.DASHBOARD,
-    }
-    for key, role in aliases.items():
-        if key not in administration:
-            continue
-        if role in result:
-            raise DbctlConfigurationError(f"{key} 与 role_password_envs 重复配置。")
-        variable_name = administration[key]
-        _validate_environment_variable_name(variable_name, key)
-        result[role] = variable_name
+    for role in (DatabaseRole.MIGRATOR, DatabaseRole.APP, DatabaseRole.DASHBOARD):
+        result[role] = _required_text(raw_mapping, role.value)
     return result
-
-
-def read_optional_environment_value(variable_name: str, environ: Mapping[str, str] | None = None) -> str | None:
-    """@brief 读取可选环境变量 / Read an optional environment variable.
-
-    @param variable_name 已验证的环境变量名 / Validated environment-variable name.
-    @param environ 可选环境映射；默认读取当前进程环境 / Optional environment mapping; defaults to process environment.
-    @return 非空值或 ``None`` / Non-empty value or ``None``.
-
-    @note 此函数不记录返回值，适合读取 DSN 或密码等 secret。
-    / This function does not log its return value and is suitable for DSNs or passwords.
-    """
-    _validate_environment_variable_name(variable_name, "环境变量")
-    source = os.environ if environ is None else environ
-    value = source.get(variable_name)
-    return value if isinstance(value, str) and value else None

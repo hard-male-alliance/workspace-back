@@ -18,10 +18,7 @@ from .config import (
     DatabaseRole,
     DbctlConfigurationService,
     DbctlSettings,
-    read_optional_environment_value,
 )
-from .connection import parse_postgres_dsn
-from .errors import DbctlConfigurationError
 from .migration import AlembicMigrationRunner
 from .retention import (
     DEFAULT_TELEMETRY_PRUNE_BATCH_SIZE,
@@ -32,7 +29,7 @@ from .retention import (
     TelemetryPruneRequest,
     TelemetryPruneResult,
 )
-from .runners import LocalPsqlBootstrapRunner, PsycopgBootstrapRunner
+from .runners import LocalPsqlBootstrapRunner
 from .shell import PasswordPolicy, PreparedPsqlCommand, PsqlShellLauncher
 
 
@@ -60,17 +57,19 @@ class DbctlComposition:
         cls,
         config_path: Path | str = Path("config.jsonc"),
         *,
+        dbinit_path: Path | str | None = None,
         environ: MutableMapping[str, str] | None = None,
     ) -> DbctlComposition:
         """@brief 从 JSONC 配置构造 composition root / Construct composition root from JSONC configuration.
 
         @param config_path 根 JSONC 配置路径 / Root JSONC configuration path.
+        @param dbinit_path 独立数据库初始化声明路径 / Separate database-initialization declaration path.
         @param environ 可选可变环境映射；默认使用当前 ``os.environ``。
         / Optional mutable environment mapping; defaults to current ``os.environ``.
         @return 已加载但尚未执行外部 I/O 的 DbctlComposition。
         / DbctlComposition loaded without executing external I/O.
         """
-        configuration_service = DbctlConfigurationService(config_path)
+        configuration_service = DbctlConfigurationService(config_path, dbinit_path)
         loaded_settings = configuration_service.load()
         return cls(
             settings=loaded_settings,
@@ -93,19 +92,15 @@ class DbctlComposition:
     def execute_bootstrap(
         self,
         plan: BootstrapPlan,
-        *,
-        local_postgres: bool = False,
     ) -> BootstrapExecutionResult:
         """@brief 执行已生成的 bootstrap 计划 / Execute a generated bootstrap plan.
 
         @param plan 待执行的 BootstrapPlan / BootstrapPlan to execute.
-        @param local_postgres 仅显式为 ``True`` 时通过 ``sudo -u ... psql`` 执行。
-        / Only when explicitly ``True`` execute through ``sudo -u ... psql``.
         @return 不含 DSN 或密码的执行摘要 / Execution summary containing no DSN or password.
-        @raise DbctlConfigurationError 默认管理员 DSN 缺失或本地设置不安全时抛出。
-        / Raised when default administrator DSN is absent or local settings are unsafe.
+        @note bootstrap 固定通过 ``sudo -u <local_postgres_user> -- psql``，由终端完成 sudo 验证。
+        / Bootstrap always uses ``sudo -u <local_postgres_user> -- psql`` with terminal sudo authentication.
         """
-        runner = self._bootstrap_runner(local_postgres=local_postgres)
+        runner = self._bootstrap_runner()
         return BootstrapExecutor(runner).apply(plan)
 
     def execute_migration(self, revision: str = "head") -> None:
@@ -195,69 +190,28 @@ class DbctlComposition:
         """
         PsqlShellLauncher(self._environ).exec_prepared(prepared)
 
-    def _bootstrap_runner(self, *, local_postgres: bool) -> BootstrapRunner:
-        """@brief 根据显式模式创建 bootstrap runner / Create bootstrap runner according to explicit mode.
+    def _bootstrap_runner(self) -> BootstrapRunner:
+        """@brief 创建固定的本地 sudo bootstrap runner / Create the fixed local-sudo bootstrap runner.
 
-        @param local_postgres 是否启用唯一允许 sudo 的本地模式。
-        / Whether to enable the sole sudo-permitted local mode.
         @return 已绑定目标数据库的 BootstrapRunner / BootstrapRunner bound to target database.
-        @note 默认优先管理员 DSN；不会因为在本机运行而自动降级到 ``sudo``。
-        / Administrator DSN is preferred by default; merely running locally never auto-falls back to ``sudo``.
+        @note 不接受管理员 DSN，也不存在隐藏的远程 fallback。
+        / Accepts no administrator DSN and has no hidden remote fallback.
         """
         administration = self.settings.administration
-        if local_postgres:
-            return LocalPsqlBootstrapRunner(
-                local_postgres_user=administration.local_postgres_user,
-                maintenance_database=administration.maintenance_database,
-            ).with_target_database(administration.database_name)
-        return PsycopgBootstrapRunner(
-            self.settings.require_admin_dsn(self._environ),
+        return LocalPsqlBootstrapRunner(
+            local_postgres_user=administration.local_postgres_user,
             maintenance_database=administration.maintenance_database,
-            target_database=administration.database_name,
-        )
+        ).with_target_database(administration.database_name)
 
     def _resolve_role_passwords(self) -> dict[DatabaseRole, str]:
-        """@brief 从显式密码环境或角色 DSN 安全解析密码 / Safely resolve passwords from explicit environment or role DSNs.
+        """@brief 返回 dbctl 自动生成的登录角色密码 / Return dbctl-generated login-role passwords.
 
         @return 仅内存保存的登录角色密码映射 / In-memory login-role password mapping.
-        @raise DbctlConfigurationError 环境变量缺失、DSN 无效或 DSN user 与配置 role 不一致时抛出。
-        / Raised for missing environment variables, invalid DSNs, or a DSN user mismatching configured role.
-
-        @note 显式 ``*_password_env`` 优先。未显式配置时，若该角色 DSN 本身包含
-        password，dbctl 才会同步该密码；没有 password 的 DSN 可继续使用 peer、证书或
-        外部认证，bootstrap 不会虚构密码。
-        / Explicit ``*_password_env`` takes precedence. Otherwise dbctl syncs a password only when
-        that role's own DSN contains one; DSNs without passwords may continue using peer,
-        certificate, or external authentication and bootstrap does not invent a password.
+        @note 密码只来自被 Git 忽略的本地 config.jsonc；DSN 与环境变量不能覆盖它们。
+        / Passwords come only from Git-ignored local config.jsonc; DSNs and environment variables
+        cannot override them.
         """
-        administration = self.settings.administration
-        result: dict[DatabaseRole, str] = {}
-        login_roles = (DatabaseRole.MIGRATOR, DatabaseRole.APP, DatabaseRole.DASHBOARD)
-        for role in login_roles:
-            explicit_variable = administration.password_env_by_role.get(role)
-            if explicit_variable is not None:
-                password = read_optional_environment_value(explicit_variable, self._environ)
-                if password is None:
-                    raise DbctlConfigurationError(
-                        f"已配置的 {role.value} role 密码环境变量未设置：{explicit_variable}"
-                    )
-                result[role] = password
-                continue
-
-            dsn_variable = self.settings.database.dsn_environment_for(role)
-            dsn = read_optional_environment_value(dsn_variable, self._environ)
-            if dsn is None:
-                continue
-            parsed = parse_postgres_dsn(dsn)
-            if parsed.password is None:
-                continue
-            expected_role_name = administration.role_name(role)
-            if parsed.user is not None and parsed.user != expected_role_name:
-                raise DbctlConfigurationError(
-                    f"{dsn_variable} 的数据库用户与配置的 {role.value} role 不一致。"
-                )
-            result[role] = parsed.password
-        return result
+        return dict(self.settings.role_passwords)
 
 
 def _find_repository_root(config_path: Path) -> Path:

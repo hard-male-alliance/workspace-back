@@ -4,7 +4,7 @@ Alembic 的 migration machinery 仍是同步 API；此文件只在 AsyncConnecti
 ``run_sync`` 建立清晰的同步边界，绝不把它误当成“全异步 migration API”。
 """
 
-# ruff: noqa: E402, I001
+# ruff: noqa: E402
 
 from __future__ import annotations
 

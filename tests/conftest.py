@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +72,14 @@ def backend_client() -> Iterator[TestClient]:
     @note 必须使用上下文管理器，以便后台 supervisor 与 telemetry 被可靠关闭。
     """
 
-    settings = BackendSettings.from_file(PROJECT_ROOT / "config.jsonc")
+    settings = BackendSettings.from_file(PROJECT_ROOT / "example.jsonc")
+    settings = replace(
+        settings,
+        network=replace(
+            settings.network,
+            cors_allowed_origins=("http://127.0.0.1:5173", "http://localhost:5173"),
+        ),
+    )
     application = create_app(settings)
     with TestClient(application, raise_server_exceptions=False) as client:
         yield client

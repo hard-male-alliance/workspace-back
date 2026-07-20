@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
-
-import pytest
 
 from backend.config import BackendSettings
 from dashboard.config import DashboardSettings
@@ -15,23 +14,38 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 """@brief 仓库根路径 / Repository-root path."""
 
 
-@pytest.mark.parametrize("file_name", ("config.jsonc", "example.jsonc"))
-def test_root_configuration_examples_load_in_every_application(file_name: str) -> None:
-    """@brief 三个独立应用均应接受完整根配置 / Every independent application accepts each complete root configuration.
+def test_public_runtime_example_loads_in_product_applications() -> None:
+    """@brief 无密钥运行配置示例应被产品应用接受 / Product applications accept the secret-free runtime example.
 
-    @param file_name 待校验的根 JSONC 文件名 / Root JSONC filename to validate.
     @return 无返回值；任一配置服务拒绝示例即令测试失败。
-
-    @note 该回归测试保护“一个共享事实来源、三个独立配置服务”的架构边界；它不让
-    backend 配置对象替 dashboard 或 dbctl 代为验证设置。
     """
-    path = PROJECT_ROOT / file_name
+    path = PROJECT_ROOT / "example.jsonc"
     root = load_jsonc(path)
 
     backend = BackendSettings.from_file(path)
     dashboard = DashboardSettings.from_root_mapping(root)
-    dbctl = DbctlConfigurationService(path).load()
 
     assert backend.environment == "development"
     assert dashboard.observability_view == "observability.dashboard_metric_samples"
+
+
+def test_dbctl_creates_private_config_and_loads_separate_dbinit(tmp_path: Path) -> None:
+    """@brief dbctl 应从公开模板生成私密配置并独立读取 dbinit / dbctl generates private config and reads dbinit separately.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @return 无返回值 / No return value.
+    """
+    example = (PROJECT_ROOT / "example.jsonc").read_text(encoding="utf-8")
+    (tmp_path / "example.jsonc").write_text(example, encoding="utf-8")
+    config_path = tmp_path / "config.jsonc"
+    dbctl = DbctlConfigurationService(
+        config_path,
+        PROJECT_ROOT / "dbinit.jsonc",
+    ).load()
+
+    generated = load_jsonc(config_path)
+    passwords = generated["database_role_passwords"]
+    assert set(passwords) == {"migrator", "app", "dashboard"}
+    assert all(isinstance(password, str) and len(password) >= 32 for password in passwords.values())
+    assert os.stat(config_path).st_mode & 0o777 == 0o600
     assert dbctl.administration.observability_schema == "observability"
