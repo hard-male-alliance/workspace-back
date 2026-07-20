@@ -142,7 +142,7 @@ class DashboardCompositionRoot:
 
     @param config_service: Dashboard 专属配置服务；缺省时读取当前目录 config.jsonc。
     @param repository_factory: 可选仓库工厂；缺省时按 database.mode 选择 memory 或 PostgreSQL。
-    @param environ: 可注入环境变量映射；只读取 DSN 和 operator token，不记录 secret。
+    @param environ: 可注入环境变量映射；只读取 operator token，不记录 secret。
 
     @note 该类从不 import backend 或 dbctl，数据库连接可由外层以 repository_factory 注入。
     """
@@ -211,7 +211,7 @@ def create_dashboard_application(
     config_path: str | Path = "config.jsonc",
     repository: ObservabilityRepository | None = None,
     repository_factory: RepositoryFactory | None = None,
-    allow_missing_config: bool = True,
+    allow_missing_config: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> DashboardApplication:
     """@brief 快速创建一个独立 DashboardApplication。
@@ -219,8 +219,8 @@ def create_dashboard_application(
     @param config_path: 共享根 config.jsonc 的路径。
     @param repository: 可选已创建仓库；适合测试或由外层管理连接池的部署。
     @param repository_factory: 可选仓库工厂；适合按配置创建 PostgreSQL 读取适配器。
-    @param allow_missing_config: 开发测试中缺少配置文件时是否采用默认安全配置。
-    @param environ: 可选进程环境；DSN/operator token 仅从这里读取。
+    @param allow_missing_config: 测试显式允许缺少配置时是否采用默认安全配置。
+    @param environ: 可选进程环境；仅从这里读取 operator token。
     @return: memory 模式使用内存仓库，postgresql 模式使用受限 PostgreSQL 读模型的应用。
     """
 
@@ -237,17 +237,16 @@ def create_dashboard_application(
 
 def _default_repository_factory(
     settings: DashboardSettings,
-    environ: Mapping[str, str],
+    _environ: Mapping[str, str],
 ) -> ObservabilityRepository:
     """@brief 按 database.mode 创建默认只读仓库（default repository factory）。
 
     @param settings: 已校验的 Dashboard 设置。
-    @param environ: secret 环境变量映射。
+    @param _environ: 为统一 factory 接口保留的环境变量映射；数据库 DSN 不从中读取。
     @return: memory 模式的内存仓库或 PostgreSQL 模式的稳定视图仓库。
     @raise DashboardConfigurationError: PostgreSQL 只读 DSN 缺失时抛出。
 
-    @note 不会将 application DSN 借给 Dashboard。dashboard_dsn_env 缺失时配置层只使用
-    公开约定名，运行时仍必须显式提供 dashboard role 的 DSN。
+    @note 不会将 application DSN 借给 Dashboard；dashboard role DSN 只来自 config.jsonc。
     """
 
     if settings.database_mode == "memory":
@@ -255,12 +254,9 @@ def _default_repository_factory(
     if settings.database_mode != "postgresql":
         raise DashboardConfigurationError("不支持的 Dashboard database.mode。")
 
-    dsn = environ.get(settings.dashboard_dsn_env)
+    dsn = settings.dashboard_dsn
     if not isinstance(dsn, str) or not dsn:
-        raise DashboardConfigurationError(
-            "Dashboard PostgreSQL DSN 环境变量未设置："
-            f"{settings.dashboard_dsn_env}"
-        )
+        raise DashboardConfigurationError("Dashboard PostgreSQL DSN 未配置。")
     fetcher = SqlAlchemyAsyncRowFetcher(
         dsn,
         pool_size=settings.database_pool_size,

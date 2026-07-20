@@ -52,7 +52,7 @@ class DashboardSettings:
       },
       "database": {
         "mode": "postgresql",
-        "dashboard_dsn_env": "AIWS_DASHBOARD_DATABASE_DSN"
+        "dashboard_dsn": "postgresql://..."
       }
     }
     ```
@@ -66,7 +66,7 @@ class DashboardSettings:
     @param max_samples: 单个仓库查询的最大样本数，作为背压上限。
     @param observability_view: PostgreSQL 只读视图的 schema.table 名称。
     @param database_mode: 从根 database.mode 读取的存储模式；只允许 memory 或 postgresql。
-    @param dashboard_dsn_env: PostgreSQL dashboard 只读 DSN 所在的环境变量名。
+    @param dashboard_dsn: PostgreSQL dashboard 只读 DSN；repr 中隐藏。
     @param database_pool_size: Dashboard 只读连接池的常驻连接数。
     @param database_max_overflow: Dashboard 连接池忙碌时允许的临时连接数。
     @param database_connect_timeout_ms: 建立 PostgreSQL 连接的超时上限。
@@ -89,7 +89,7 @@ class DashboardSettings:
     max_samples: int = 10_000
     observability_view: str = "observability.dashboard_metric_samples"
     database_mode: str = "memory"
-    dashboard_dsn_env: str = "AIWS_DASHBOARD_DATABASE_DSN"
+    dashboard_dsn: str | None = field(default=None, repr=False)
     database_pool_size: int = 5
     database_max_overflow: int = 5
     database_connect_timeout_ms: int = 3_000
@@ -119,8 +119,10 @@ class DashboardSettings:
             raise DashboardConfigurationError("dashboard.observability_view 必须是字符串。")
         if not isinstance(self.database_mode, str):
             raise DashboardConfigurationError("database.mode 必须是字符串。")
-        if not isinstance(self.dashboard_dsn_env, str):
-            raise DashboardConfigurationError("database.dashboard_dsn_env 必须是字符串。")
+        if self.dashboard_dsn is not None and (
+            not isinstance(self.dashboard_dsn, str) or not self.dashboard_dsn.strip()
+        ):
+            raise DashboardConfigurationError("database.dashboard_dsn 必须是非空字符串或 null。")
         if not isinstance(self.operator_access_mode, str):
             raise DashboardConfigurationError("dashboard.access.mode 必须是字符串。")
         if not isinstance(self.operator_id, str):
@@ -175,9 +177,10 @@ class DashboardSettings:
         database_mode = self.database_mode.strip()
         if database_mode not in _DATABASE_MODES:
             raise DashboardConfigurationError("database.mode 必须是 memory 或 postgresql。")
-        dashboard_dsn_env = self.dashboard_dsn_env.strip()
-        if not _ENVIRONMENT_VARIABLE_PATTERN.fullmatch(dashboard_dsn_env):
-            raise DashboardConfigurationError("database.dashboard_dsn_env 必须是合法环境变量名。")
+        if database_mode == "postgresql" and self.dashboard_dsn is None:
+            raise DashboardConfigurationError(
+                "database.dashboard_dsn 在 postgresql 模式下必须配置。"
+            )
         for field_name, value in (
             ("database.pool_size", self.database_pool_size),
             ("database.max_overflow", self.database_max_overflow),
@@ -200,10 +203,7 @@ class DashboardSettings:
             raise DashboardConfigurationError(
                 "database.mode=postgresql 时 dashboard.access.mode 必须是 operator_token。"
             )
-        if (
-            environment not in _MOCK_ACCESS_ENVIRONMENTS
-            and operator_access_mode == "mock"
-        ):
+        if environment not in _MOCK_ACCESS_ENVIRONMENTS and operator_access_mode == "mock":
             raise DashboardConfigurationError(
                 "staging/production 的 dashboard.access.mode 必须是 operator_token；"
                 "mock 仅允许 development/test。"
@@ -216,14 +216,17 @@ class DashboardSettings:
             raise DashboardConfigurationError("dashboard.access.token_env 必须是合法环境变量名。")
         operator_token_header = self.operator_token_header.strip()
         if not _HTTP_HEADER_PATTERN.fullmatch(operator_token_header):
-            raise DashboardConfigurationError("dashboard.access.token_header 必须是安全 HTTP header 名称。")
+            raise DashboardConfigurationError(
+                "dashboard.access.token_header 必须是安全 HTTP header 名称。"
+            )
 
         object.__setattr__(self, "environment", environment)
         object.__setattr__(self, "api_host", api_host)
         object.__setattr__(self, "api_prefix", api_prefix)
         object.__setattr__(self, "observability_view", observability_view)
         object.__setattr__(self, "database_mode", database_mode)
-        object.__setattr__(self, "dashboard_dsn_env", dashboard_dsn_env)
+        if self.dashboard_dsn is not None:
+            object.__setattr__(self, "dashboard_dsn", self.dashboard_dsn.strip())
         object.__setattr__(self, "operator_access_mode", operator_access_mode)
         object.__setattr__(self, "operator_id", operator_id)
         object.__setattr__(self, "operator_token_env", operator_token_env)
@@ -236,7 +239,7 @@ class DashboardSettings:
         *,
         environment: str = "development",
         database_mode: str = "memory",
-        dashboard_dsn_env: str = "AIWS_DASHBOARD_DATABASE_DSN",
+        dashboard_dsn: str | None = None,
         database_pool_size: int = 5,
         database_max_overflow: int = 5,
         database_connect_timeout_ms: int = 3_000,
@@ -246,7 +249,7 @@ class DashboardSettings:
         @param mapping: 根配置中 dashboard 键对应的对象；未知键会被拒绝。
         @param environment: 从根 environment 节派生的部署环境。
         @param database_mode: 从根 database 节派生的存储模式。
-        @param dashboard_dsn_env: dashboard 只读 DSN 的环境变量名。
+        @param dashboard_dsn: config.jsonc 中的 dashboard 只读 DSN。
         @param database_pool_size: 连接池常驻连接数。
         @param database_max_overflow: 连接池临时连接上限。
         @param database_connect_timeout_ms: 连接超时。
@@ -405,7 +408,7 @@ class DashboardSettings:
                 max_samples=max_samples,
                 observability_view=observability_view,
                 database_mode=database_mode,
-                dashboard_dsn_env=dashboard_dsn_env,
+                dashboard_dsn=dashboard_dsn,
                 database_pool_size=database_pool_size,
                 database_max_overflow=database_max_overflow,
                 database_connect_timeout_ms=database_connect_timeout_ms,
@@ -442,7 +445,7 @@ class DashboardSettings:
         environment = _optional_str(root, "environment", "development", "environment")
         (
             database_mode,
-            dashboard_dsn_env,
+            dashboard_dsn,
             database_pool_size,
             database_max_overflow,
             database_connect_timeout_ms,
@@ -454,7 +457,7 @@ class DashboardSettings:
                 dashboard,
                 environment=environment,
                 database_mode=database_mode,
-                dashboard_dsn_env=dashboard_dsn_env,
+                dashboard_dsn=dashboard_dsn,
                 database_pool_size=database_pool_size,
                 database_max_overflow=database_max_overflow,
                 database_connect_timeout_ms=database_connect_timeout_ms,
@@ -493,7 +496,7 @@ class DashboardSettings:
             compatibility_mapping,
             environment=environment,
             database_mode=database_mode,
-            dashboard_dsn_env=dashboard_dsn_env,
+            dashboard_dsn=dashboard_dsn,
             database_pool_size=database_pool_size,
             database_max_overflow=database_max_overflow,
             database_connect_timeout_ms=database_connect_timeout_ms,
@@ -514,7 +517,7 @@ class DashboardConfigService:
     """@brief 从项目根 config.jsonc 独立读取 Dashboard 配置的服务。
 
     @param path: 共享配置文件路径，默认相对当前工作目录的 config.jsonc。
-    @param allow_missing: 为 True 时，开发与测试中缺少文件会返回安全默认值。
+    @param allow_missing: 仅测试显式设为 True 时，缺少文件返回安全默认值。
 
     @note 服务优先读取 `dashboard`，也兼容共享的 `operator_interface`；不导入
     backend 或 dbctl 的配置服务。
@@ -524,7 +527,7 @@ class DashboardConfigService:
         self,
         path: str | Path = "config.jsonc",
         *,
-        allow_missing: bool = True,
+        allow_missing: bool = False,
     ) -> None:
         """@brief 创建尚未读取磁盘的 DashboardConfigService。
 
@@ -599,29 +602,25 @@ def _optional_mapping(
     return _require_mapping(value, path)
 
 
-def _root_database_values(root: Mapping[str, Any]) -> tuple[str, str, int, int, int]:
+def _root_database_values(
+    root: Mapping[str, Any],
+) -> tuple[str, str | None, int, int, int]:
     """@brief 从共享根读取 Dashboard 所需的数据库配置（database settings）。
 
     @param root: 已确认是对象的共享根配置。
-    @return: ``(mode, dashboard_dsn_env, pool_size, max_overflow, connect_timeout_ms)``。
+    @return: ``(mode, dashboard_dsn, pool_size, max_overflow, connect_timeout_ms)``。
     @raise DashboardConfigurationError: database 节存在但类型或字段不合法时抛出。
 
     @note 仅消费 Dashboard 所需字段，故不会因 backend/dbctl 的新增配置破坏该独立包。
-    缺失 ``dashboard_dsn_env`` 时只派生为公开约定的变量名
-    ``AIWS_DASHBOARD_DATABASE_DSN``，绝不回退使用 application DSN。
+    Dashboard 只读取自己的直接 DSN，绝不回退使用 application DSN。
     """
 
     if "database" not in root:
-        return ("memory", "AIWS_DASHBOARD_DATABASE_DSN", 5, 5, 3_000)
+        return ("memory", None, 5, 5, 3_000)
     database = _require_mapping(root["database"], "database")
     return (
         _optional_str(database, "mode", "memory", "database.mode"),
-        _optional_str(
-            database,
-            "dashboard_dsn_env",
-            "AIWS_DASHBOARD_DATABASE_DSN",
-            "database.dashboard_dsn_env",
-        ),
+        _optional_nullable_str(database, "dashboard_dsn", "database.dashboard_dsn"),
         _optional_int(database, "pool_size", 5, "database.pool_size"),
         _optional_int(database, "max_overflow", 5, "database.max_overflow"),
         _optional_int(
@@ -692,6 +691,26 @@ def _optional_str(
     if not value.strip():
         raise DashboardConfigurationError(f"{path} 不能为空。")
     return value
+
+
+def _optional_nullable_str(
+    source: Mapping[str, Any],
+    key: str,
+    path: str,
+) -> str | None:
+    """@brief 读取可空字符串 / Read a nullable string.
+
+    @param source 配置对象 / Configuration mapping.
+    @param key 字段名 / Field name.
+    @param path 错误路径 / Error path.
+    @return 修剪后的字符串或 None / Stripped string or None.
+    """
+    value = source.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise DashboardConfigurationError(f"{path} 必须是非空字符串或 null。")
+    return value.strip()
 
 
 __all__ = ["DashboardConfigService", "DashboardSettings", "load_jsonc"]

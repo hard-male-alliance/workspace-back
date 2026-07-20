@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from ipaddress import IPv4Network, IPv6Network, ip_network
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -58,7 +58,7 @@ class DatabaseSettings:
     """@brief 后端数据库连接设置 / Backend database connection settings."""
 
     mode: DatabaseMode
-    application_dsn_env: str
+    application_dsn: str | None = field(repr=False)
     pool_size: int
     max_overflow: int
     connect_timeout_ms: int
@@ -232,7 +232,9 @@ class BackendSettings:
         root = load_jsonc(path)
         environment = _require_string(root, "environment")
         if environment not in _SUPPORTED_ENVIRONMENTS:
-            raise ConfigurationError("environment must be development, test, staging, or production")
+            raise ConfigurationError(
+                "environment must be development, test, staging, or production"
+            )
         workspace = require_mapping(root.get("workspace"), "workspace")
         network = require_mapping(root.get("network"), "network")
         database = require_mapping(root.get("database"), "database")
@@ -243,7 +245,9 @@ class BackendSettings:
         observability = require_mapping(root.get("observability"), "observability")
         logging = require_mapping(root.get("logging"), "logging")
         security = _security_settings(root.get("security"), environment)
-        database_mode = cast(DatabaseMode, _require_choice(database, "mode", {"memory", "postgresql"}))
+        database_mode = cast(
+            DatabaseMode, _require_choice(database, "mode", {"memory", "postgresql"})
+        )
         if environment in {"staging", "production"} and database_mode != "postgresql":
             raise ConfigurationError("database.mode must be postgresql in staging/production")
         renderer_adapter = cast(
@@ -256,15 +260,17 @@ class BackendSettings:
         font_directories = renderer.get("allowed_font_directories", [])
         fallback_providers = ai.get("fallback_providers", [])
         chunk_max_characters = _require_positive_int(knowledge, "chunk_max_characters")
-        chunk_overlap_characters = _require_non_negative_int(
-            knowledge, "chunk_overlap_characters"
-        )
+        chunk_overlap_characters = _require_non_negative_int(knowledge, "chunk_overlap_characters")
         if chunk_overlap_characters >= chunk_max_characters:
             raise ConfigurationError(
                 "knowledge.chunk_overlap_characters must be smaller than chunk_max_characters"
             )
-        if not isinstance(font_directories, list) or not all(isinstance(item, str) for item in font_directories):
-            raise ConfigurationError("resume_rendering.allowed_font_directories must be a string array")
+        if not isinstance(font_directories, list) or not all(
+            isinstance(item, str) for item in font_directories
+        ):
+            raise ConfigurationError(
+                "resume_rendering.allowed_font_directories must be a string array"
+            )
         if not isinstance(fallback_providers, list):
             raise ConfigurationError("ai.fallback_providers must be an array")
         return cls(
@@ -290,7 +296,11 @@ class BackendSettings:
             ),
             database=DatabaseSettings(
                 mode=database_mode,
-                application_dsn_env=_require_string(database, "application_dsn_env"),
+                application_dsn=_database_dsn(
+                    database,
+                    key="application_dsn",
+                    mode=database_mode,
+                ),
                 pool_size=_require_positive_int(database, "pool_size"),
                 max_overflow=_require_non_negative_int(database, "max_overflow"),
                 connect_timeout_ms=_require_positive_int(database, "connect_timeout_ms"),
@@ -335,8 +345,7 @@ class BackendSettings:
                     ai, "data_region", {"cn", "global", "private_deployment"}
                 ),
                 fallback_providers=tuple(
-                    _provider_endpoint(item, index)
-                    for index, item in enumerate(fallback_providers)
+                    _provider_endpoint(item, index) for index, item in enumerate(fallback_providers)
                 ),
                 embedding_provider=_require_string(ai, "embedding_provider"),
                 embedding_model=_require_string(ai, "embedding_model"),
@@ -392,6 +401,31 @@ def _optional_string(value: object) -> str | None:
     raise ConfigurationError("configuration value must be a string or null")
 
 
+def _database_dsn(
+    database: dict[str, Any],
+    *,
+    key: str,
+    mode: DatabaseMode,
+) -> str | None:
+    """@brief 从统一配置读取数据库 DSN / Read a database DSN from unified configuration.
+
+    @param database 根 database 配置节 / Root database configuration section.
+    @param key DSN 字段名 / DSN field name.
+    @param mode 数据库运行模式 / Database runtime mode.
+    @return memory 模式下可为空的 DSN / DSN, nullable in memory mode.
+    @raise ConfigurationError PostgreSQL 模式缺少 DSN 或字段类型错误时抛出。
+    / Raised when PostgreSQL mode lacks a DSN or the field type is invalid.
+    """
+    dsn = _optional_string(database.get(key))
+    if isinstance(dsn, str):
+        dsn = dsn.strip()
+        if not dsn:
+            raise ConfigurationError(f"database.{key} must be a non-empty string or null")
+    if mode == "postgresql" and dsn is None:
+        raise ConfigurationError(f"database.{key} is required in postgresql mode")
+    return dsn
+
+
 def _optional_proxy_url(value: object) -> str | None:
     """@brief 读取并验证统一出站代理 URL / Read and validate the shared outbound proxy URL.
 
@@ -443,7 +477,9 @@ def _require_trusted_proxy_cidrs(value: object) -> tuple[IPv4Network | IPv6Netwo
         try:
             networks.append(ip_network(item, strict=False))
         except ValueError as error:
-            raise ConfigurationError("network.trusted_proxy_cidrs contains an invalid CIDR") from error
+            raise ConfigurationError(
+                "network.trusted_proxy_cidrs contains an invalid CIDR"
+            ) from error
     return tuple(networks)
 
 
@@ -595,14 +631,21 @@ def _security_settings(value: object, environment: str) -> SecuritySettings:
     secret_env = _require_string(mapping, "trusted_proxy_hmac_secret_env")
     max_clock_skew_seconds = _require_positive_int(mapping, "trusted_proxy_max_clock_skew_seconds")
     if not _ENVIRONMENT_VARIABLE_PATTERN.fullmatch(secret_env):
-        raise ConfigurationError("security.trusted_proxy_hmac_secret_env must be an environment variable name")
+        raise ConfigurationError(
+            "security.trusted_proxy_hmac_secret_env must be an environment variable name"
+        )
     if max_clock_skew_seconds > _MAX_TRUSTED_PROXY_CLOCK_SKEW_SECONDS:
         raise ConfigurationError(
             "security.trusted_proxy_max_clock_skew_seconds must not exceed "
             f"{_MAX_TRUSTED_PROXY_CLOCK_SKEW_SECONDS}"
         )
-    if environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS and identity_mode != "trusted_proxy_hmac":
-        raise ConfigurationError("security.identity_mode must be trusted_proxy_hmac outside development/test")
+    if (
+        environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS
+        and identity_mode != "trusted_proxy_hmac"
+    ):
+        raise ConfigurationError(
+            "security.identity_mode must be trusted_proxy_hmac outside development/test"
+        )
     return SecuritySettings(
         identity_mode=identity_mode,
         trusted_proxy_hmac_secret_env=secret_env,
@@ -631,9 +674,7 @@ def _provider_endpoint(value: object, index: int) -> AIProviderEndpoint:
         model=_require_string(mapping, "model"),
         api_key_env=_require_string(mapping, "api_key_env"),
         base_url=_require_string(mapping, "base_url"),
-        data_region=_require_choice(
-            mapping, "data_region", {"cn", "global", "private_deployment"}
-        ),
+        data_region=_require_choice(mapping, "data_region", {"cn", "global", "private_deployment"}),
     )
     if not _ENVIRONMENT_VARIABLE_PATTERN.fullmatch(endpoint.api_key_env):
         raise ConfigurationError(
