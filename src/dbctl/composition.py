@@ -12,7 +12,6 @@ from .bootstrap import (
     BootstrapExecutor,
     BootstrapPlan,
     BootstrapPlanBuilder,
-    BootstrapRunner,
 )
 from .config import (
     DatabaseRole,
@@ -29,7 +28,7 @@ from .retention import (
     TelemetryPruneRequest,
     TelemetryPruneResult,
 )
-from .runners import LocalPsqlBootstrapRunner
+from .runners import BootstrapAccessMode, LocalPsqlBootstrapRunner
 from .shell import PasswordPolicy, PreparedPsqlCommand, PsqlShellLauncher
 
 
@@ -92,16 +91,22 @@ class DbctlComposition:
     def execute_bootstrap(
         self,
         plan: BootstrapPlan,
+        *,
+        access_mode: BootstrapAccessMode | str = BootstrapAccessMode.AUTO,
     ) -> BootstrapExecutionResult:
         """@brief 执行已生成的 bootstrap 计划 / Execute a generated bootstrap plan.
 
         @param plan 待执行的 BootstrapPlan / BootstrapPlan to execute.
+        @param access_mode 自动、sudo 或终端密码模式 / Auto, sudo, or terminal-password mode.
         @return 不含 DSN 或密码的执行摘要 / Execution summary containing no DSN or password.
-        @note bootstrap 固定通过 ``sudo -u <local_postgres_user> -- psql``，由终端完成 sudo 验证。
-        / Bootstrap always uses ``sudo -u <local_postgres_user> -- psql`` with terminal sudo authentication.
+        @note Windows 或找不到 sudo 时，auto 会改为提示 PostgreSQL 管理角色密码。
+        / On Windows or when sudo is unavailable, auto prompts for the PostgreSQL administrator password.
         """
-        runner = self._bootstrap_runner()
-        return BootstrapExecutor(runner).apply(plan)
+        runner = self._bootstrap_runner(access_mode=access_mode)
+        try:
+            return BootstrapExecutor(runner).apply(plan)
+        finally:
+            runner.close()
 
     def execute_migration(self, revision: str = "head") -> None:
         """@brief 显式执行 Alembic migration / Explicitly execute Alembic migration.
@@ -190,17 +195,24 @@ class DbctlComposition:
         """
         PsqlShellLauncher(self._environ).exec_prepared(prepared)
 
-    def _bootstrap_runner(self) -> BootstrapRunner:
-        """@brief 创建固定的本地 sudo bootstrap runner / Create the fixed local-sudo bootstrap runner.
+    def _bootstrap_runner(
+        self,
+        *,
+        access_mode: BootstrapAccessMode | str = BootstrapAccessMode.AUTO,
+    ) -> LocalPsqlBootstrapRunner:
+        """@brief 创建跨平台本地 bootstrap runner / Create a cross-platform local bootstrap runner.
 
-        @return 已绑定目标数据库的 BootstrapRunner / BootstrapRunner bound to target database.
-        @note 不接受管理员 DSN，也不存在隐藏的远程 fallback。
-        / Accepts no administrator DSN and has no hidden remote fallback.
+        @param access_mode 自动、sudo 或终端密码模式 / Auto, sudo, or terminal-password mode.
+        @return 已绑定目标数据库的本地 runner / Local runner bound to the target database.
+        @note 不接受管理员 DSN；两种模式都要求本机终端验证。
+        / Accepts no administrator DSN; both modes require local terminal authentication.
         """
         administration = self.settings.administration
         return LocalPsqlBootstrapRunner(
             local_postgres_user=administration.local_postgres_user,
             maintenance_database=administration.maintenance_database,
+            bootstrap_database_user=administration.bootstrap_database_user,
+            access_mode=access_mode,
         ).with_target_database(administration.database_name)
 
     def _resolve_role_passwords(self) -> dict[DatabaseRole, str]:

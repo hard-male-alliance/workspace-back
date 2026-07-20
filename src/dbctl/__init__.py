@@ -32,7 +32,7 @@ from .identifiers import (
     validate_postgres_identifier,
 )
 from .migration import AlembicMigrationRunner
-from .runners import LocalPsqlBootstrapRunner
+from .runners import BootstrapAccessMode, LocalPsqlBootstrapRunner
 from .shell import (
     PasswordPolicy,
     PreparedPsqlCommand,
@@ -42,6 +42,7 @@ from .shell import (
 
 __all__ = [
     "AlembicMigrationRunner",
+    "BootstrapAccessMode",
     "BootstrapExecutionError",
     "BootstrapExecutionResult",
     "BootstrapExecutor",

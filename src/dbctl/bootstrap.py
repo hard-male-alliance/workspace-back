@@ -289,11 +289,10 @@ class BootstrapPlanBuilder:
 class BootstrapRunner(Protocol):
     """@brief bootstrap 执行端口 / Bootstrap execution port.
 
-    测试可实现此协议记录 SQL，而生产环境可使用管理员 DSN 或显式本地 ``psql``
-runner；计划本身不依赖任何 subprocess、网络客户端或框架。
-    / Tests can implement this protocol to record SQL, while production can use an administrator
-    DSN or explicit local ``psql`` runner; the plan itself depends on no subprocess, network client,
-    or framework.
+    测试可实现此协议记录 SQL，而生产环境使用跨平台本地 ``psql`` runner；计划本身
+    不依赖任何 subprocess、网络客户端或框架。
+    / Tests can implement this protocol to record SQL, while production uses the cross-platform
+    local ``psql`` runner; the plan itself depends on no subprocess, network client, or framework.
     """
 
     def database_exists(self, database_name: str) -> bool:

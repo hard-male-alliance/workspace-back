@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,7 +18,8 @@ from dbctl.bootstrap import (
 )
 from dbctl.cli import main
 from dbctl.composition import DbctlComposition
-from dbctl.runners import LocalPsqlBootstrapRunner
+from dbctl.errors import DbctlConfigurationError
+from dbctl.runners import BootstrapAccessMode, LocalPsqlBootstrapRunner
 
 
 @dataclass
@@ -195,10 +197,10 @@ def test_bootstrap_executor_skips_existing_database_on_repeat_without_external_i
     assert any(target is ExecutionTarget.DATABASE for target, _ in runner.calls)
 
 
-def test_bootstrap_runner_always_uses_terminal_sudo_psql(
+def test_bootstrap_runner_uses_terminal_sudo_psql_on_supported_posix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """@brief bootstrap 必须固定使用 sudo psql，且不需要管理员 DSN / Bootstrap always uses sudo psql without an admin DSN.
+    """@brief 支持 sudo 的 POSIX 可显式使用 sudo psql / Supported POSIX platforms can explicitly use sudo psql.
 
     @param monkeypatch pytest 替换夹具 / pytest patch fixture.
     @return 无返回值 / No return value.
@@ -217,8 +219,83 @@ def test_bootstrap_runner_always_uses_terminal_sudo_psql(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     composition, _ = _composition_with_secret()
-    runner = composition._bootstrap_runner()
+    runner = composition._bootstrap_runner(access_mode=BootstrapAccessMode.SUDO)
     assert isinstance(runner, LocalPsqlBootstrapRunner)
     assert runner.database_exists("ai_job_workspace") is False
     assert observed_commands[0][:5] == ["sudo", "-u", "postgres", "--", "psql"]
     assert "shell" not in observed_commands[0]
+
+
+@pytest.mark.parametrize("platform_name", ("nt", "posix"))
+def test_bootstrap_runner_prompts_once_without_sudo(
+    platform_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief Windows 与无 sudo 平台应提示一次密码且不把密码放进 argv/environment / Windows and sudo-less platforms prompt once without exposing the password.
+
+    @param platform_name 模拟平台 / Simulated platform.
+    @param monkeypatch pytest 替换夹具 / pytest patch fixture.
+    @return 无返回值 / No return value.
+    """
+    secret = "bootstrap-admin-password-sentinel"
+    prompt_count = 0
+    observed: list[tuple[list[str], dict[str, Any]]] = []
+
+    def prompt(_: str) -> str:
+        """@brief 返回一次测试密码 / Return one test password.
+
+        @param _ 安全提示文本 / Safe prompt text.
+        @return 测试密码 / Test password.
+        """
+        nonlocal prompt_count
+        prompt_count += 1
+        return secret
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """@brief 捕获 prompt 模式命令 / Capture a prompt-mode command.
+
+        @param command 无 shell argv / Shell-free argv.
+        @param kwargs subprocess 参数 / Subprocess arguments.
+        @return 数据库不存在的成功结果 / Successful absent-database result.
+        """
+        observed.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="f\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = LocalPsqlBootstrapRunner(
+        platform_name=platform_name,
+        executable_finder=lambda _: None,
+        password_prompt=prompt,
+        environ={"PGPASSWORD": "inherited-password-must-be-removed"},
+    ).with_target_database("ai_job_workspace")
+    try:
+        assert runner.access_mode is BootstrapAccessMode.PROMPT
+        assert runner.database_exists("ai_job_workspace") is False
+        assert runner.database_exists("ai_job_workspace") is False
+        command, arguments = observed[0]
+        assert command[0] == "psql"
+        assert "sudo" not in command
+        assert "--username=postgres" in command
+        assert secret not in repr(command)
+        child_environment = arguments["env"]
+        assert isinstance(child_environment, dict)
+        assert "PGPASSWORD" not in child_environment
+        password_file = child_environment["PGPASSFILE"]
+        assert isinstance(password_file, str)
+        assert prompt_count == 1
+    finally:
+        runner.close()
+    assert not Path(password_file).exists()
+
+
+def test_explicit_sudo_mode_fails_closed_on_windows() -> None:
+    """@brief Windows 显式 sudo 模式必须 fail closed / Explicit sudo mode fails closed on Windows.
+
+    @return 无返回值 / No return value.
+    """
+    with pytest.raises(DbctlConfigurationError, match="未找到兼容的 sudo"):
+        LocalPsqlBootstrapRunner(
+            platform_name="nt",
+            executable_finder=lambda _: None,
+            access_mode=BootstrapAccessMode.SUDO,
+        )
