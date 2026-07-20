@@ -181,14 +181,57 @@ class ObservabilitySettings:
     flush_interval_ms: int
     retention_days: int
     drop_policy: Literal["drop_newest", "drop_oldest"]
+    shutdown_flush_timeout_ms: int
+    writer: ObservabilityWriterSettings
+    diagnostics: DiagnosticsSettings
+
+
+@dataclass(frozen=True, slots=True)
+class ObservabilityWriterSettings:
+    """@brief 隔离的 telemetry PostgreSQL writer 设置 / Isolated telemetry PostgreSQL writer settings."""
+
+    pool_size: int
+    connect_timeout_ms: int
+    statement_timeout_ms: int
+    lock_timeout_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticsSettings:
+    """@brief 浏览器诊断入口资源预算 / Browser diagnostics ingress resource budgets."""
+
+    max_body_bytes: int
+    max_batch_size: int
+    max_event_age_seconds: int
+    max_future_skew_seconds: int
+    rate_limit_capacity: int
+    rate_limit_refill_per_minute: int
+    max_actor_buckets: int
+
+
+LogSink = Literal["stdout", "stderr", "file"]
+"""@brief 日志输出目标 / Log output targets."""
+
+
+@dataclass(frozen=True, slots=True)
+class LoggingRouteSettings:
+    """@brief 一条精确等级日志路由 / One exact-level logging route."""
+
+    sink: LogSink
+    levels: tuple[str, ...]
+    path: Path | None = None
+    max_bytes: int | None = None
+    backup_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class LoggingSettings:
     """@brief 结构化日志设置 / Structured logging settings."""
 
-    level: str
+    queue_capacity: int
+    routes: tuple[LoggingRouteSettings, ...]
     persist_structured_events: bool
+    shutdown_timeout_ms: int = 5_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +300,9 @@ class BackendSettings:
             Literal["drop_newest", "drop_oldest"],
             _require_choice(observability, "drop_policy", {"drop_newest", "drop_oldest"}),
         )
+        observability_writer = _observability_writer_settings(observability.get("writer"))
+        diagnostics = _diagnostics_settings(observability.get("diagnostics"))
+        logging_settings = _logging_settings(logging)
         font_directories = renderer.get("allowed_font_directories", [])
         fallback_providers = ai.get("fallback_providers", [])
         chunk_max_characters = _require_positive_int(knowledge, "chunk_max_characters")
@@ -365,11 +411,13 @@ class BackendSettings:
                 flush_interval_ms=_require_positive_int(observability, "flush_interval_ms"),
                 retention_days=_require_non_negative_int(observability, "retention_days"),
                 drop_policy=drop_policy,
+                shutdown_flush_timeout_ms=_optional_positive_int(
+                    observability, "shutdown_flush_timeout_ms", 5_000
+                ),
+                writer=observability_writer,
+                diagnostics=diagnostics,
             ),
-            logging=LoggingSettings(
-                level=_require_string(logging, "level").upper(),
-                persist_structured_events=_require_bool(logging, "persist_structured_events"),
-            ),
+            logging=logging_settings,
             security=security,
             config_path=path,
         )
@@ -539,6 +587,186 @@ def _require_non_negative_int(mapping: dict[str, Any], key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ConfigurationError(f"configuration key {key!r} must be a non-negative integer")
     return value
+
+
+def _optional_positive_int(mapping: dict[str, Any], key: str, default: int) -> int:
+    """@brief 读取带默认值的正整数 / Read an optional positive integer with a default.
+
+    @param mapping 配置对象 / Configuration object.
+    @param key 键名 / Key name.
+    @param default 缺失时默认值 / Default used when absent.
+    @return 正整数 / Positive integer.
+    @raise ConfigurationError 值不是正整数时抛出 / Raised for an invalid value.
+    """
+    if key not in mapping:
+        return default
+    return _require_positive_int(mapping, key)
+
+
+def _observability_writer_settings(value: object) -> ObservabilityWriterSettings:
+    """@brief 解析隔离 telemetry writer 配置 / Parse isolated telemetry-writer settings.
+
+    @param value ``observability.writer`` 配置对象或缺失值 / Mapping or missing value.
+    @return 已验证小连接池设置 / Validated small-pool settings.
+    @raise ConfigurationError 字段未知或 timeout 次序非法时抛出。
+    """
+    mapping = {} if value is None else require_mapping(value, "observability.writer")
+    _reject_unknown_keys(
+        mapping,
+        {"pool_size", "connect_timeout_ms", "statement_timeout_ms", "lock_timeout_ms"},
+        "observability.writer",
+    )
+    settings = ObservabilityWriterSettings(
+        pool_size=_optional_positive_int(mapping, "pool_size", 2),
+        connect_timeout_ms=_optional_positive_int(mapping, "connect_timeout_ms", 1_000),
+        statement_timeout_ms=_optional_positive_int(mapping, "statement_timeout_ms", 2_000),
+        lock_timeout_ms=_optional_positive_int(mapping, "lock_timeout_ms", 500),
+    )
+    if settings.lock_timeout_ms > settings.statement_timeout_ms:
+        raise ConfigurationError(
+            "observability.writer.lock_timeout_ms must not exceed statement_timeout_ms"
+        )
+    return settings
+
+
+def _diagnostics_settings(value: object) -> DiagnosticsSettings:
+    """@brief 解析前端诊断入口预算 / Parse frontend diagnostics ingress budgets.
+
+    @param value ``observability.diagnostics`` 配置对象或缺失值 / Mapping or missing value.
+    @return 已验证限额 / Validated resource limits.
+    @raise ConfigurationError 字段未知或批大小超过硬上限时抛出。
+    """
+    mapping = {} if value is None else require_mapping(value, "observability.diagnostics")
+    _reject_unknown_keys(
+        mapping,
+        {
+            "max_body_bytes",
+            "max_batch_size",
+            "max_event_age_seconds",
+            "max_future_skew_seconds",
+            "rate_limit_capacity",
+            "rate_limit_refill_per_minute",
+            "max_actor_buckets",
+        },
+        "observability.diagnostics",
+    )
+    max_batch_size = _optional_positive_int(mapping, "max_batch_size", 50)
+    if max_batch_size > 50:
+        raise ConfigurationError("observability.diagnostics.max_batch_size cannot exceed 50")
+    settings = DiagnosticsSettings(
+        max_body_bytes=_optional_positive_int(mapping, "max_body_bytes", 65_536),
+        max_batch_size=max_batch_size,
+        max_event_age_seconds=_optional_positive_int(mapping, "max_event_age_seconds", 86_400),
+        max_future_skew_seconds=_optional_positive_int(mapping, "max_future_skew_seconds", 300),
+        rate_limit_capacity=_optional_positive_int(mapping, "rate_limit_capacity", 100),
+        rate_limit_refill_per_minute=_optional_positive_int(
+            mapping, "rate_limit_refill_per_minute", 200
+        ),
+        max_actor_buckets=_optional_positive_int(mapping, "max_actor_buckets", 10_000),
+    )
+    if settings.rate_limit_capacity < settings.max_batch_size:
+        raise ConfigurationError(
+            "observability.diagnostics.rate_limit_capacity must cover one maximum batch"
+        )
+    return settings
+
+
+def _logging_settings(mapping: dict[str, Any]) -> LoggingSettings:
+    """@brief 解析精确等级日志路由 / Parse exact-level logging routes.
+
+    @param mapping ``logging`` 配置对象 / ``logging`` configuration mapping.
+    @return 已验证日志设置 / Validated logging settings.
+    @raise ConfigurationError route 结构、等级或文件设置非法时抛出。
+
+    @note 日志路由属于产品运行契约，必须显式配置；缺失时 fail fast，避免部署环境
+    因隐藏默认值产生不同的 STDOUT/STDERR 或文件行为。
+    """
+    _reject_unknown_keys(
+        mapping,
+        {
+            "persist_structured_events",
+            "queue_capacity",
+            "routes",
+            "shutdown_timeout_ms",
+        },
+        "logging",
+    )
+    persist = _require_bool(mapping, "persist_structured_events")
+    queue_capacity = _optional_positive_int(mapping, "queue_capacity", 2_048)
+    shutdown_timeout_ms = _optional_positive_int(
+        mapping, "shutdown_timeout_ms", 5_000
+    )
+    if shutdown_timeout_ms > 60_000:
+        raise ConfigurationError("logging.shutdown_timeout_ms must not exceed 60000")
+    raw_routes = mapping.get("routes")
+    if not isinstance(raw_routes, list) or not raw_routes:
+        raise ConfigurationError("logging.routes must be a non-empty array")
+    routes: list[LoggingRouteSettings] = []
+    allowed_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    claimed_stream_sinks: set[LogSink] = set()
+    claimed_file_paths: set[Path] = set()
+    for index, raw_route in enumerate(raw_routes):
+        route = require_mapping(raw_route, f"logging.routes[{index}]")
+        _reject_unknown_keys(
+            route,
+            {"sink", "levels", "path", "max_bytes", "backup_count"},
+            f"logging.routes[{index}]",
+        )
+        sink = cast(LogSink, _require_choice(route, "sink", {"stdout", "stderr", "file"}))
+        raw_levels = route.get("levels")
+        if (
+            not isinstance(raw_levels, list)
+            or not raw_levels
+            or not all(isinstance(level, str) for level in raw_levels)
+        ):
+            raise ConfigurationError(f"logging.routes[{index}].levels must be a non-empty array")
+        levels = tuple(level.upper() for level in raw_levels)
+        if len(set(levels)) != len(levels) or not set(levels).issubset(allowed_levels):
+            raise ConfigurationError(
+                f"logging.routes[{index}].levels must be unique standard log levels"
+            )
+        if sink == "file":
+            path = Path(_require_string(route, "path"))
+            if path in claimed_file_paths:
+                raise ConfigurationError(
+                    f"logging.routes[{index}].path must identify a distinct file sink"
+                )
+            claimed_file_paths.add(path)
+            max_bytes = _require_positive_int(route, "max_bytes")
+            backup_count = _require_positive_int(route, "backup_count")
+        else:
+            if sink in claimed_stream_sinks:
+                raise ConfigurationError(
+                    f"logging.routes[{index}] duplicates the {sink} sink"
+                )
+            claimed_stream_sinks.add(sink)
+            if any(key in route for key in ("path", "max_bytes", "backup_count")):
+                raise ConfigurationError(
+                    f"logging.routes[{index}] stream routes cannot configure file rotation"
+                )
+            path = None
+            max_bytes = None
+            backup_count = None
+        routes.append(LoggingRouteSettings(sink, levels, path, max_bytes, backup_count))
+    return LoggingSettings(
+        queue_capacity,
+        tuple(routes),
+        persist,
+        shutdown_timeout_ms,
+    )
+
+
+def _reject_unknown_keys(mapping: dict[str, Any], allowed: set[str], label: str) -> None:
+    """@brief 拒绝嵌套配置拼写错误 / Reject misspelled nested configuration keys.
+
+    @param mapping 待检查对象 / Mapping to inspect.
+    @param allowed 允许字段 / Allowed fields.
+    @param label 配置路径 / Configuration path.
+    @raise ConfigurationError 出现未知字段时抛出 / Raised when unknown keys are present.
+    """
+    unknown = set(mapping).difference(allowed)
+    if unknown:
+        raise ConfigurationError(f"{label} contains unknown keys: {sorted(unknown)!r}")
 
 
 def _provider_rate_limit_settings(mapping: dict[str, Any]) -> ProviderRateLimitSettings:

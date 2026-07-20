@@ -1,4 +1,4 @@
-"""@brief 结构化并发与反压基础设施 / Structured-concurrency and backpressure infrastructure."""
+"""@brief 应用层结构化并发与反压 / Application-layer structured concurrency and backpressure."""
 
 from __future__ import annotations
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any, Protocol
 
 from backend.domain.agent import AgentRunRecord, ConversationRecord, MessageRecord
@@ -14,9 +15,16 @@ from backend.domain.knowledge import (
     ParsedKnowledgeDocument,
     StoredKnowledgeBlob,
 )
+from backend.domain.observability import (
+    AttributeValue,
+    MetricType,
+    SeverityNumber,
+    SignalSource,
+    SpanStatus,
+    TelemetrySignal,
+)
 from backend.domain.proposal import ResumeProposalRecord
 from backend.domain.resume import ResumeRecord
-from workspace_shared.observability import TelemetryRecord
 from workspace_shared.tenancy import ActorScope
 
 
@@ -387,10 +395,112 @@ class ModelProvider(Protocol):
 
 
 class TelemetryWriter(Protocol):
-    """@brief telemetry 持久化端口 / Telemetry persistence port."""
+    """@brief cancellation-cooperative telemetry 持久化端口 / Cancellation-cooperative telemetry persistence port.
 
-    async def write_batch(self, records: list[TelemetryRecord]) -> None:
+    @note 实现不得吞掉 ``CancelledError``，并必须让被取消的 I/O 有界收敛；Python task
+    不能被外部强制终止，因此进程级关停上限依赖这一端口契约。/ Implementations must not
+    swallow ``CancelledError`` and must let cancelled I/O converge within a bound. Python tasks
+    cannot be forcibly terminated, so the process-level shutdown bound depends on this port contract.
+    """
+
+    async def write_batch(self, records: list[TelemetrySignal]) -> None:
         """@brief 批量写 telemetry / Write telemetry as a batch.
 
         @param records 已过滤记录 / Filtered records.
+
+        @note 必须传播 cancellation 且不得启动脱离调用生命周期的后台写入 / Cancellation
+        must propagate and no write may outlive this call in an unowned background task.
+        """
+
+
+class ObservabilityRecorder(Protocol):
+    """@brief 应用层可依赖的非阻塞 observability 端口 / Non-blocking observability application port."""
+
+    def record_metric(
+        self,
+        name: str,
+        value: float,
+        scope: ActorScope | None,
+        request_id: str | None,
+        attributes: dict[str, AttributeValue],
+        *,
+        service: str = "backend.worker",
+        metric_type: MetricType = MetricType.COUNTER,
+        unit: str = "{event}",
+        source: SignalSource = SignalSource.BACKEND,
+        client_event_id: str | None = None,
+        occurred_at: datetime | None = None,
+    ) -> bool:
+        """@brief 非阻塞提交 metric / Non-blockingly submit a metric.
+
+        @param name 稳定仪器名 / Stable instrument name.
+        @param value 有限观测值 / Finite observed value.
+        @param scope 可空租户范围 / Optional tenant scope.
+        @param request_id 请求关联 ID / Request correlation ID.
+        @param attributes 低基数属性 / Low-cardinality attributes.
+        @param service 稳定服务名 / Stable service name.
+        @param metric_type 仪器类型 / Instrument type.
+        @param unit 规范单位 / Canonical unit.
+        @param source 可信来源 / Trusted producer.
+        @param client_event_id 前端幂等 ID / Frontend idempotency ID.
+        @param occurred_at 事件发生时间 / Event occurrence time.
+        @return 成功进入队列时为真 / True when admitted to the queue.
+        """
+
+    def record_log(
+        self,
+        name: str,
+        severity_number: SeverityNumber,
+        severity_text: str,
+        scope: ActorScope | None,
+        request_id: str | None,
+        attributes: dict[str, AttributeValue],
+        *,
+        service: str = "backend",
+        source: SignalSource = SignalSource.BACKEND,
+        client_event_id: str | None = None,
+        occurred_at: datetime | None = None,
+        event_id: str | None = None,
+        trace_id: str | None = None,
+        span_id: str | None = None,
+        parent_span_id: str | None = None,
+    ) -> bool:
+        """@brief 非阻塞提交稳定日志事件 / Non-blockingly submit a stable log event.
+
+        @param name 稳定事件名 / Stable event name.
+        @param severity_number OpenTelemetry 严重度 / OpenTelemetry severity number.
+        @param severity_text 规范严重度文本 / Canonical severity text.
+        @param scope 可空租户范围 / Optional tenant scope.
+        @param request_id 请求关联 ID / Request correlation ID.
+        @param attributes 低基数属性 / Low-cardinality attributes.
+        @param service 稳定服务名 / Stable service name.
+        @param source 可信来源 / Trusted producer.
+        @param client_event_id 前端幂等 ID / Frontend idempotency ID.
+        @param occurred_at 事件发生时间 / Event occurrence time.
+        @param event_id 服务端已有事件 ID / Existing server event ID.
+        @param trace_id 可选 W3C trace ID / Optional W3C trace ID.
+        @param span_id 可选 W3C span ID / Optional W3C span ID.
+        @param parent_span_id 可选 W3C parent span ID / Optional W3C parent span ID.
+        @return 成功进入队列时为真 / True when admitted to the queue.
+        """
+
+    def record_span(
+        self,
+        name: str,
+        duration_ms: float,
+        status: SpanStatus,
+        scope: ActorScope | None,
+        request_id: str | None,
+        attributes: dict[str, AttributeValue],
+        *,
+        trace_id: str,
+        span_id: str,
+        parent_span_id: str | None,
+        service: str = "backend.api",
+        occurred_at: datetime | None = None,
+    ) -> bool:
+        """@brief 非阻塞提交已完成 span / Non-blockingly submit a completed span.
+
+        @param occurred_at span 开始时间 / Span start time.
+        @return 成功进入队列时为真 / True when admitted to the queue.
         """

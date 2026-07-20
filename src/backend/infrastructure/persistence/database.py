@@ -229,6 +229,34 @@ class AsyncDatabase:
                 )
                 yield session
 
+    @asynccontextmanager
+    async def unscoped_transaction(self) -> AsyncIterator[AsyncSession]:
+        """@brief 打开仅用于全局基础设施记录的短事务 / Open a short transaction for global infrastructure records.
+
+        @return 安装 timeout、但不伪造租户 GUC 的 Session / Session with timeouts and no fabricated tenant GUCs.
+
+        @note 仅允许由具有显式全 NULL-scope RLS policy 的基础设施表使用；业务
+        Repository 不得通过此接口绕过 ActorScope。
+        """
+        async with self._session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        """
+                        SELECT
+                            set_config(
+                                'statement_timeout', CAST(:statement_timeout_ms AS text), true
+                            ),
+                            set_config('lock_timeout', CAST(:lock_timeout_ms AS text), true)
+                        """
+                    ),
+                    {
+                        "statement_timeout_ms": str(self._statement_timeout_ms),
+                        "lock_timeout_ms": str(self._lock_timeout_ms),
+                    },
+                )
+                yield session
+
     async def aclose(self) -> None:
         """@brief 关闭连接池 / Dispose the connection pool.
 

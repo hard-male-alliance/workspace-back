@@ -18,10 +18,10 @@ def build_parser() -> argparse.ArgumentParser:
     @return 仅描述配置路径的 argparse 解析器。
 
     @note backend 不提供 migration、bootstrap 或 dashboard 子命令；这些职责分别属于
-    ``workspace-dbctl`` 与 ``workspace-dashboard``，从命令行边界上避免分布式单体式耦合。
+    ``dbctl`` 与 ``dashboard``，从命令行边界上避免分布式单体式耦合。
     """
     parser = argparse.ArgumentParser(
-        prog="workspace-backend",
+        prog="backend",
         description="启动仅供可信反向代理访问的 AI Job Workspace FastAPI 后端。",
     )
     parser.add_argument(

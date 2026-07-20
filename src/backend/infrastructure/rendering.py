@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib
 import os
 import shutil
@@ -225,15 +224,6 @@ def renderer_for(settings: RendererSettings) -> MockRenderer | SandboxedXeLaTeXR
     @return 私有 renderer 实现 / Private renderer implementation.
     """
     return MockRenderer() if settings.adapter == "mock" else SandboxedXeLaTeXRenderer(settings)
-
-
-def artifact_sha256(content: bytes) -> str:
-    """@brief 计算产物摘要 / Compute an artifact digest.
-
-    @param content 二进制内容 / Binary content.
-    @return 小写 SHA-256 / Lowercase SHA-256.
-    """
-    return hashlib.sha256(content).hexdigest()
 
 
 def _minimal_pdf(title: object) -> bytes:

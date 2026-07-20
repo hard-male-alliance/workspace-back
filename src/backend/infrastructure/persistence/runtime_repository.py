@@ -16,7 +16,6 @@ import hashlib
 import hmac
 import json
 import secrets
-from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -139,15 +138,11 @@ from backend.infrastructure.persistence.models import (
     ResumeTemplateRecord as ResumeTemplateOrmRecord,
 )
 from backend.infrastructure.persistence.models import (
-    TelemetryRecord as TelemetryOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
     UserRecord,
     WorkspaceRecord,
 )
 from backend.infrastructure.persistence.repositories import scoped_select
 from workspace_shared.ids import new_opaque_id
-from workspace_shared.observability import TelemetryRecord
 from workspace_shared.tenancy import ActorScope
 
 _RUNTIME_EXTENSION_KEY = "runtime"
@@ -2662,67 +2657,6 @@ class PostgresWorkspaceRepository:
             return artifacts
 
 
-class PostgresTelemetryWriter:
-    """@brief 按 ActorScope 分批写入的 PostgreSQL telemetry writer / PostgreSQL telemetry writer batched by ActorScope.
-
-    @param database 生命周期由 composition root 管理的数据库 / Database owned by the composition root.
-
-    @note 本 writer 绝不记录 SQL 客户端自身 span，也不调用 logging；这样数据库写入失败
-    不会经 telemetry/logging 再次回流到此 writer，避免递归观测（recursive telemetry）。
-    """
-
-    def __init__(self, database: AsyncDatabase) -> None:
-        """@brief 绑定数据库资源所有者 / Bind the database resource owner.
-
-        @param database 生命周期由 composition root 管理的数据库 / Database owned by the composition root.
-        """
-        self._database = database
-
-    async def write_batch(self, records: list[TelemetryRecord]) -> None:
-        """@brief 以 RLS 短事务持久化低基数 telemetry / Persist low-cardinality telemetry in RLS short transactions.
-
-        @param records 已由 sink 清洗过的记录 / Records already sanitized by the sink.
-        @return 无返回值。
-        """
-        grouped: dict[ActorScope, list[TelemetryRecord]] = defaultdict(list)
-        for record in records:
-            item = cast(Any, record)
-            scope = ActorScope(
-                actor_id=str(item.actor_id),
-                workspace_id=str(item.workspace_id),
-                resource_owner_id=str(item.resource_owner_id),
-            )
-            grouped[scope].append(record)
-        for scope, scoped_records in grouped.items():
-            async with self._database.transaction(scope) as session:
-                await _ensure_scope_identities(session, scope)
-                for record in scoped_records:
-                    item = cast(Any, record)
-                    session.add(
-                        TelemetryOrmRecord(
-                            id=new_opaque_id("tel"),
-                            workspace_id=scope.workspace_id,
-                            resource_owner_id=scope.resource_owner_id,
-                            actor_id=scope.actor_id,
-                            occurred_at=item.occurred_at,
-                            kind=item.kind,
-                            service=item.service,
-                            name=item.name,
-                            value=item.value,
-                            severity=None,
-                            request_id=item.request_id,
-                            trace_id=None,
-                            span_id=None,
-                            parent_span_id=None,
-                            attributes=deepcopy(item.attributes),
-                            created_at=item.occurred_at,
-                            updated_at=item.occurred_at,
-                            revision=1,
-                            extensions={},
-                        )
-                    )
-
-
 @dataclass(frozen=True, slots=True)
 class _IdempotencyClaimDecision:
     """@brief pending claim 竞争结果 / Outcome of pending-claim arbitration.
@@ -3109,6 +3043,5 @@ class PostgresIdempotencyRegistry:
 
 __all__ = [
     "PostgresIdempotencyRegistry",
-    "PostgresTelemetryWriter",
     "PostgresWorkspaceRepository",
 ]

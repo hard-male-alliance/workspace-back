@@ -1,4 +1,4 @@
-"""@brief ``python -m dbctl`` 入口 / Entry point for ``python -m dbctl``."""
+"""@brief `dbctl` console 与模块入口 / ``dbctl`` console and module entry point."""
 
 from __future__ import annotations
 

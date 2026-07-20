@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -23,19 +22,29 @@ class ContractValidator:
 
         @param schema_path 严格 JSON Schema 路径 / Strict JSON Schema path.
         """
-        self._schema_path = schema_path
+        try:
+            with schema_path.open(encoding="utf-8") as stream:
+                payload = json.load(stream)
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError("contract bundle cannot be loaded") from error
+        self._schema = _require_schema_bundle(payload)
 
-    @cached_property
-    def _schema(self) -> dict[str, Any]:
-        """@brief 延迟加载完整 bundle / Lazily load the full bundle.
+    @classmethod
+    def from_json(cls, serialized: str) -> ContractValidator:
+        """@brief 从已交付的 JSON 资源构造校验器 / Build a validator from a delivered JSON resource.
 
-        @return Draft 2020-12 bundle / Draft 2020-12 bundle.
+        @param serialized 完整 Draft 2020-12 bundle / Complete Draft 2020-12 bundle.
+        @return 已验证且不依赖临时文件生命周期的校验器 / Validated validator independent of temporary-file lifetime.
+        @raise RuntimeError 资源不是合法 contract bundle 时抛出 / Raised when the resource is not a valid contract bundle.
         """
-        with self._schema_path.open(encoding="utf-8") as stream:
-            payload = json.load(stream)
-        if not isinstance(payload, dict) or not isinstance(payload.get("$defs"), dict):
-            raise RuntimeError("contract bundle is malformed")
-        return payload
+
+        try:
+            payload = json.loads(serialized)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("contract bundle cannot be loaded") from error
+        instance = cls.__new__(cls)
+        instance._schema = _require_schema_bundle(payload)
+        return instance
 
     def validate(self, entrypoint: str, payload: object) -> None:
         """@brief 校验一个已声明 entrypoint / Validate a declared entrypoint.
@@ -98,3 +107,20 @@ class ContractValidator:
                     extensions={"pointer": pointer},
                 )
             ) from error
+
+
+def _require_schema_bundle(payload: object) -> dict[str, Any]:
+    """@brief 校验并返回 contract bundle 根对象 / Validate and return a contract-bundle root.
+
+    @param payload 已解析 JSON 值 / Parsed JSON value.
+    @return 含 `$defs` 与 `x-entrypoints` 的 bundle / Bundle containing `$defs` and `x-entrypoints`.
+    @raise RuntimeError bundle 结构不完整时抛出 / Raised when the bundle structure is incomplete.
+    """
+
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("$defs"), dict)
+        or not isinstance(payload.get("x-entrypoints"), dict)
+    ):
+        raise RuntimeError("contract bundle is malformed")
+    return payload

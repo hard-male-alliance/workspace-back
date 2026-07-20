@@ -2,25 +2,27 @@
 
 v0.1.0 是一个面向 AI 求职工作流的模块化单体（modular monolith）后端。它提供简历操作与受限 XeLaTeX 渲染、流式 Agent、模拟面试 WebSocket、知识库、PostgreSQL/pgvector 持久化，以及只读运维 Dashboard。
 
-这不是一个可以把默认配置直接暴露到公网的“开箱即用 SaaS”。仓库提交的是无密钥 `example.jsonc` 与数据库目标状态 `dbinit.jsonc`；本地 `config.jsonc` 被 Git 忽略，首次运行 `workspace-dbctl` 时会从示例复制并生成登录角色密码。生产启动前必须完成本文的数据库、身份和网络边界配置。
+这不是一个可以把默认配置直接暴露到公网的“开箱即用 SaaS”。仓库提交的是无密钥 `example.jsonc` 与数据库目标状态 `dbinit.jsonc`；本地 `config.jsonc` 被 Git 忽略。首次执行需要加载配置的 `dbctl` 子命令时，若省略 `--config` 且默认 `config.jsonc` 不存在，`dbctl` 会优先复制同一运行目录的 `example.jsonc`，该目录没有模板时再读取 wheel 内置示例，并生成登录角色密码。生产启动前必须完成本文的数据库、身份和网络边界配置。
 
 ## 进程边界
 
-三个可执行应用共享根 JSONC 配置和 `workspace_shared` 中的纯数据类型，但彼此不导入、也不通过 HTTP 相互调用。
+三个可执行应用共享根 JSONC 配置和 `workspace_shared` 中的纯数据类型，且不通过 HTTP 相互调用。Dashboard 不导入 backend 或 dbctl；`dbctl migrate` 所执行的 Alembic 环境会复用 backend 的持久化 metadata，这是当前唯一明确的跨应用 Python 依赖。
 
 | 可执行程序 | 职责 | 数据库身份/网络边界 |
 |---|---|---|
-| `workspace-backend` | 产品 REST、SSE、WebSocket 与领域编排 | 仅使用 application DSN；仅绑定 loopback 或 Unix socket |
-| `workspace-dashboard` | 只读 CLI；API/可选 PyQt6 GUI 复用同一 application layer | 仅使用 dashboard 只读 DSN；默认仅内部网络 |
-| `workspace-dbctl` | 显式 bootstrap、Alembic migration、遥测保留期清理与 `psql` shell | bootstrap 使用 sudo 或终端密码验证；其余使用迁移器/目标身份；后端启动永不自动迁移 |
+| `backend` | 产品 REST、SSE、WebSocket 与领域编排 | 仅使用 application DSN；仅绑定 loopback 或 Unix socket |
+| `dashboard` / `dashboard-api` / `dashboard-gui` | 只读 CLI、私有 API 与可选 PyQt6 GUI；三者复用同一 application layer | 仅使用 dashboard 只读 DSN；默认仅内部网络 |
+| `dbctl` | 显式 bootstrap、Alembic migration、遥测保留期清理与 `psql` shell | bootstrap 使用 sudo 或终端密码验证；其余使用迁移器/目标身份；后端启动永不自动迁移 |
 
-产品路径、哪些 DTO 只是 mock，以及当前尚未冻结的传输协议，见 [docs/CONTRACT_GAPS.md](docs/CONTRACT_GAPS.md)。`contract/ai-job-workspace.contract.schema.json` 是唯一机器可读的数据结构事实来源；它目前不是完整 OpenAPI 或 AsyncAPI 描述。
+产品路径、哪些 DTO 只是 mock，以及当前尚未冻结的传输协议，见 [docs/CONTRACT_GAPS.md](docs/CONTRACT_GAPS.md)。`contract/ai-job-workspace.contract.schema.json` 是唯一机器可读的数据结构事实来源，并会原样打入 backend wheel；它目前不是完整 OpenAPI 或 AsyncAPI 描述。
 
 ## 本地开发
 
 ```bash
 uv sync --extra dev
-uv run workspace-backend
+# 首次 checkout：生成权限为 0600 的默认 config.jsonc；不连接或修改 PostgreSQL
+uv run dbctl bootstrap --dry-run
+uv run backend
 ```
 
 另一个终端可运行测试：
@@ -30,13 +32,14 @@ uv run pytest
 ```
 
 本地默认值使用确定性的内存 repository、mock 模型和仅开发/测试允许的 `X-Mock-*` 租户头。它们不需要 PostgreSQL 或外部模型密钥，也绝不能用于 staging/production。
+`backend` 默认读取当前工作目录的 `config.jsonc`，也可用 `--config` 或 `AIWS_CONFIG` 覆盖；日志与知识库 blob 的相对路径统一以该配置文件所在目录为基准，因此 wheel 安装态不会把运行数据误写进虚拟环境。
 
 ## 生产前置条件
 
 1. 将部署配置设为 `"environment": "production"`、`"database.mode": "postgresql"`，并将 `security.identity_mode` 设为 `"trusted_proxy_hmac"`。生产/预发布环境缺少 `security`，或仍使用 `development_mock` 时，后端会拒绝加载配置。
 2. 后端仅监听私有 loopback、Unix socket 或受限 Pod 网络；安全组、容器网络和防火墙必须禁止客户端绕过入口认证代理直连它。
 3. 入口认证代理必须先完成用户认证、workspace membership/role 决策，再重新签发下文定义的 HMAC 断言。Nginx 本身不生成该签名。
-4. PostgreSQL 必须启用 `pgvector`，并由 `workspace-dbctl` 显式创建最小权限角色和运行 migration。
+4. PostgreSQL 必须启用 `pgvector`，并由 `dbctl` 显式创建最小权限角色和运行 migration。
 5. 非 mock 模型 provider 需要 HTTPS `ai.base_url` 和对应 API key 环境变量；API 不接收或回显 provider、model、base URL 或密钥。
 6. 若启用 `resume_rendering.adapter: xelatex`，宿主机必须提供可工作的 OS sandbox；无法建立 sandbox 时实现会 fail closed，而不是退化为不受限的编译子进程。
 7. `ai.provider_rate_limit` 是每个实际 endpoint/credential 在单一 backend worker 内的并发与滑动一分钟请求预算；耗尽时返回可重试的 429。多 worker/Pod 部署必须按实例数向供应商申请配额，或在入口层另设全局限流。`ai.metering` 仅记录 UTF-8 字节除以 4 的可复算 token **估算**与整数 micro-USD 成本快照，保存在 `AgentRun.extensions.aiws.metering`；它不是 provider 账单，也不含系统提示词、隐式 tokenizer 或重试计费。
@@ -47,9 +50,9 @@ uv run pytest
 
 | 本地 `config.jsonc` 字段 | 使用者 | 应有身份/权限 |
 |---|---|---|
-| `database.migrator_dsn` | `workspace-dbctl migrate`、`prune-telemetry --apply` | `workspace_migrator`；仅 migration/受控维护，可显式 `SET ROLE workspace_owner` |
-| `database.application_dsn` | `workspace-backend` | `workspace_app`；运行时最小 DML 权限与 RLS（row-level security）上下文 |
-| `database.dashboard_dsn` | Dashboard PostgreSQL reader、`workspace-dbctl shell --role dashboard` | `workspace_dashboard`；仅 `observability.dashboard_metric_samples` 稳定视图读权限 |
+| `database.migrator_dsn` | `dbctl migrate`、`prune-telemetry --apply` | `workspace_migrator`；仅 migration/受控维护，可显式 `SET ROLE workspace_owner` |
+| `database.application_dsn` | `backend` | `workspace_app`；运行时最小 DML 权限与 RLS（row-level security）上下文 |
+| `database.dashboard_dsn` | Dashboard PostgreSQL reader、`dbctl shell --role dashboard` | `workspace_dashboard`；仅 `observability.dashboard_signals` canonical 读模型权限 |
 
 | 其他 secret 环境变量 | 使用者 | 要求 |
 |---|---|---|
@@ -57,23 +60,23 @@ uv run pytest
 | `AIWS_DASHBOARD_OPERATOR_TOKEN` | Dashboard 私有 HTTP API（若启用） | 仅运维入口持有；不应出现在产品浏览器请求中 |
 | `AIWS_LLM_API_KEY`（或配置指定的变量） | non-mock 模型 provider | 仅 backend 进程可读取 |
 
-`workspace-dbctl bootstrap` 管理四个互不相同的 PostgreSQL 角色：不可登录的 `workspace_owner`、可迁移的 `workspace_migrator`、运行时 `workspace_app` 与只读 `workspace_dashboard`。角色名、数据库名、schema 与权限目标来自根目录 `dbinit.jsonc`；三个登录角色的随机密码写入本地 `config.jsonc`，owner 保持 `NOLOGIN` 且没有密码。
+`dbctl bootstrap` 管理四个互不相同的 PostgreSQL 角色：不可登录的 `workspace_owner`、可迁移的 `workspace_migrator`、运行时 `workspace_app` 与只读 `workspace_dashboard`。角色名、数据库名、schema 与权限目标来自 `dbinit.jsonc`；三个登录角色的随机密码写入本地 `config.jsonc`，owner 保持 `NOLOGIN` 且没有密码。
 
 `dbinit.jsonc` 的 `database_connection` 声明非敏感的主机和端口；`dbctl` 根据它以及角色、数据库声明生成 `database.application_dsn`、`database.migrator_dsn`、`database.dashboard_dsn`。bootstrap 从这三个实际 DSN 取得相应角色密码，因此写入配置和创建角色使用的是同一份凭证。
 
 ## PostgreSQL 上线顺序
 
-以下命令均假设已经审阅 `dbinit.jsonc`，并可在当前终端完成系统 sudo 或 PostgreSQL 管理密码验证。若 `config.jsonc` 不存在，第一次 dbctl 调用会复制同目录 `example.jsonc`、生成三个登录角色密码并将文件权限收紧为 `0600`。后端不会在启动时创建 schema、创建角色或运行 Alembic。
+以下命令均假设已经审阅 `dbinit.jsonc`，并可在当前终端完成系统 sudo 或 PostgreSQL 管理密码验证。省略 `--config/--dbinit` 时，若默认 `config.jsonc` 不存在，第一次需要配置的 `dbctl` 调用会优先使用同目录 `example.jsonc`，找不到时才使用安装包资源，生成配置和三个登录角色密码，并将权限收紧为 `0600`；默认 `dbinit.jsonc` 同样优先读取同目录文件，缺失时只读取包内声明而不在当前目录复制一份。显式指定但不存在的路径会 fail closed。后端不会在启动时创建 schema、创建角色或运行 Alembic。
 
 ```bash
 # 1. 先审阅脱敏、无连接的 bootstrap 计划
-uv run workspace-dbctl --config config.jsonc bootstrap --dry-run
+uv run dbctl bootstrap --dry-run
 
 # 2. 自动选择 POSIX sudo 或跨平台终端密码验证
-uv run workspace-dbctl --config config.jsonc bootstrap
+uv run dbctl bootstrap
 
 # 3. 以 migrator DSN 显式升级数据库
-uv run workspace-dbctl --config config.jsonc migrate --revision head
+uv run dbctl migrate --revision head
 ```
 
 使用非默认位置时，同时传入 `--config <runtime.jsonc>` 与 `--dbinit <dbinit.jsonc>`。`config.jsonc` 属于本机 secret 载体，不应提交；`dbinit.jsonc` 是可审阅、可提交的声明式初始化计划。
@@ -84,41 +87,139 @@ uv run workspace-dbctl --config config.jsonc migrate --revision head
 
 ### 遥测保留期
 
-`observability.retention_days` 是保留边界；`0` 明确禁用清理。清理不是请求路径后台任务，而是由受控调度器显式调用的有界维护命令。先完成 `20260715_0003` 或之后的 migration（它提供 telemetry owner maintenance RLS policy），再按以下方式演练并执行：
+`observability.retention_days` 是以服务端 `observed_at` 为准的保留边界；`0` 明确禁用清理。清理不是请求路径后台任务，而是由受控调度器显式调用的有界维护命令。先完成 `20260721_0006` migration（它提供 v2 信号表、owner maintenance RLS policy 与清理索引），再按以下方式演练并执行。
+
+`20260721_0006` 是单事务 shadow-table 切换，不是在线双写 migration。它在取得
+`SHARE ROW EXCLUSIVE` 前执行 `SET LOCAL lock_timeout = '30s'`；任一次锁等待超过 30 秒都会让整个
+revision 回滚。升级前应暂停 telemetry writer，并排空长期 writer 与 Dashboard/read transaction：
+backfill 期间普通 `ACCESS SHARE` 读取仍可继续，但后续 `DROP VIEW`/切表需要更强锁，长读事务同样
+会阻塞切换。只在可接受 telemetry 暂停写入的受控维护窗口执行。
 
 ```bash
 # 默认是 dry-run：不连接 PostgreSQL，也不执行删除。
-uv run workspace-dbctl --config config.jsonc prune-telemetry --dry-run
+uv run dbctl prune-telemetry --dry-run
 
 # 只有 --apply 会删除；每批独立短事务，强度需由运维者显式给出或接受安全默认值。
-uv run workspace-dbctl --config config.jsonc prune-telemetry --apply \
-  --batch-size 1000 --max-batches 10 --statement-timeout-ms 5000
+uv run dbctl prune-telemetry --apply \
+  --batch-size 1000 --max-batches 10 \
+  --statement-timeout-ms 5000 --lock-timeout-ms 500
 ```
 
-执行模式只使用 migrator DSN，并在每个短事务中切换到配置的 owner role；它不会借用 application 或 dashboard 凭证。硬上限分别为每批 10,000 条、每次 100 批、每条 SQL 60,000 ms。建议由单实例、受审计的定时任务执行，保留 dry-run 输出、删除总数和剩余候选数。不要把 `--apply` 放进 Web 请求、CI 的无人工确认步骤或无限循环脚本。
+执行模式只使用 migrator DSN，并在每个短事务中切换到配置的 owner role；它不会借用 application 或 dashboard 凭证。删除通过 `FOR UPDATE SKIP LOCKED` 的有界 CTE 完成，硬上限分别为每批 10,000 条、每次 100 批、每条 SQL 60,000 ms、锁等待 5,000 ms。结果只报告删除数与 `has_more`，不会为“精确剩余数”全表计数。建议由单实例、受审计的定时任务执行；不要把 `--apply` 放进 Web 请求、CI 的无人工确认步骤或无限循环脚本。
 
 ## 启动 backend 与 Dashboard
 
 数据库 migration 完成后：
 
 ```bash
-uv run workspace-backend
+uv run backend
 
-# 内部运维 CLI：只读、同一 application layer
-uv run workspace-dashboard overview --workspace-id ws_example --output table
+# 内部运维 CLI：零参数即显示默认工作区 Overview；TTY 自动表格、管道自动 JSON
+uv run dashboard
+uv run dashboard latency --workspace ws_example --since 6h
+uv run dashboard diagnostics --since 30m --limit 50
+uv run dashboard frontend --since 30m
+uv run dashboard health
+
+# 可选私有只读 API；监听地址和端口读取 dashboard.api 配置。
+uv run dashboard-api
 
 # 可选的人类运维 GUI；正常 headless 环境不会安装 PyQt6。
 uv sync --extra gui
-uv run workspace-dashboard-gui
+uv run dashboard-gui
 ```
 
-Dashboard 的 API 是可选的私有运维接口，不由 `workspace-dashboard` CLI 自动监听。若确有需要，可由受控 ASGI 服务启动工厂：
+`uv sync`/wheel 安装会生成 `backend`、`dashboard`、`dashboard-api`、`dashboard-gui`、`dbctl` 五个
+console entry point；激活虚拟环境后可直接去掉上例的 `uv run` 前缀，例如 `dbctl migrate
+--revision head`。这些入口均已从 wheel 内直接导入并启动验证，不依赖源码目录或
+`python -m ...`。
 
-```bash
-uv run uvicorn dashboard.api:create_fastapi_app --factory --host 127.0.0.1 --port 8010
-```
+Dashboard 只有一套 `domain → application → infrastructure/interfaces` 分层实现，由
+`dashboard.bootstrap` 统一组合。CLI 提供 `overview`、`services`、`traffic`、`latency`、
+`errors`、`saturation`、`diagnostics`、`frontend`、`health` 九个视图。`frontend` 是聚焦
+`frontend.browser` 的最近事件视图，其中 error、performance 与 network 信号均可见；`health`
+不要求 workspace，读取全 NULL scope 的遥测管线快照。私有 API 暴露 `overview`、`trends`、
+`events` 与 `system-health`（另有不读取业务数据的 `healthz`）。GUI 的查询在持久后台事件循环执行，Qt 更新通过 queued signal 回到 UI 线程；退出时
+先取消在途查询，在同一 worker loop 中关闭 asyncpg pool，再停止 loop。
+
+读模型的时间语义是：`occurred_at` 决定查询窗口。窗口仍接近当前时间时，Overview 先取各服务的
+`latest_observed_at`，再以其中最旧的值计算新鲜度（freshness），即
+`now - min(service.latest_observed_at)`；一个刚上报的服务不能掩盖另一个已停止上报的服务。
+历史窗口结束时间早于当前时间减去 freshness target 时，显示的是
+窗口内每条信号在同一行上的 `observed_at - occurred_at` 最大值，即最坏采集延迟（collection lag）；
+它不会把不同行的独立最大时刻拼接，也不会把历史数据距今多久误判为 stale。
+实时过期遥测显示 `NO_DATA`，不会产生假绿。Overview 在 PostgreSQL 对完整窗口聚合，趋势使用
+`date_bin`；有界事件流包括 log/span，以及 `source=frontend` 的 performance/network metric，
+统一使用 `LIMIT`。`http.server.request.duration` 按 canonical 单位秒存储，
+展示时统一换算为毫秒；流量、错误和饱和度只读取 migration 定义的稳定指标名。错误预算剩余值
+是 steady-traffic estimate：`max(0, 1 - burn_rate × min(window / SLO period, 1))`，不是供应商
+账单式的精确消耗记录。`database.mode=memory` 是明确标注的空 demo adapter，不代表持久化运行态。
+
+查询预算在配置校验与 application policy 两层收紧：任何窗口最多 31 天，每个 service 的趋势
+目标点预算最多 2,000，最近事件最多 1,000 条，显式 `bucket_seconds` 最多 86,400 秒，每条 PostgreSQL
+statement timeout 最多 60,000 ms；部署配置可以设得更小，不能放大这些代码级上限。
+
+`health`/`system-health` 返回所选窗口内、按 `observed_at` 排序的**一条最新 worker 快照**，
+不是所有 worker 的合计或集群健康。多 worker/Pod 部署时，结果可能随最新写入者在 worker
+之间切换，累计计数不能当作 fleet total；需要逐实例诊断时应接入带实例维度的独立读模型或
+外部 collector。
 
 Dashboard 的 `mock` access 仅允许根配置的 `development`/`test` 环境；`staging`/`production`（以及任意 `database.mode=postgresql`）强制 `dashboard.access.mode=operator_token`。PostgreSQL 模式优先从 `database.dashboard_dsn` 读取稳定只读视图，绝不复用 application DSN。`/dashboard/v1/healthz` 不读取业务数据但也不应公网暴露；将整个 Dashboard API 保持在 loopback、受控 VPN 或 mTLS 运维网络之后。
+
+当前延迟 SLO 的查询、DTO 与呈现统一采用 p95，因此 `dashboard.health.latency_target` 固定为 `0.95`；若要支持 p99 等其他目标，应同时扩展查询与健康策略，而不是仅修改配置数字。
+
+## 结构化日志、信号与前端诊断
+
+`logging.routes` 将每个标准等级精确映射到一个或多个 `stdout`、`stderr`、`file` sink；
+示例配置把 DEBUG/INFO 写到 STDOUT，WARNING/ERROR/CRITICAL 写到 STDERR，并把全部等级写入
+权限为 `0600`、按大小轮转的 `data/logs/backend.jsonl`。每条 route 都拥有独立的有界队列和
+worker：一个 sink 阻塞、失败或队列满载时，不会阻塞其他 sink 或业务请求，且会累计丢弃数。
+同一 stdout/stderr 或同一文件路径只能由一条 route 拥有，避免重复输出及两个 rotator 争用文件。
+`logging.shutdown_timeout_ms` 是所有输出 worker 共享的总关闭预算；超时 worker 由 daemon reaper
+回收。prepare/enqueue/sink 故障只提交限频、脱敏的稳定事件，不会把 traceback、异常正文或文件路径写到 emergency STDERR。
+`logging.persist_structured_events=true` 时，同一 `event_id` 还会进入独立的数据库
+管线；PostgreSQL 只保存稳定事件名、严重度、低基数字段和 trace 关联，不保存自由文本 message
+或 stack。多 worker 不得共享同一个轮转文件，应改为每进程文件或外部日志收集器。
+
+后端在最外层 ASGI middleware 中观察每个非健康检查 HTTP 请求：只有最后一个
+`http.response.body` 成功发送后才记录完整流生命周期，因此 SSE/StreamingResponse 不会把响应头
+时刻误当成完成时刻。`http.disconnect`、Starlette `ClientDisconnect` 和发送端断开记为 499；
+非断开型流生成异常即使已经发出 200 response start，终态也强制记为 500。请求流量、秒制
+duration histogram、仅 5xx 的服务端错误和完成 span 使用低基数路由模板及标准
+OpenTelemetry（OTel）HTTP attributes：`http.request.method`、`http.response.status_code`、
+`http.route`、`url.scheme`，并关联 W3C Trace Context。
+
+WebSocket 在连接终态记录 connection count、duration histogram 与
+`websocket.server.connection` span，并为服务端错误记录 error count；`close_code` 作为受控属性
+持久化。已接受连接
+以 1000/1001 关闭归为 `success`，未处理服务端异常或 1011–1014 归为 `server_error`，其余拒绝、
+异常/协议关闭归为 `client_error`。HTTP/WS 还分别在活跃数变化时写入
+`aiws.http.server.active_requests` 与 `aiws.websocket.server.active_connections` gauge。
+这两个 gauge 是 worker-local（单 worker）瞬时值，使用全 NULL ActorScope 且无 request ID，
+不能归因给某个 workspace，也不能把任一最新样本解释为 fleet total。
+
+业务 supervisor/telemetry queue 饱和度、业务 Job 结果以及前端 Web Vitals/错误/网络耗时也映射为
+同一强类型信封。写入采用独立小连接池、批量
+`ON CONFLICT DO NOTHING` 和有界 best-effort 队列；数据库故障不会拖垮业务，且会通过不可
+递归、限频的 emergency STDERR 事件显式可见。
+
+管线的 accepted、dropped、write-failure 与日志输出 drop 累计值以
+`aiws.telemetry.health.snapshot` 稀疏持久化，并在关停时补写最终快照。它们是 worker
+进程级状态，固定使用全 NULL scope、无 request ID，不能归因给触发采样的某个 workspace；
+告警等级只反映相对上一快照新增的损失，历史上发生过一次 drop 不会造成永久假红。
+`shutdown_flush_timeout_ms` 约束 `ObservabilityPipeline.close()`；完整进程的有界退出还要求
+`TelemetryWriter` 遵守 cancellation-cooperative（取消协作）端口契约，因为 Python coroutine
+不能被外部强制终止。
+
+浏览器诊断入口为 `POST /api/v1/diagnostics`，只接受经过身份边界的严格 error/performance/network
+判别联合，具有原始 body、批次、时间漂移、字段、ActorScope token bucket 与 Nginx 入口速率
+限制。PostgreSQL 通过 `(workspace_id, resource_owner_id, actor_id, client_event_id)` 部分唯一索引
+在完整 ActorScope 内持久去重。入口还以固定低基数指标记录 payload bytes、batch 数、准入耗时，
+以及 accepted/dropped/rate-limited 事件数；这些自监控信号本身仍走同一有界 best-effort 管线。
+它不是审计或计费事实。前端不得发送 message、stack、URL、query、cookie、header、DOM、
+storage、token 或用户文本；完整 schema、单位、重试和隐私约束见
+[前端诊断接入契约](docs/FRONTEND_DIAGNOSTICS.md)，架构依据见
+[ADR-0003](docs/decisions/0003-observability-platform.md)。
 
 ## 生产身份边界：trusted proxy HMAC
 
