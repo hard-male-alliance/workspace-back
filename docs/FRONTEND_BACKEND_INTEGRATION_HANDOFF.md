@@ -15,12 +15,12 @@
 
 ## 2. 联调启动参数
 
-后端本地配置使用被 Git 忽略的 `config.jsonc`。先运行 `workspace-dbctl` 生成三个角色的本地 DSN，**不要把 DSN 或密码提交到 Git**：
+后端本地配置使用被 Git 忽略的 `config.jsonc`。先运行 `dbctl` 生成三个角色的本地 DSN，**不要把 DSN 或密码提交到 Git**：
 
 ```powershell
 cd F:\workspace-back
-.\.venv\Scripts\workspace-dbctl.exe --config config.jsonc bootstrap
-.\.venv\Scripts\python.exe -m backend --config config.jsonc
+.\.venv\Scripts\dbctl.exe bootstrap
+.\.venv\Scripts\backend.exe --config config.jsonc
 ```
 
 前端新增本地文件 `.env.local`（不要提交）：

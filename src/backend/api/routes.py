@@ -42,6 +42,11 @@ from backend.composition import BackendContainer
 from backend.domain.common import DomainError, Problem
 from backend.domain.templates import get_template_manifest, list_template_manifests
 from backend.infrastructure.identity import IdentityVerificationError, peer_is_trusted_proxy
+from backend.infrastructure.observability.context import (
+    ObservabilityContext,
+    ServerTraceContext,
+    bind_observability_context,
+)
 from workspace_shared.tenancy import ActorScope
 
 router = APIRouter(prefix="/api/v1")
@@ -121,12 +126,14 @@ def _scope_from_websocket(websocket: WebSocket) -> ActorScope:
     raw_query = websocket.scope.get("query_string", b"")
     if not isinstance(raw_path, (str, bytes)) or not isinstance(raw_query, (str, bytes)):
         raise IdentityVerificationError("identity.request_target_invalid")
-    return container.identity.resolve(
+    scope = container.identity.resolve(
         method="GET",
         path=raw_path,
         query_string=raw_query,
         headers=websocket.headers,
     )
+    websocket.state.actor_scope = scope
+    return scope
 
 
 def _request_id(request: Request) -> str | None:
@@ -1090,6 +1097,39 @@ async def interview_realtime(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=1008)
         return
     container: BackendContainer = websocket.app.state.container
+    request_id = getattr(websocket.state, "request_id", None)
+    trace = getattr(websocket.state, "trace_context", None)
+    if not isinstance(request_id, str) or not isinstance(trace, ServerTraceContext):
+        raise RuntimeError("transport telemetry middleware did not install WebSocket context")
+    with bind_observability_context(ObservabilityContext(scope, request_id, trace)):
+        await _serve_interview_realtime(
+            websocket,
+            session_id,
+            scope,
+            container,
+            request_id,
+            trace.trace_id,
+        )
+
+
+async def _serve_interview_realtime(
+    websocket: WebSocket,
+    session_id: str,
+    scope: ActorScope,
+    container: BackendContainer,
+    request_id: str,
+    trace_id: str,
+) -> None:
+    """@brief 在已绑定观测上下文内运行实时连接 / Run a realtime connection inside a bound observability context.
+
+    @param websocket 已认证 WebSocket / Authenticated WebSocket.
+    @param session_id Session ID / Session ID.
+    @param scope 已认证 ActorScope / Authenticated ActorScope.
+    @param container 当前 worker 容器 / Current worker container.
+    @param request_id 连接关联 ID / Connection correlation ID.
+    @param trace_id 连接 W3C trace ID / Connection W3C trace ID.
+    """
+
     await websocket.accept()
     outbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
 
@@ -1130,7 +1170,13 @@ async def interview_realtime(websocket: WebSocket, session_id: str) -> None:
                 continue
             try:
                 container.contracts.validate("InterviewRealtimeEvent", event)
-                responses = await container.interview.handle_realtime_event(scope, session_id, event, None)
+                responses = await container.interview.handle_realtime_event(
+                    scope,
+                    session_id,
+                    event,
+                    request_id=request_id,
+                    trace_id=trace_id,
+                )
                 for response in responses:
                     await enqueue_outbound(response)
             except DomainError as error:

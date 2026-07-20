@@ -1,9 +1,9 @@
 """@brief dbctl 遥测保留期清理 / dbctl telemetry-retention pruning.
 
-该模块只由 ``workspace-dbctl prune-telemetry`` 的显式运维命令调用。它绝不被
+该模块只由 ``dbctl prune-telemetry`` 的显式运维命令调用。它绝不被
 backend、Dashboard 或任何 HTTP/WebSocket 请求路径导入；因此保留期删除不会把大范围
 I/O、锁竞争或数据库管理权限带入面向用户的工作负载。
-/ This module is invoked only by the explicit ``workspace-dbctl prune-telemetry`` operator
+/ This module is invoked only by the explicit ``dbctl prune-telemetry`` operator
 command. It is never imported by backend, Dashboard, or any HTTP/WebSocket request path, so
 retention deletion cannot bring wide I/O, lock contention, or database-maintenance privileges
 into user-facing workloads.
@@ -41,6 +41,12 @@ DEFAULT_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS: Final[int] = 5_000
 MAX_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS: Final[int] = 60_000
 """@brief 运维清理允许设置的最大语句超时（毫秒）/ Maximum configurable statement timeout."""
 
+DEFAULT_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS: Final[int] = 500
+"""@brief 清理事务默认锁等待上限（毫秒）/ Default prune-transaction lock timeout."""
+
+MAX_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS: Final[int] = 5_000
+"""@brief 清理事务锁等待硬上限（毫秒）/ Hard prune-transaction lock-timeout ceiling."""
+
 _TELEMETRY_TABLE_NAME: Final[str] = "telemetry_records"
 """@brief 固定的遥测表名 / Fixed telemetry relation name."""
 
@@ -62,6 +68,7 @@ class TelemetryPruneRequest:
     @param batch_size 一批最多删除的记录数 / Maximum records deleted in one batch.
     @param max_batches 本次命令最多执行的批次数 / Maximum batches for this invocation.
     @param statement_timeout_ms 每个 SQL 语句的事务本地超时 / Transaction-local timeout for each SQL statement.
+    @param lock_timeout_ms 每个删除事务的锁等待上限 / Lock-wait timeout for each delete transaction.
     @param apply ``True`` 才允许连接数据库并删除；``False`` 是 dry-run。
     / Only ``True`` permits database connection and deletion; ``False`` is dry-run.
 
@@ -75,6 +82,7 @@ class TelemetryPruneRequest:
     batch_size: int = DEFAULT_TELEMETRY_PRUNE_BATCH_SIZE
     max_batches: int = DEFAULT_TELEMETRY_PRUNE_MAX_BATCHES
     statement_timeout_ms: int = DEFAULT_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS
+    lock_timeout_ms: int = DEFAULT_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS
     apply: bool = False
 
     def __post_init__(self) -> None:
@@ -103,6 +111,14 @@ class TelemetryPruneRequest:
             lower=1,
             upper=MAX_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS,
         )
+        _require_bounded_integer(
+            self.lock_timeout_ms,
+            "lock_timeout_ms",
+            lower=1,
+            upper=MAX_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS,
+        )
+        if self.lock_timeout_ms > self.statement_timeout_ms:
+            raise DbctlConfigurationError("lock_timeout_ms 不能大于 statement_timeout_ms。")
         if not isinstance(self.apply, bool):
             raise DbctlConfigurationError("apply 必须是布尔值。")
 
@@ -128,8 +144,8 @@ class TelemetryPruneResult:
     @param batch_size 单个删除事务的行数上限 / Row cap for one deletion transaction.
     @param max_batches 调用方允许的最大批次数 / Maximum batches allowed by the caller.
     @param deleted_count 本次已删除记录总数 / Total records deleted in this invocation.
-    @param remaining_count 截止时仍过期的精确记录数；dry-run 或停用时为 ``None``。
-    / Exact stale rows remaining at the cutoff; ``None`` for dry-run or disabled mode.
+    @param has_more 截止时是否仍有过期记录；dry-run 或停用时为 ``None``。
+    / Whether any stale row remains at the cutoff; ``None`` for dry-run or disabled mode.
     """
 
     retention_days: int
@@ -140,7 +156,7 @@ class TelemetryPruneResult:
     batch_size: int
     max_batches: int
     deleted_count: int
-    remaining_count: int | None
+    has_more: bool | None
 
     @property
     def reached_batch_limit(self) -> bool:
@@ -171,13 +187,14 @@ class TelemetryPruneResult:
                 f"最多 {self.max_batches} 批、"
                 f"每批上限 {self.batch_size} 条，语句超时由 --statement-timeout-ms 控制。"
             )
-        remaining = self.remaining_count
-        if remaining is None or self.cutoff is None:
-            raise RuntimeError("已执行的遥测清理结果必须包含 remaining_count 与 UTC cutoff。")
+        has_more = self.has_more
+        if has_more is None or self.cutoff is None:
+            raise RuntimeError("已执行的遥测清理结果必须包含 has_more 与 UTC cutoff。")
         limit_note = "；已达到本次批次上限" if self.reached_batch_limit else ""
+        remaining_note = "；仍有过期记录待下轮处理" if has_more else "；过期记录已清空"
         return (
             "dbctl prune-telemetry 完成："
-            f"删除 {self.deleted_count} 条，仍有 {remaining} 条过期记录；"
+            f"删除 {self.deleted_count} 条{remaining_note}；"
             f"cutoff 为 {self.cutoff.isoformat()}；"
             f"已提交 {self.batch_count}/{self.max_batches} 个短事务{limit_note}。"
         )
@@ -186,11 +203,11 @@ class TelemetryPruneResult:
 class TelemetryRetentionRunner(Protocol):
     """@brief 受控遥测删除 I/O 端口 / Controlled telemetry-deletion I/O port.
 
-    实现必须让每个 ``delete_batch`` 与 ``remaining_count`` 调用使用独立短事务，并在
+    实现必须让每个 ``delete_batch`` 与 ``has_stale`` 调用使用独立短事务，并在
     同一事务内以 migrator 连接显式 ``SET LOCAL ROLE`` 为配置化 owner。协议使纯单元
     测试可注入 fake runner，而无需 PostgreSQL、subprocess 或真实凭证。
     / Implementations must use a separate short transaction for each ``delete_batch`` and
-    ``remaining_count`` call, explicitly ``SET LOCAL ROLE`` to the configured owner over a migrator
+    ``has_stale`` call, explicitly ``SET LOCAL ROLE`` to the configured owner over a migrator
     connection in that transaction. The protocol lets unit tests inject a fake runner without
     PostgreSQL, subprocesses, or real credentials.
     """
@@ -201,26 +218,30 @@ class TelemetryRetentionRunner(Protocol):
         cutoff: datetime,
         batch_size: int,
         statement_timeout_ms: int,
+        lock_timeout_ms: int,
     ) -> int:
         """@brief 删除一个有界的过期遥测批次 / Delete one bounded batch of stale telemetry.
 
         @param cutoff 仅删除早于该 UTC 时刻的记录 / Delete only rows older than this UTC moment.
         @param batch_size 单批最大记录数 / Maximum records in one batch.
         @param statement_timeout_ms 语句超时 / Statement timeout.
+        @param lock_timeout_ms 锁等待超时 / Lock-wait timeout.
         @return 本事务已删除的记录数 / Records deleted in this transaction.
         """
 
-    def remaining_count(
+    def has_stale(
         self,
         *,
         cutoff: datetime,
         statement_timeout_ms: int,
-    ) -> int:
-        """@brief 统计仍过期的遥测记录 / Count stale telemetry records still remaining.
+        lock_timeout_ms: int,
+    ) -> bool:
+        """@brief 判断是否仍有过期遥测 / Determine whether stale telemetry remains.
 
         @param cutoff 过期边界 UTC 时刻 / Staleness boundary UTC moment.
         @param statement_timeout_ms 语句超时 / Statement timeout.
-        @return 在该边界前仍存在的记录数 / Number of rows still older than the boundary.
+        @param lock_timeout_ms 锁等待超时 / Lock-wait timeout.
+        @return 存在至少一条过期记录时为真 / True when at least one stale row remains.
         """
 
 
@@ -267,7 +288,7 @@ class TelemetryPruneExecutor:
                 batch_size=request.batch_size,
                 max_batches=request.max_batches,
                 deleted_count=0,
-                remaining_count=None,
+                has_more=None,
             )
 
         cutoff = _utc_cutoff(self._clock(), request.retention_days)
@@ -281,7 +302,7 @@ class TelemetryPruneExecutor:
                 batch_size=request.batch_size,
                 max_batches=request.max_batches,
                 deleted_count=0,
-                remaining_count=None,
+                has_more=None,
             )
         if self._runner is None:
             raise DbctlConfigurationError("遥测清理执行缺少受控数据库 runner。")
@@ -293,6 +314,7 @@ class TelemetryPruneExecutor:
                 cutoff=cutoff,
                 batch_size=request.batch_size,
                 statement_timeout_ms=request.statement_timeout_ms,
+                lock_timeout_ms=request.lock_timeout_ms,
             )
             if not isinstance(deleted_in_batch, int) or isinstance(deleted_in_batch, bool):
                 raise TelemetryRetentionExecutionError("遥测清理批次返回了无效删除计数。")
@@ -303,16 +325,13 @@ class TelemetryPruneExecutor:
             if deleted_in_batch < request.batch_size:
                 break
 
-        remaining_count = self._runner.remaining_count(
+        has_more = self._runner.has_stale(
             cutoff=cutoff,
             statement_timeout_ms=request.statement_timeout_ms,
+            lock_timeout_ms=request.lock_timeout_ms,
         )
-        if (
-            not isinstance(remaining_count, int)
-            or isinstance(remaining_count, bool)
-            or remaining_count < 0
-        ):
-            raise TelemetryRetentionExecutionError("遥测清理剩余计数无效。")
+        if not isinstance(has_more, bool):
+            raise TelemetryRetentionExecutionError("遥测清理剩余状态无效。")
         return TelemetryPruneResult(
             retention_days=request.retention_days,
             cutoff=cutoff,
@@ -322,7 +341,7 @@ class TelemetryPruneExecutor:
             batch_size=request.batch_size,
             max_batches=request.max_batches,
             deleted_count=deleted_count,
-            remaining_count=remaining_count,
+            has_more=has_more,
         )
 
 
@@ -331,11 +350,11 @@ class PsycopgTelemetryRetentionRunner:
 
     每一个公开操作都会建立一个新连接，并在独立的短事务内先执行 ``SET LOCAL ROLE``，
     再设置事务本地 ``statement_timeout``。migrator 必须是配置 owner 的 ``NOINHERIT``
-    成员；owner 对遥测表的 ``FOR ALL`` RLS policy 由 migration ``20260715_0003`` 建立。
+    成员；owner 对当前遥测表的 ``FOR ALL`` RLS policy 由 migration ``20260721_0006`` 建立。
     / Each public operation opens a new connection and, in a separate short transaction, first
     executes ``SET LOCAL ROLE`` and then sets transaction-local ``statement_timeout``. The migrator
-    must be a ``NOINHERIT`` member of the configured owner; migration ``20260715_0003`` establishes
-    the owner's ``FOR ALL`` RLS policy for the telemetry table.
+    must be a ``NOINHERIT`` member of the configured owner; migration ``20260721_0006`` establishes
+    the owner's ``FOR ALL`` RLS policy for the current telemetry table.
     """
 
     def __init__(
@@ -369,18 +388,19 @@ class PsycopgTelemetryRetentionRunner:
         self._delete_batch_sql = (
             "WITH stale_rows AS ("
             f" SELECT ctid FROM {relation}"
-            " WHERE occurred_at < %s"
-            " ORDER BY occurred_at ASC"
+            " WHERE observed_at < %s"
+            " ORDER BY observed_at ASC"
             " LIMIT %s"
             " FOR UPDATE SKIP LOCKED"
             ")"
             f" DELETE FROM {relation} AS telemetry"
             " USING stale_rows"
-            " WHERE telemetry.ctid = stale_rows.ctid"
-            " RETURNING telemetry.id;"
+            " WHERE telemetry.ctid = stale_rows.ctid;"
         )
-        self._remaining_count_sql = (
-            f"SELECT count(*) FROM {relation} WHERE occurred_at < %s;"
+        self._has_stale_sql = (
+            "SELECT EXISTS ("
+            f"SELECT 1 FROM {relation} WHERE observed_at < %s LIMIT 1"
+            ");"
         )
 
     def delete_batch(
@@ -389,25 +409,33 @@ class PsycopgTelemetryRetentionRunner:
         cutoff: datetime,
         batch_size: int,
         statement_timeout_ms: int,
+        lock_timeout_ms: int,
     ) -> int:
         """@brief 用一个短事务删除一批过期记录 / Delete a stale-record batch in one short transaction.
 
         @param cutoff 过期边界 UTC 时刻 / Staleness boundary UTC moment.
         @param batch_size 单批上限 / Per-batch row cap.
         @param statement_timeout_ms 事务本地语句超时 / Transaction-local statement timeout.
+        @param lock_timeout_ms 事务本地锁等待上限 / Transaction-local lock-wait timeout.
         @return 已提交删除的记录数 / Number of records deleted and committed.
         @raise TelemetryRetentionExecutionError PostgreSQL 操作失败时抛出，且不泄露原始错误。
         / Raised when PostgreSQL operation fails, without exposing the original error.
         """
-        _validate_runtime_arguments(cutoff, batch_size, statement_timeout_ms)
+        _validate_runtime_arguments(cutoff, batch_size, statement_timeout_ms, lock_timeout_ms)
         connection: Any | None = None
         try:
             connection = self._connect()
             with connection.transaction():
-                self._prepare_short_transaction(connection, statement_timeout_ms)
+                self._prepare_short_transaction(
+                    connection,
+                    statement_timeout_ms,
+                    lock_timeout_ms,
+                )
                 cursor = connection.execute(self._delete_batch_sql, (cutoff, batch_size))
-                rows = cursor.fetchall()
-                return len(rows)
+                deleted = getattr(cursor, "rowcount", None)
+                if not isinstance(deleted, int) or isinstance(deleted, bool) or deleted < 0:
+                    raise TelemetryRetentionExecutionError("遥测保留期删除计数不可用。")
+                return deleted
         except (DbctlConfigurationError, DbctlDependencyError):
             raise
         except Exception as error:
@@ -417,29 +445,35 @@ class PsycopgTelemetryRetentionRunner:
         finally:
             _close_connection_quietly(connection)
 
-    def remaining_count(
+    def has_stale(
         self,
         *,
         cutoff: datetime,
         statement_timeout_ms: int,
-    ) -> int:
-        """@brief 在一个短事务中统计仍过期的记录 / Count remaining stale rows in one short transaction.
+        lock_timeout_ms: int,
+    ) -> bool:
+        """@brief 在一个短事务中判断是否仍有过期记录 / Check for stale rows in one short transaction.
 
         @param cutoff 过期边界 UTC 时刻 / Staleness boundary UTC moment.
         @param statement_timeout_ms 事务本地语句超时 / Transaction-local statement timeout.
-        @return 仍过期的记录数 / Number of stale records still remaining.
+        @param lock_timeout_ms 事务本地锁等待上限 / Transaction-local lock-wait timeout.
+        @return 仍有过期记录时为真 / True when stale records remain.
         @raise TelemetryRetentionExecutionError PostgreSQL 操作失败时抛出，且不泄露原始错误。
         / Raised when PostgreSQL operation fails, without exposing the original error.
         """
-        _validate_runtime_arguments(cutoff, 1, statement_timeout_ms)
+        _validate_runtime_arguments(cutoff, 1, statement_timeout_ms, lock_timeout_ms)
         connection: Any | None = None
         try:
             connection = self._connect()
             with connection.transaction():
-                self._prepare_short_transaction(connection, statement_timeout_ms)
-                row = connection.execute(self._remaining_count_sql, (cutoff,)).fetchone()
-                if row is None or not isinstance(row[0], int):
-                    raise TelemetryRetentionExecutionError("遥测保留期剩余计数不可用。")
+                self._prepare_short_transaction(
+                    connection,
+                    statement_timeout_ms,
+                    lock_timeout_ms,
+                )
+                row = connection.execute(self._has_stale_sql, (cutoff,)).fetchone()
+                if row is None or not isinstance(row[0], bool):
+                    raise TelemetryRetentionExecutionError("遥测保留期剩余状态不可用。")
                 return row[0]
         except (DbctlConfigurationError, DbctlDependencyError, TelemetryRetentionExecutionError):
             raise
@@ -468,11 +502,17 @@ class PsycopgTelemetryRetentionRunner:
         except Exception as error:
             raise TelemetryRetentionExecutionError("无法连接遥测清理数据库；连接详情已隐藏。") from error
 
-    def _prepare_short_transaction(self, connection: Any, statement_timeout_ms: int) -> None:
+    def _prepare_short_transaction(
+        self,
+        connection: Any,
+        statement_timeout_ms: int,
+        lock_timeout_ms: int,
+    ) -> None:
         """@brief 在当前事务中切换 owner 并设置局部超时 / Set owner role and local timeout in current transaction.
 
         @param connection 当前 psycopg 连接 / Current psycopg connection.
         @param statement_timeout_ms 已校验的超时毫秒数 / Validated timeout in milliseconds.
+        @param lock_timeout_ms 已校验的锁等待超时毫秒数 / Validated lock-wait timeout.
         @return 无返回值 / No return value.
 
         @note role 名是经 identifier 校验后引用的 PostgreSQL 标识符；所有值参数（包括
@@ -484,6 +524,10 @@ class PsycopgTelemetryRetentionRunner:
         connection.execute(
             "SELECT set_config('statement_timeout', %s, true);",
             (f"{statement_timeout_ms}ms",),
+        )
+        connection.execute(
+            "SELECT set_config('lock_timeout', %s, true);",
+            (f"{lock_timeout_ms}ms",),
         )
 
 
@@ -506,12 +550,14 @@ def _validate_runtime_arguments(
     cutoff: datetime,
     batch_size: int,
     statement_timeout_ms: int,
+    lock_timeout_ms: int,
 ) -> None:
     """@brief 校验 runner 的运行时输入 / Validate runner runtime inputs.
 
     @param cutoff 过期边界 / Staleness boundary.
     @param batch_size 删除批次大小 / Deletion batch size.
     @param statement_timeout_ms 语句超时毫秒数 / Statement timeout milliseconds.
+    @param lock_timeout_ms 锁等待超时毫秒数 / Lock-wait timeout milliseconds.
     @return 无返回值 / No return value.
     @raise DbctlConfigurationError 输入未通过受限运行边界时抛出。
     / Raised when input fails bounded runtime constraints.
@@ -530,6 +576,14 @@ def _validate_runtime_arguments(
         lower=1,
         upper=MAX_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS,
     )
+    _require_bounded_integer(
+        lock_timeout_ms,
+        "lock_timeout_ms",
+        lower=1,
+        upper=MAX_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS,
+    )
+    if lock_timeout_ms > statement_timeout_ms:
+        raise DbctlConfigurationError("lock_timeout_ms 不能大于 statement_timeout_ms。")
 
 
 def _require_non_negative_integer(value: object, name: str) -> None:

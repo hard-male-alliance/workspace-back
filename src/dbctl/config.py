@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import secrets
-import shutil
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -20,6 +19,7 @@ import json5
 from .connection import parse_postgres_dsn
 from .errors import DbctlConfigurationError
 from .identifiers import validate_postgres_identifier
+from .package_resources import read_default_text
 
 _LOCAL_ACCOUNT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _DATABASE_HOST_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9._:-]+$")
@@ -35,6 +35,15 @@ _DEFAULT_BOOTSTRAP_SCHEMAS: Final[tuple[str, ...]] = (
     "knowledge",
     "observability",
 )
+
+_DEFAULT_CONFIG_PATH: Final[Path] = Path("config.jsonc")
+"""@brief 默认私密配置路径 / Default private-configuration path."""
+
+_DEFAULT_DBINIT_NAME: Final[str] = "dbinit.jsonc"
+"""@brief 默认数据库声明文件名 / Default database-declaration file name."""
+
+_DEFAULT_EXAMPLE_NAME: Final[str] = "example.jsonc"
+"""@brief 默认公开配置模板名 / Default public configuration-template name."""
 
 
 class DatabaseRole(StrEnum):
@@ -54,10 +63,10 @@ class ObservabilityRetentionSettings:
     / Number of days to retain telemetry records; ``0`` explicitly disables pruning.
 
     @note 该对象只描述保留边界，不包含数据库凭证、批量大小或执行开关。后两者由
-    ``workspace-dbctl prune-telemetry`` 的受限运维参数提供，避免把一次性维护强度
+    ``dbctl prune-telemetry`` 的受限运维参数提供，避免把一次性维护强度
     偷偷藏入应用请求路径。
     / This object describes only the retention boundary. Database credentials, batch size, and
-    execution switches are supplied by constrained ``workspace-dbctl prune-telemetry`` operator
+    execution switches are supplied by constrained ``dbctl prune-telemetry`` operator
     arguments, keeping one-off maintenance intensity out of the application request path.
     """
 
@@ -332,28 +341,36 @@ class DbctlSettings:
 class DbctlConfigurationService:
     """@brief 读取私密运行配置与独立 dbinit 声明 / Load private runtime config and the separate dbinit declaration.
 
-    ``config.jsonc`` 是被 Git 忽略的本地运行配置，首次缺失时由 ``example.jsonc``
-    复制并写入随机登录角色密码；``dbinit.jsonc`` 是可提交、无密钥的数据库目标状态。
-    / ``config.jsonc`` is Git-ignored local runtime configuration. When absent it is copied from
-    ``example.jsonc`` and populated with random login-role passwords; ``dbinit.jsonc`` is the
-    committable, secret-free desired database state.
+    默认 ``config.jsonc`` 是被 Git 忽略的本地运行配置，首次缺失时由 ``example.jsonc``
+    生成并写入随机登录角色密码；``dbinit.jsonc`` 是可提交、无密钥的数据库目标状态。
+    显式路径缺失时不会回退内置资源。/ Default ``config.jsonc`` is Git-ignored local runtime
+    configuration. When absent it is generated from ``example.jsonc`` and populated with random
+    login-role passwords; ``dbinit.jsonc`` is the committable, secret-free desired database state.
+    Missing explicit paths never fall back to bundled resources.
     """
 
     def __init__(
         self,
-        config_path: Path | str = Path("config.jsonc"),
+        config_path: Path | str | None = None,
         dbinit_path: Path | str | None = None,
     ) -> None:
         """@brief 初始化配置服务 / Initialize the configuration service.
 
-        @param config_path 私密运行配置路径 / Private runtime-configuration path.
+        @param config_path 私密运行配置路径；``None`` 表示默认路径并允许内置模板回退。
+        / Private runtime-configuration path; ``None`` selects the default and permits bundled-template fallback.
         @param dbinit_path 可提交数据库初始化声明路径；默认与 config 同目录的 dbinit.jsonc。
         / Committable database-initialization declaration; defaults to dbinit.jsonc beside config.
         """
-        self._config_path = Path(config_path)
+        uses_default_config = config_path is None
+        """@brief 调用方是否省略配置路径 / Whether the caller omitted the config path."""
+        self._config_path = _DEFAULT_CONFIG_PATH if config_path is None else Path(config_path)
         self._dbinit_path = (
-            self._config_path.parent / "dbinit.jsonc" if dbinit_path is None else Path(dbinit_path)
+            self._config_path.parent / _DEFAULT_DBINIT_NAME
+            if dbinit_path is None
+            else Path(dbinit_path)
         )
+        self._allow_packaged_config_fallback = uses_default_config
+        self._allow_packaged_dbinit_fallback = uses_default_config and dbinit_path is None
 
     @property
     def config_path(self) -> Path:
@@ -378,7 +395,7 @@ class DbctlConfigurationService:
         @raise DbctlConfigurationError 文件缺失、JSONC 无效或所需配置节不合规时抛出。
         / Raised for a missing file, invalid JSONC, or malformed required configuration sections.
         """
-        dbinit = self._load_mapping_file(self._dbinit_path, "dbinit")
+        dbinit = self._load_dbinit_mapping()
         administration = _require_mapping(
             dbinit.get("database_administration"), "database_administration"
         )
@@ -427,6 +444,18 @@ class DbctlConfigurationService:
             role_passwords=_passwords_from_dsns(connection_settings, administration_settings),
         )
 
+    def _load_dbinit_mapping(self) -> dict[str, Any]:
+        """@brief 读取显式 dbinit 或默认内置声明 / Load explicit dbinit or the bundled default declaration.
+
+        @return 可变 dbinit 根对象 / Mutable dbinit root mapping.
+        @raise DbctlConfigurationError 显式路径缺失或默认资源损坏时抛出。
+        / Raised when an explicit path is missing or the default resource is invalid.
+        """
+
+        if self._dbinit_path.is_file() or not self._allow_packaged_dbinit_fallback:
+            return self._load_mapping_file(self._dbinit_path, "dbinit")
+        return self._load_mapping_text(read_default_text("dbinit.jsonc"), "dbinit")
+
     def _load_or_create_private_root_mapping(
         self,
         administration: DatabaseAdministrationSettings,
@@ -439,17 +468,19 @@ class DbctlConfigurationService:
         / Raised when the template is absent, the file is unwritable, or configuration is invalid.
         """
         if not self._config_path.is_file():
-            template_path = self._config_path.parent / "example.jsonc"
-            if not template_path.is_file():
-                raise DbctlConfigurationError(
-                    f"config.jsonc 不存在，且未找到初始化模板：{template_path}"
-                )
-            try:
-                shutil.copyfile(template_path, self._config_path)
-            except OSError as error:
-                raise DbctlConfigurationError(
-                    "无法从 example.jsonc 创建私密 config.jsonc。"
-                ) from error
+            if not self._allow_packaged_config_fallback:
+                raise DbctlConfigurationError(f"config.jsonc 不存在：{self._config_path}")
+            template_path = self._config_path.parent / _DEFAULT_EXAMPLE_NAME
+            template_text: str
+            """@brief 即将落盘的公开模板文本 / Public template text to persist."""
+            if template_path.is_file():
+                try:
+                    template_text = template_path.read_text(encoding="utf-8")
+                except OSError as error:
+                    raise DbctlConfigurationError("无法读取 example.jsonc 初始化模板。") from error
+            else:
+                template_text = read_default_text("example.jsonc")
+            self._write_private_text(template_text)
         root = self._load_mapping_file(self._config_path, "dbctl 配置")
         changed = _ensure_database_dsns(root, administration, endpoint)
         if changed:
@@ -467,6 +498,16 @@ class DbctlConfigurationService:
         @param root 待序列化的完整配置根对象 / Complete configuration root to serialize.
         @return 无返回值 / No return value.
         """
+        self._write_private_text(json.dumps(root, ensure_ascii=False, indent=2) + "\n")
+
+    def _write_private_text(self, content: str) -> None:
+        """@brief 原子写入权限为 0600 的配置文本 / Atomically write configuration text with mode 0600.
+
+        @param content 待写入 UTF-8 文本 / UTF-8 text to write.
+        @return 无返回值 / No return value.
+        @raise DbctlConfigurationError 文件无法安全写入时抛出 / Raised when the file cannot be written safely.
+        """
+
         temporary_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -476,7 +517,7 @@ class DbctlConfigurationService:
                 prefix=f".{self._config_path.name}.",
                 delete=False,
             ) as temporary_file:
-                temporary_file.write(json.dumps(root, ensure_ascii=False, indent=2) + "\n")
+                temporary_file.write(content)
                 temporary_path = Path(temporary_file.name)
             temporary_path.chmod(0o600)
             temporary_path.replace(self._config_path)
@@ -499,8 +540,23 @@ class DbctlConfigurationService:
         if not path.is_file():
             raise DbctlConfigurationError(f"{label}文件不存在：{path}")
         try:
-            parsed = json5.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
+            content = path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise DbctlConfigurationError(f"{label}文件无法解析。") from error
+        return DbctlConfigurationService._load_mapping_text(content, label)
+
+    @staticmethod
+    def _load_mapping_text(content: str, label: str) -> dict[str, Any]:
+        """@brief 解析一个 JSONC 根对象文本 / Parse one JSONC root mapping from text.
+
+        @param content UTF-8 JSONC 文本 / UTF-8 JSONC text.
+        @param label 安全错误标签 / Safe error label.
+        @return 可变顶层对象 / Mutable root mapping.
+        """
+
+        try:
+            parsed = json5.loads(content)
+        except ValueError as error:
             raise DbctlConfigurationError(f"{label}文件无法解析。") from error
         if not isinstance(parsed, Mapping):
             raise DbctlConfigurationError(f"{label}根必须是对象。")

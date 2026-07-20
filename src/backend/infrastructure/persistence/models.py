@@ -1114,39 +1114,131 @@ class KnowledgeAccessSnapshotRecord(Base, TenantScopedMixin):
     policy_evaluation: Mapped[JsonObject] = mapped_column(JSONB, nullable=False)
 
 
-class TelemetryRecord(Base, TenantScopedMixin):
-    """@brief 低基数业务 telemetry 原始记录 / Low-cardinality business telemetry raw record.
+class TelemetryRecord(Base):
+    """@brief 强约束的统一 telemetry 信封 / Strongly constrained unified telemetry envelope.
 
-    该表只接收业务 metric/log/span。数据库客户端自身的 SQL span 不应写入，避免
-    telemetry sink 递归；完整 prompt、用户文本、URL 和异常堆栈等高基数值也不得
-    放进 ``attributes``。
+    @note 表是物理统一的，但 metric/log/span 的专属字段由互斥 ``CHECK`` 约束保护；
+    它不继承业务资源 lifecycle，也不以外键阻塞业务身份删除。
     """
 
     __tablename__ = "telemetry_records"
     __table_args__ = (
-        CheckConstraint("kind IN ('metric', 'log', 'span')", name="telemetry_kind"),
+        CheckConstraint("kind IN ('metric', 'log', 'span')", name="telemetry_signal_kind"),
+        CheckConstraint("source IN ('backend', 'frontend')", name="telemetry_signal_source"),
         CheckConstraint(
-            "kind <> 'metric' OR value IS NOT NULL", name="telemetry_metric_requires_value"
+            "jsonb_typeof(attributes) = 'object'", name="telemetry_attributes_object"
         ),
-        Index("ix_telemetry_workspace_occurred", "workspace_id", "occurred_at"),
-        Index("ix_telemetry_workspace_name_occurred", "workspace_id", "name", "occurred_at"),
+        CheckConstraint(
+            "num_nonnulls(workspace_id, resource_owner_id, actor_id) IN (0, 3)",
+            name="telemetry_scope_complete",
+        ),
+        CheckConstraint(
+            "(source = 'frontend' AND workspace_id IS NOT NULL AND client_event_id IS NOT NULL) "
+            "OR (source = 'backend' AND client_event_id IS NULL)",
+            name="telemetry_source_contract",
+        ),
+        CheckConstraint(
+            "(kind = 'metric' AND metric_type IS NOT NULL AND value IS NOT NULL AND unit IS NOT NULL "
+            "AND severity_number IS NULL AND severity_text IS NULL AND duration_ms IS NULL "
+            "AND span_status IS NULL) OR "
+            "(kind = 'log' AND metric_type IS NULL AND value IS NULL AND unit IS NULL "
+            "AND severity_number BETWEEN 1 AND 24 AND severity_text IS NOT NULL "
+            "AND duration_ms IS NULL AND span_status IS NULL) OR "
+            "(kind = 'span' AND metric_type IS NULL AND value IS NULL AND unit IS NULL "
+            "AND severity_number IS NULL AND severity_text IS NULL AND duration_ms >= 0 "
+            "AND span_status IS NOT NULL AND trace_id IS NOT NULL AND span_id IS NOT NULL)",
+            name="telemetry_kind_fields",
+        ),
+        CheckConstraint(
+            "metric_type IS NULL OR metric_type IN ('counter', 'gauge', 'histogram')",
+            name="telemetry_metric_type",
+        ),
+        CheckConstraint(
+            "value IS NULL OR value NOT IN ('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)",
+            name="telemetry_finite_value",
+        ),
+        CheckConstraint(
+            "duration_ms IS NULL OR duration_ms NOT IN "
+            "('NaN'::float8, 'Infinity'::float8, '-Infinity'::float8)",
+            name="telemetry_finite_duration",
+        ),
+        CheckConstraint(
+            "span_status IS NULL OR span_status IN ('unset', 'ok', 'error')",
+            name="telemetry_span_status",
+        ),
+        CheckConstraint(
+            "(trace_id IS NULL AND span_id IS NULL AND parent_span_id IS NULL) OR "
+            "(trace_id ~ '^[0-9a-f]{32}$' AND trace_id <> repeat('0', 32) "
+            "AND span_id ~ '^[0-9a-f]{16}$' AND span_id <> repeat('0', 16) "
+            "AND (parent_span_id IS NULL OR "
+            "(parent_span_id ~ '^[0-9a-f]{16}$' AND parent_span_id <> repeat('0', 16))))",
+            name="telemetry_trace_context",
+        ),
+        Index(
+            "ix_telemetry_metric_workspace_occurred",
+            "workspace_id",
+            "occurred_at",
+            "service",
+            "name",
+            postgresql_where=text("kind = 'metric'"),
+            postgresql_include=["value", "observed_at", "unit", "metric_type"],
+        ),
+        Index(
+            "ix_telemetry_event_workspace_occurred_observed",
+            "workspace_id",
+            "occurred_at",
+            "observed_at",
+            postgresql_where=text("kind IN ('log', 'span')"),
+        ),
+        Index(
+            "ix_telemetry_trace_occurred",
+            "trace_id",
+            "occurred_at",
+            "span_id",
+            postgresql_where=text("trace_id IS NOT NULL"),
+        ),
+        Index("ix_telemetry_observed_at", "observed_at"),
+        Index(
+            "uq_telemetry_frontend_client_event",
+            "workspace_id",
+            "resource_owner_id",
+            "actor_id",
+            "client_event_id",
+            unique=True,
+            postgresql_where=text("source = 'frontend' AND client_event_id IS NOT NULL"),
+        ),
         {"schema": "observability"},
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workspace_id: Mapped[str | None] = mapped_column(String(128))
+    resource_owner_id: Mapped[str | None] = mapped_column(String(128))
+    actor_id: Mapped[str | None] = mapped_column(String(128))
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
     service: Mapped[str] = mapped_column(String(128), nullable=False)
+    service_version: Mapped[str | None] = mapped_column(String(128))
+    deployment_environment: Mapped[str | None] = mapped_column(String(128))
+    service_instance_id: Mapped[str | None] = mapped_column(String(128))
     name: Mapped[str] = mapped_column(String(128), nullable=False)
+    metric_type: Mapped[str | None] = mapped_column(String(16))
     value: Mapped[float | None] = mapped_column(Float)
-    severity: Mapped[str | None] = mapped_column(String(16))
+    unit: Mapped[str | None] = mapped_column(String(32))
+    severity_number: Mapped[int | None] = mapped_column(SmallInteger)
+    severity_text: Mapped[str | None] = mapped_column(String(16))
+    duration_ms: Mapped[float | None] = mapped_column(Float)
+    span_status: Mapped[str | None] = mapped_column(String(16))
     request_id: Mapped[str | None] = mapped_column(String(128))
-    trace_id: Mapped[str | None] = mapped_column(String(128))
-    span_id: Mapped[str | None] = mapped_column(String(128))
-    parent_span_id: Mapped[str | None] = mapped_column(String(128))
+    trace_id: Mapped[str | None] = mapped_column(String(32))
+    span_id: Mapped[str | None] = mapped_column(String(16))
+    parent_span_id: Mapped[str | None] = mapped_column(String(16))
+    client_event_id: Mapped[str | None] = mapped_column(String(128))
     attributes: Mapped[JsonObject] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )

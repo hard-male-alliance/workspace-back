@@ -19,8 +19,10 @@ from .config import (
     DbctlSettings,
 )
 from .migration import AlembicMigrationRunner
+from .package_resources import alembic_script_location
 from .retention import (
     DEFAULT_TELEMETRY_PRUNE_BATCH_SIZE,
+    DEFAULT_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS,
     DEFAULT_TELEMETRY_PRUNE_MAX_BATCHES,
     DEFAULT_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS,
     PsycopgTelemetryRetentionRunner,
@@ -46,22 +48,19 @@ class DbctlComposition:
 
     settings: DbctlSettings
     _environ: MutableMapping[str, str] = field(default_factory=lambda: os.environ, repr=False)
-    _repository_root: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parents[2],
-        repr=False,
-    )
 
     @classmethod
     def from_config_path(
         cls,
-        config_path: Path | str = Path("config.jsonc"),
+        config_path: Path | str | None = None,
         *,
         dbinit_path: Path | str | None = None,
         environ: MutableMapping[str, str] | None = None,
     ) -> DbctlComposition:
         """@brief 从 JSONC 配置构造 composition root / Construct composition root from JSONC configuration.
 
-        @param config_path 根 JSONC 配置路径 / Root JSONC configuration path.
+        @param config_path 根 JSONC 配置路径；``None`` 使用可回退到安装包资源的默认路径。
+        / Root JSONC configuration path; ``None`` uses the default with installed-resource fallback.
         @param dbinit_path 独立数据库初始化声明路径 / Separate database-initialization declaration path.
         @param environ 可选可变环境映射；默认使用当前 ``os.environ``。
         / Optional mutable environment mapping; defaults to current ``os.environ``.
@@ -73,7 +72,6 @@ class DbctlComposition:
         return cls(
             settings=loaded_settings,
             _environ=os.environ if environ is None else environ,
-            _repository_root=_find_repository_root(configuration_service.config_path),
         )
 
     def build_bootstrap_plan(self) -> BootstrapPlan:
@@ -116,13 +114,14 @@ class DbctlComposition:
         @note 此方法绝不会由 backend 启动路径调用；只有 ``dbctl migrate`` 明确调用。
         / This method is never called by backend startup; only explicit ``dbctl migrate`` invokes it.
         """
-        AlembicMigrationRunner(
-            self.settings.require_migrator_dsn(),
-            self._repository_root / "alembic",
-            self.settings.administration.owner_role,
-            self.settings.administration.app_role,
-            self.settings.administration.dashboard_role,
-        ).upgrade(revision)
+        with alembic_script_location() as script_location:
+            AlembicMigrationRunner(
+                self.settings.require_migrator_dsn(),
+                script_location,
+                self.settings.administration.owner_role,
+                self.settings.administration.app_role,
+                self.settings.administration.dashboard_role,
+            ).upgrade(revision)
 
     def prune_telemetry(
         self,
@@ -131,6 +130,7 @@ class DbctlComposition:
         batch_size: int = DEFAULT_TELEMETRY_PRUNE_BATCH_SIZE,
         max_batches: int = DEFAULT_TELEMETRY_PRUNE_MAX_BATCHES,
         statement_timeout_ms: int = DEFAULT_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS,
+        lock_timeout_ms: int = DEFAULT_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS,
     ) -> TelemetryPruneResult:
         """@brief 通过 dbctl 显式执行或预览遥测保留期清理 / Explicitly execute or preview telemetry retention pruning via dbctl.
 
@@ -140,6 +140,7 @@ class DbctlComposition:
         @param max_batches 本次运维调用可执行的最大短事务数 / Maximum short transactions for this operator invocation.
         @param statement_timeout_ms 每个清理/计数 SQL 的事务本地超时。
         / Transaction-local timeout for each prune/count SQL.
+        @param lock_timeout_ms 每个清理事务的锁等待上限 / Lock-wait timeout per prune transaction.
         @return 不含数据库凭证、原始 SQL 或驱动异常的清理摘要。
         / Pruning summary containing no credentials, raw SQL, or driver exception.
         @raise DbctlConfigurationError 运维参数无效或 ``--apply`` 缺少 migrator DSN 时抛出。
@@ -156,6 +157,7 @@ class DbctlComposition:
             batch_size=batch_size,
             max_batches=max_batches,
             statement_timeout_ms=statement_timeout_ms,
+            lock_timeout_ms=lock_timeout_ms,
             apply=apply,
         )
         if request.disabled or not request.apply:
@@ -224,16 +226,3 @@ class DbctlComposition:
         be overridden by environment variables.
         """
         return dict(self.settings.role_passwords)
-
-
-def _find_repository_root(config_path: Path) -> Path:
-    """@brief 定位包含 Alembic 的仓库根 / Locate repository root containing Alembic.
-
-    @param config_path 根 JSONC 配置路径 / Root JSONC configuration path.
-    @return 包含 ``alembic`` 目录的仓库根路径 / Repository root containing the ``alembic`` directory.
-    """
-    candidates = (config_path.resolve().parent, Path(__file__).resolve().parents[2])
-    for candidate in candidates:
-        if (candidate / "alembic").is_dir():
-            return candidate
-    return candidates[-1]

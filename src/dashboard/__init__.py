@@ -1,46 +1,17 @@
-"""AI Job Workspace 的独立运维 Dashboard 包。"""
+"""@brief AI Job Workspace 的独立可靠性 Dashboard / Standalone reliability Dashboard."""
 
-from .access import DashboardAccessPolicy
-from .composition import (
-    DashboardApplication,
-    DashboardCompositionRoot,
-    create_dashboard_application,
-)
-from .config import DashboardConfigService, DashboardSettings
-from .models import (
-    DashboardOverview,
-    DashboardScope,
-    HealthPolicy,
-    HealthStatus,
-    MetricKind,
-    MetricQuery,
-    MetricSample,
-    ServiceSummary,
-)
-from .repositories import (
-    MemoryObservabilityRepository,
-    PostgresObservabilityRepository,
-    SqlAlchemyAsyncRowFetcher,
-)
-from .service import DashboardService
+from .application import DashboardOverview, DashboardQueryService, EventReport, TrendReport
+from .bootstrap import DashboardRuntime, build_runtime
+from .domain import OperatorPrincipal, SignalKind, WorkspaceScope
 
 __all__ = [
-    "DashboardAccessPolicy",
-    "DashboardApplication",
-    "DashboardCompositionRoot",
-    "DashboardConfigService",
     "DashboardOverview",
-    "DashboardScope",
-    "DashboardService",
-    "DashboardSettings",
-    "HealthPolicy",
-    "HealthStatus",
-    "MemoryObservabilityRepository",
-    "MetricKind",
-    "MetricQuery",
-    "MetricSample",
-    "PostgresObservabilityRepository",
-    "ServiceSummary",
-    "SqlAlchemyAsyncRowFetcher",
-    "create_dashboard_application",
+    "DashboardQueryService",
+    "DashboardRuntime",
+    "EventReport",
+    "OperatorPrincipal",
+    "SignalKind",
+    "TrendReport",
+    "WorkspaceScope",
+    "build_runtime",
 ]

@@ -84,3 +84,99 @@ def test_backend_domain_never_imports_infrastructure() -> None:
                     ):
                         violations.append(f"{source.relative_to(_PROJECT_ROOT)} -> {alias.name}")
     assert not violations, "domain 反向依赖 infrastructure：\n" + "\n".join(violations)
+
+
+def test_backend_application_never_imports_infrastructure() -> None:
+    """@brief 应用层通过端口依赖基础设施 / Application layer depends on infrastructure through ports.
+
+    @return 无返回值 / No return value.
+
+    @note composition root 可以把 adapter 注入 use case；application 本身不得认识具体
+    pipeline、repository、HTTP 或 logging 实现，否则分层架构只是目录装饰。
+    / The composition root may inject adapters, while application code must not know concrete
+    pipeline, repository, HTTP, or logging implementations.
+    """
+    application_root = _PROJECT_ROOT / "src" / "backend" / "application"
+    violations: list[str] = []
+    for source in application_root.rglob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for node in ast.walk(tree):
+            imported: str | None = None
+            if isinstance(node, ast.ImportFrom) and node.level == 0:
+                imported = node.module
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "backend.infrastructure" or alias.name.startswith(
+                        "backend.infrastructure."
+                    ):
+                        violations.append(
+                            f"{source.relative_to(_PROJECT_ROOT)} -> {alias.name}"
+                        )
+                continue
+            if imported == "backend.infrastructure" or (
+                isinstance(imported, str) and imported.startswith("backend.infrastructure.")
+            ):
+                violations.append(f"{source.relative_to(_PROJECT_ROOT)} -> {imported}")
+    assert not violations, "application 反向依赖 infrastructure：\n" + "\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    ("layer", "forbidden_layers", "forbidden_libraries"),
+    (
+        (
+            "domain",
+            frozenset({"application", "infrastructure", "interfaces"}),
+            frozenset({"fastapi", "matplotlib", "plotly", "PyQt6", "rich", "sqlalchemy"}),
+        ),
+        (
+            "application",
+            frozenset({"infrastructure", "interfaces"}),
+            frozenset({"fastapi", "matplotlib", "plotly", "PyQt6", "rich", "sqlalchemy"}),
+        ),
+    ),
+)
+def test_dashboard_core_layers_only_depend_inward(
+    layer: str,
+    forbidden_layers: frozenset[str],
+    forbidden_libraries: frozenset[str],
+) -> None:
+    """@brief Dashboard 核心层只能向内依赖，且不得认识呈现/数据库框架。
+
+    @param layer 被检查的 Dashboard 层 / Dashboard layer under inspection.
+    @param forbidden_layers 违反单向依赖的内部层名 / Internal layers that violate dependency direction.
+    @param forbidden_libraries 核心层禁止导入的适配器库 / Adapter libraries forbidden in the core.
+    @return 无返回值 / No return value.
+    """
+
+    layer_root = _PROJECT_ROOT / "src" / "dashboard" / layer
+    violations: list[str] = []
+    for source in layer_root.rglob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for node in ast.walk(tree):
+            imported: str | None = None
+            if isinstance(node, ast.ImportFrom):
+                imported = node.module
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    root_name = alias.name.partition(".")[0]
+                    if root_name in forbidden_libraries:
+                        violations.append(
+                            f"{source.relative_to(_PROJECT_ROOT)} -> {alias.name}"
+                        )
+                continue
+            if not imported:
+                continue
+            root_name = imported.partition(".")[0]
+            if root_name in forbidden_libraries:
+                violations.append(f"{source.relative_to(_PROJECT_ROOT)} -> {imported}")
+            absolute_parts = imported.split(".")
+            if absolute_parts[:1] == ["dashboard"] and len(absolute_parts) > 1:
+                target_layer = absolute_parts[1]
+            elif node.level > 0:
+                target_layer = absolute_parts[0]
+            else:
+                target_layer = ""
+            if target_layer in forbidden_layers:
+                violations.append(f"{source.relative_to(_PROJECT_ROOT)} -> {imported}")
+
+    assert not violations, f"dashboard.{layer} 依赖方向错误：\n" + "\n".join(violations)

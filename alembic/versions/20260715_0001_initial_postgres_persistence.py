@@ -4,7 +4,7 @@ Revision ID: 20260715_0001
 Revises:
 Create Date: 2026-07-15
 
-@note 运行此前必须由 ``workspace-dbctl bootstrap`` 创建 ``workspace_owner``、
+@note 运行此前必须由 ``dbctl bootstrap`` 创建 ``workspace_owner``、
 ``workspace_migrator``、``workspace_app`` 与 ``workspace_dashboard`` 四个角色，
 并授予 migrator ``SET ROLE workspace_owner`` 的权限。本 revision 以 owner 身份
 创建 DDL，应用运行时账号没有 DDL 权限。

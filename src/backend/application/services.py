@@ -14,8 +14,10 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
+from backend.application.concurrency import BackpressureError, BoundedTaskSupervisor
 from backend.config import AISettings, KnowledgeSettings, NetworkSettings
 from backend.domain.agent import AgentRunRecord, AgentRunStatus, ConversationRecord, MessageRecord
+from backend.domain.artifacts import artifact_sha256
 from backend.domain.common import DomainError, Job, Problem, iso_timestamp, utc_now
 from backend.domain.interview import InterviewSessionRecord, InterviewStatus
 from backend.domain.knowledge import (
@@ -41,6 +43,7 @@ from backend.domain.ports import (
     KnowledgeFileParser,
     KnowledgeRepository,
     ModelProvider,
+    ObservabilityRecorder,
     Renderer,
     ResumeKnowledgeBridge,
     ResumeProposalRepository,
@@ -53,9 +56,6 @@ from backend.domain.proposal import (
     ResumeProposalStatus,
 )
 from backend.domain.resume import ResumeRecord, create_empty_document
-from backend.infrastructure.concurrency import BackpressureError, BoundedTaskSupervisor
-from backend.infrastructure.rendering import artifact_sha256
-from backend.infrastructure.telemetry import BufferedTelemetrySink
 from workspace_shared.ids import new_opaque_id
 from workspace_shared.tenancy import ActorScope
 
@@ -149,7 +149,7 @@ class ServiceDependencies:
     ai: AISettings
     knowledge: KnowledgeSettings
     supervisor: BoundedTaskSupervisor
-    telemetry: BufferedTelemetrySink
+    telemetry: ObservabilityRecorder
 
 
 class ResumeApplicationService:
@@ -216,9 +216,8 @@ class ResumeApplicationService:
         record = ResumeRecord(scope=scope, document=document, revisions={1: deepcopy(document)})
         await self._repository.create_resume(scope, record)
         await self._knowledge_bridge.synchronize_resume(scope, record.snapshot(), request_id)
-        self._dependencies.telemetry.record(
-            "metric",
-            "resume.created",
+        self._dependencies.telemetry.record_metric(
+            "aiws.resume.created",
             1,
             scope,
             request_id,
@@ -336,9 +335,8 @@ class ResumeApplicationService:
                 result,
             )
             await self._repository.save_resume(scope, record)
-            self._dependencies.telemetry.record(
-                "metric",
-                "resume.operations",
+            self._dependencies.telemetry.record_metric(
+                "aiws.resume.operations",
                 1,
                 scope,
                 request_id,
@@ -497,9 +495,8 @@ class ResumeApplicationService:
         job.total_units = 1
         job.succeed()
         await self._jobs.save_job(scope, job)
-        self._dependencies.telemetry.record(
-            "metric",
-            "resume.render",
+        self._dependencies.telemetry.record_metric(
+            "aiws.resume.render",
             1,
             scope,
             job.request_id,
@@ -519,9 +516,8 @@ class ResumeApplicationService:
         else:
             job.fail(Problem("resume.render_failed", 500, "Resume rendering failed"))
         await self._jobs.save_job(scope, job)
-        self._dependencies.telemetry.record(
-            "metric",
-            "resume.render",
+        self._dependencies.telemetry.record_metric(
+            "aiws.resume.render",
             1,
             scope,
             job.request_id,
@@ -984,9 +980,8 @@ class AgentApplicationService:
             raise
         if completed:
             live_run = await self.get_run(scope, run_id)
-            self._dependencies.telemetry.record(
-                "metric",
-                "agent.run",
+            self._dependencies.telemetry.record_metric(
+                "aiws.agent.run",
                 1,
                 scope,
                 request_id,
@@ -1358,9 +1353,8 @@ class AgentApplicationService:
             await self._set_output_status_locked(scope, run, "failed")
             run.append_event("agent.run.failed", {"problem": run.problem.as_dict()}, None)
             await self._repository.save_run(scope, run)
-        self._dependencies.telemetry.record(
-            "metric",
-            "agent.run",
+        self._dependencies.telemetry.record_metric(
+            "aiws.agent.run",
             1,
             scope,
             None,
@@ -1630,9 +1624,8 @@ class KnowledgeApplicationService:
                 request_id,
                 raise_on_backpressure=False,
             )
-        self._dependencies.telemetry.record(
-            "metric",
-            "resume.knowledge_source",
+        self._dependencies.telemetry.record_metric(
+            "aiws.resume.knowledge_source",
             1,
             scope,
             request_id,
@@ -2087,9 +2080,8 @@ class KnowledgeApplicationService:
                 job.total_units = 1
                 job.succeed()
                 await self._jobs.save_job(scope, job)
-                self._dependencies.telemetry.record(
-                    "metric",
-                    "knowledge.ingest",
+                self._dependencies.telemetry.record_metric(
+                    "aiws.knowledge.ingest",
                     1,
                     scope,
                     job.request_id,
@@ -2235,9 +2227,8 @@ class KnowledgeApplicationService:
             job.succeed()
             await self._repository.save_source(scope, source)
             await self._jobs.save_job(scope, job)
-            self._dependencies.telemetry.record(
-                "metric",
-                "knowledge.ingest",
+            self._dependencies.telemetry.record_metric(
+                "aiws.knowledge.ingest",
                 1,
                 scope,
                 job.request_id,
@@ -2275,9 +2266,8 @@ class KnowledgeApplicationService:
                 source.updated_at = utc_now()
                 source.revision += 1
                 await self._repository.save_source(scope, source)
-        self._dependencies.telemetry.record(
-            "metric",
-            "knowledge.ingest",
+        self._dependencies.telemetry.record_metric(
+            "aiws.knowledge.ingest",
             1,
             scope,
             job.request_id,
@@ -2408,14 +2398,17 @@ class InterviewApplicationService:
         scope: ActorScope,
         session_id: str,
         event: dict[str, Any],
+        *,
         request_id: str | None,
+        trace_id: str | None,
     ) -> list[dict[str, Any]]:
         """@brief 处理一个已验证的实时控制事件 / Handle one validated realtime control event.
 
         @param scope 多租户范围 / Multi-tenant scope.
         @param session_id Session ID / Session ID.
         @param event 正式 InterviewRealtimeEvent / Formal InterviewRealtimeEvent.
-        @param request_id 请求追踪 ID / Request trace ID.
+        @param request_id 创建后台 Job 使用的请求关联 ID / Request correlation ID used for background Jobs.
+        @param trace_id 写入实时事件 envelope 的 W3C trace ID / W3C trace ID written to realtime event envelopes.
         @return 服务端待发送事件 / Server events to send.
         """
         async with self._locks.hold(scope, session_id):
@@ -2426,7 +2419,7 @@ class InterviewApplicationService:
                 if session.status is InterviewStatus.READY:
                     session.transition(InterviewStatus.CONNECTING)
                     session.transition(InterviewStatus.IN_PROGRESS)
-                responses.append(session.append_event("interview.session.state", {"status": session.status.value, "reason": None}, request_id))
+                responses.append(session.append_event("interview.session.state", {"status": session.status.value, "reason": None}, trace_id))
             elif event_type == "interview.user.interrupt":
                 if session.status is not InterviewStatus.IN_PROGRESS:
                     raise DomainError(Problem("interview.invalid_state", 409, "User interrupt requires an active interview"))
@@ -2442,19 +2435,19 @@ class InterviewApplicationService:
                             },
                             "recoverable": True,
                         },
-                        request_id,
+                        trace_id,
                     )
                 )
             elif event_type == "interview.session.end_requested":
                 await self._end_locked(scope, session, request_id)
-                responses.append(session.append_event("interview.session.state", {"status": session.status.value, "reason": None}, request_id))
+                responses.append(session.append_event("interview.session.state", {"status": session.status.value, "reason": None}, trace_id))
             elif event_type == "interview.ping":
                 ping_payload = event.get("payload", {})
                 responses.append(
                     session.append_event(
                         "interview.pong",
                         {"nonce": ping_payload.get("nonce", "unknown"), "sent_at": ping_payload.get("sent_at", iso_timestamp(utc_now()))},
-                        request_id,
+                        trace_id,
                     )
                 )
             else:
@@ -2537,9 +2530,8 @@ class InterviewApplicationService:
         job.succeed()
         await self._repository.save_session(scope, session)
         await self._jobs.save_job(scope, job)
-        self._dependencies.telemetry.record(
-            "metric",
-            "interview.report",
+        self._dependencies.telemetry.record_metric(
+            "aiws.interview.report",
             1,
             scope,
             job.request_id,
@@ -2556,9 +2548,8 @@ class InterviewApplicationService:
         """
         job.fail(error.problem if isinstance(error, DomainError) else Problem("interview.report_failed", 500, "Interview report generation failed"))
         await self._jobs.save_job(scope, job)
-        self._dependencies.telemetry.record(
-            "metric",
-            "interview.report",
+        self._dependencies.telemetry.record_metric(
+            "aiws.interview.report",
             1,
             scope,
             job.request_id,

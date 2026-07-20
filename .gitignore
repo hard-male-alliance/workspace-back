@@ -12,4 +12,5 @@ htmlcov/
 .coverage
 artifacts/
 data/knowledge-blobs/
+data/logs/
 *.log

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
-import re
-from asyncio import CancelledError
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from time import perf_counter
+from typing import cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -16,101 +15,39 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from backend.api.diagnostics import diagnostics_router
 from backend.api.errors import (
     domain_error_handler,
     http_exception_handler,
     request_validation_error_handler,
 )
+from backend.api.middleware.context import correlate_http_response
+from backend.api.middleware.transport import (
+    TransportTelemetryMiddleware,
+    log_http_start,
+)
 from backend.api.routes import router
-from backend.composition import BackendContainer, build_container
+from backend.composition import build_container
 from backend.config import BackendSettings
 from backend.domain.common import DomainError, Problem
 from backend.infrastructure.identity import IdentityVerificationError, peer_is_trusted_proxy
-from backend.infrastructure.telemetry import bind_telemetry_scope
-from workspace_shared.ids import new_opaque_id
+from backend.infrastructure.observability.context import (
+    ObservabilityContext,
+    ServerTraceContext,
+    bind_observability_context,
+)
 from workspace_shared.tenancy import ActorScope
 
-_REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
-"""@brief 可安全持久化的 request ID 格式 / Request-ID format safe for persistence."""
-
-
-def project_root() -> Path:
-    """@brief 定位项目根目录 / Locate the project root.
-
-    @return 包含 pyproject.toml 的项目目录 / Project directory containing pyproject.toml.
-    """
-    return Path(__file__).resolve().parents[2]
+logger = logging.getLogger(__name__)
+"""@brief HTTP 边界稳定事件 logger / Stable-event logger for the HTTP boundary."""
 
 
 def config_path() -> Path:
     """@brief 解析配置路径 / Resolve the configuration path.
 
-    @return AIWS_CONFIG 或根 config.jsonc / AIWS_CONFIG or root config.jsonc.
+    @return AIWS_CONFIG 或当前目录 config.jsonc / AIWS_CONFIG or current-directory config.jsonc.
     """
-    return Path(os.environ.get("AIWS_CONFIG", project_root() / "config.jsonc"))
-
-
-def _record_http_telemetry(
-    container: BackendContainer,
-    scope: ActorScope,
-    request: Request,
-    status_code: int,
-    latency_ms: float,
-) -> None:
-    """@brief 写入 Google SRE 四个黄金信号 / Write Google SRE's four golden signals.
-
-    @param container 当前 worker 容器 / Current worker container.
-    @param scope 已认证或 mock 的租户范围 / Authenticated or mock tenant scope.
-    @param request HTTP 请求 / HTTP request.
-    @param status_code 最终 HTTP 状态码 / Final HTTP status code.
-    @param latency_ms 请求端到端耗时毫秒 / End-to-end request duration in milliseconds.
-    @return 无返回值 / No return value.
-    @note 只记录低基数 method/status/outcome，不记录 URL、prompt 或异常文本。
-    """
-    outcome = "failure" if status_code >= 500 else "success"
-    attributes: dict[str, str | int | float | bool] = {
-        "operation": request.method.lower(),
-        "outcome": outcome,
-        "status_code": status_code,
-    }
-    telemetry = container.telemetry
-    telemetry.record(
-        "metric",
-        "requests",
-        1,
-        scope,
-        request.state.request_id,
-        attributes,
-        service="backend.api",
-    )
-    telemetry.record(
-        "metric",
-        "latency_ms",
-        max(0.0, latency_ms),
-        scope,
-        request.state.request_id,
-        attributes,
-        service="backend.api",
-    )
-    telemetry.record(
-        "metric",
-        "saturation",
-        container.supervisor.saturation,
-        scope,
-        request.state.request_id,
-        {"operation": request.method.lower(), "outcome": outcome},
-        service="backend.api",
-    )
-    if status_code >= 500:
-        telemetry.record(
-            "metric",
-            "errors",
-            1,
-            scope,
-            request.state.request_id,
-            attributes,
-            service="backend.api",
-        )
+    return Path(os.environ.get("AIWS_CONFIG", "config.jsonc"))
 
 
 def _identity_problem_response(request: Request, error: IdentityVerificationError) -> JSONResponse:
@@ -150,24 +87,6 @@ def _raw_transport_target(request: Request) -> tuple[str | bytes, str | bytes]:
     return raw_path, raw_query
 
 
-def _request_id_from_headers(request: Request) -> str:
-    """@brief 验证入口关联 ID 或生成新 ID / Validate an ingress correlation ID or generate a new one.
-
-    @param request 当前 HTTP 请求 / Current HTTP request.
-    @return 可写入 telemetry 与 PostgreSQL ``VARCHAR(128)`` 的 request ID。
-    @raise ValueError 客户端提供了重复、过长或含控制字符的值时抛出。
-
-    @note request ID 不是身份凭据，但其会进入持久化 telemetry。边界校验避免一个
-    任意长 header 将普通业务请求放大成数据库列溢出或日志污染。
-    """
-    values = request.headers.getlist("X-Request-Id")
-    if not values:
-        return new_opaque_id("req")
-    if len(values) != 1 or not _REQUEST_ID_PATTERN.fullmatch(values[0]):
-        raise ValueError("invalid request ID")
-    return values[0]
-
-
 def create_app(settings: BackendSettings | None = None) -> FastAPI:
     """@brief 创建无需自动 migration 的 FastAPI 应用 / Create a FastAPI app without automatic migrations.
 
@@ -183,7 +102,8 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
         @param app FastAPI 应用 / FastAPI application.
         @return 生命周期上下文 / Lifespan context.
         """
-        async with build_container(resolved_settings, project_root()) as container:
+        runtime_root = resolved_settings.config_path.resolve().parent
+        async with build_container(resolved_settings, runtime_root) as container:
             app.state.container = container
             yield
 
@@ -195,6 +115,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
         docs_url="/docs" if resolved_settings.environment != "production" else None,
     )
     app.include_router(router)
+    app.include_router(diagnostics_router)
     app.add_exception_handler(DomainError, domain_error_handler)
     app.add_exception_handler(RequestValidationError, request_validation_error_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
@@ -211,27 +132,26 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
         @return HTTP 响应 / HTTP response.
         """
         response: Response
-        try:
-            request.state.request_id = _request_id_from_headers(request)
-        except ValueError:
-            request.state.request_id = new_opaque_id("req")
+        trace = cast(ServerTraceContext, request.state.trace_context)
+        container = getattr(request.app.state, "container", None)
+        if bool(request.state.request_id_invalid):
+            request.state.route_fallback = "pre_auth"
+            if container is not None:
+                log_http_start(request, trace)
             problem = Problem("http.invalid_request_id", 400, "X-Request-Id is invalid")
             response = JSONResponse(
                 problem.as_dict(request.state.request_id, request.url.path),
                 status_code=400,
                 media_type="application/problem+json",
             )
-            response.headers["X-Request-Id"] = request.state.request_id
-            return response
-        container = getattr(request.app.state, "container", None)
+            return correlate_http_response(response, request, trace)
         if container is None:
             response = await call_next(request)
-            response.headers["X-Request-Id"] = request.state.request_id
-            return response
+            return correlate_http_response(response, request, trace)
         if request.url.path == "/_internal/healthz":
             response = await call_next(request)
-            response.headers["X-Request-Id"] = request.state.request_id
-            return response
+            return correlate_http_response(response, request, trace)
+        log_http_start(request, trace)
         if (
             container.settings.security.identity_mode == "trusted_proxy_hmac"
             and not peer_is_trusted_proxy(
@@ -239,12 +159,12 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
                 container.settings.network.trusted_proxy_cidrs,
             )
         ):
+            request.state.route_fallback = "pre_auth"
             response = _identity_problem_response(
                 request,
                 IdentityVerificationError("identity.proxy_source_not_trusted"),
             )
-            response.headers["X-Request-Id"] = request.state.request_id
-            return response
+            return correlate_http_response(response, request, trace)
         try:
             raw_path, raw_query = _raw_transport_target(request)
             scope = container.identity.resolve(
@@ -254,34 +174,15 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
                 headers=request.headers,
             )
         except IdentityVerificationError as error:
+            request.state.route_fallback = "pre_auth"
             response = _identity_problem_response(request, error)
-            response.headers["X-Request-Id"] = request.state.request_id
-            return response
+            return correlate_http_response(response, request, trace)
         request.state.actor_scope = scope
-        started_at = perf_counter()
-        with bind_telemetry_scope(scope):
-            try:
-                response = await call_next(request)
-            except CancelledError:
-                raise
-            except BaseException:
-                _record_http_telemetry(
-                    container,
-                    scope,
-                    request,
-                    500,
-                    (perf_counter() - started_at) * 1000,
-                )
-                raise
-        response.headers["X-Request-Id"] = request.state.request_id
-        _record_http_telemetry(
-            container,
-            scope,
-            request,
-            response.status_code,
-            (perf_counter() - started_at) * 1000,
-        )
-        return response
+        with bind_observability_context(
+            ObservabilityContext(scope, request.state.request_id, trace)
+        ):
+            response = await call_next(request)
+        return correlate_http_response(response, request, trace)
 
     @app.get("/_internal/healthz", include_in_schema=False)
     async def healthz() -> dict[str, str]:
@@ -300,12 +201,39 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
         @param error 未处理异常 / Unhandled exception.
         @return 通用 ProblemDetails / Generic ProblemDetails.
         """
+        actor_scope = getattr(request.state, "actor_scope", None)
+        request_id = getattr(request.state, "request_id", None)
+        trace = getattr(request.state, "trace_context", None)
+        context = ObservabilityContext(
+            actor_scope if isinstance(actor_scope, ActorScope) else None,
+            request_id if isinstance(request_id, str) else None,
+            trace if isinstance(trace, ServerTraceContext) else None,
+        )
+        with bind_observability_context(context):
+            logger.error(
+                "backend.http.unexpected_error",
+                extra={
+                    "event_name": "backend.http.unexpected_error",
+                    "telemetry_attributes": {
+                        "operation": "request",
+                        "outcome": "server_error",
+                    },
+                },
+                exc_info=error,
+            )
         problem = Problem("internal.unexpected", 500, "Unexpected server error")
-        return JSONResponse(
+        response = JSONResponse(
             problem.as_dict(getattr(request.state, "request_id", None), request.url.path),
             status_code=500,
             media_type="application/problem+json",
         )
+        request_id = getattr(request.state, "request_id", None)
+        if isinstance(request_id, str):
+            response.headers["X-Request-Id"] = request_id
+        trace = getattr(request.state, "trace_context", None)
+        if isinstance(trace, ServerTraceContext):
+            response.headers["traceparent"] = trace.traceparent
+        return response
 
     if resolved_settings.network.cors_allowed_origins:
         app.add_middleware(
@@ -322,6 +250,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
                 "Last-Event-ID",
                 "Range",
                 "X-Request-Id",
+                "traceparent",
             ],
             expose_headers=[
                 "Accept-Ranges",
@@ -330,8 +259,11 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
                 "ETag",
                 "Location",
                 "X-Request-Id",
+                "traceparent",
             ],
             max_age=600,
         )
+
+    app.add_middleware(TransportTelemetryMiddleware)
 
     return app

@@ -530,13 +530,6 @@ def _database_privilege_statements(
                         label="授予 dashboard 使用 observability schema 的权限",
                         sql=f"GRANT USAGE ON SCHEMA {schema} TO {dashboard};",
                     ),
-                    SqlStatement(
-                        label="授予 app 写入未来 observability 表的最小权限",
-                        sql=(
-                            f"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} "
-                            f"GRANT INSERT ON TABLES TO {app};"
-                        ),
-                    ),
                     _conditional_relation_grant_statement(
                         schema_name=schema_name,
                         relation_name="telemetry_records",
@@ -547,7 +540,7 @@ def _database_privilege_statements(
                     ),
                     _conditional_relation_grant_statement(
                         schema_name=schema_name,
-                        relation_name="dashboard_metric_samples",
+                        relation_name="dashboard_signals",
                         relation_kinds=("v", "m"),
                         privileges="SELECT",
                         role_identifier=dashboard,

@@ -12,9 +12,11 @@ from .config import DatabaseRole
 from .errors import DbctlError
 from .retention import (
     DEFAULT_TELEMETRY_PRUNE_BATCH_SIZE,
+    DEFAULT_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS,
     DEFAULT_TELEMETRY_PRUNE_MAX_BATCHES,
     DEFAULT_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS,
     MAX_TELEMETRY_PRUNE_BATCH_SIZE,
+    MAX_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS,
     MAX_TELEMETRY_PRUNE_MAX_BATCHES,
     MAX_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS,
 )
@@ -30,19 +32,19 @@ def build_parser() -> argparse.ArgumentParser:
     / The CLI accepts no DSN or password argument; all sensitive configuration is read from environment variables.
     """
     parser = argparse.ArgumentParser(
-        prog="workspace-dbctl",
+        prog="dbctl",
         description="安全管理 AI Job Workspace PostgreSQL bootstrap 与 psql shell。",
     )
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("config.jsonc"),
+        default=None,
         help="本地私密运行配置路径（默认：config.jsonc）。",
     )
     parser.add_argument(
         "--dbinit",
         type=Path,
-        default=Path("dbinit.jsonc"),
+        default=None,
         help="数据库初始化声明路径（默认：dbinit.jsonc）。",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -122,6 +124,16 @@ def build_parser() -> argparse.ArgumentParser:
             f"{MAX_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS}）。"
         ),
     )
+    prune_telemetry.add_argument(
+        "--lock-timeout-ms",
+        type=int,
+        default=DEFAULT_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS,
+        help=(
+            "每个清理事务的锁等待超时毫秒数（默认："
+            f"{DEFAULT_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS}，最大："
+            f"{MAX_TELEMETRY_PRUNE_LOCK_TIMEOUT_MS}）。"
+        ),
+    )
     shell = subparsers.add_parser(
         "shell",
         help="直接 exec 到以合适登录身份连接的 psql。",
@@ -197,6 +209,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 batch_size=arguments.batch_size,
                 max_batches=arguments.max_batches,
                 statement_timeout_ms=arguments.statement_timeout_ms,
+                lock_timeout_ms=arguments.lock_timeout_ms,
             )
             print(prune_result.render_operator_summary())
             return 0

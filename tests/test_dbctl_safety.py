@@ -102,8 +102,13 @@ def test_dbctl_bootstrap_plan_is_least_privilege_and_secret_free_when_displayed(
         not in all_sql
     )
     assert (
-        'GRANT SELECT ON TABLE "observability"."dashboard_metric_samples" TO "workspace_dashboard";'
+        'GRANT SELECT ON TABLE "observability"."dashboard_signals" TO "workspace_dashboard";'
         in all_sql
+    )
+    assert (
+        'ALTER DEFAULT PRIVILEGES FOR ROLE "workspace_owner" IN SCHEMA "observability" '
+        'GRANT INSERT ON TABLES TO "workspace_app";'
+        not in all_sql
     )
     assert "ALTER SYSTEM" not in all_sql
     assert "pg_hba.conf" not in all_sql

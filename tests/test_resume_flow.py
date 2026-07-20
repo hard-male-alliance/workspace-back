@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from backend.application.concurrency import BoundedTaskSupervisor, WorkLimits
 from backend.application.services import (
     KnowledgeApplicationService,
     ResumeApplicationService,
@@ -16,14 +17,17 @@ from backend.application.services import (
     ServiceDependencies,
 )
 from backend.config import BackendSettings
-from backend.infrastructure.concurrency import BoundedTaskSupervisor, WorkLimits
+from backend.domain.observability import ResourceMetadata
 from backend.infrastructure.contracts import ContractValidator
 from backend.infrastructure.embeddings import DeterministicEmbeddingProvider
 from backend.infrastructure.knowledge_parsing import LocalKnowledgeFileParser
 from backend.infrastructure.knowledge_storage import LocalKnowledgeBlobStorage
 from backend.infrastructure.memory import InMemoryWorkspaceRepository
+from backend.infrastructure.observability.pipeline import (
+    InMemoryTelemetryWriter,
+    ObservabilityPipeline,
+)
 from backend.infrastructure.rendering import MockRenderer
-from backend.infrastructure.telemetry import BufferedTelemetrySink, InMemoryTelemetryWriter
 from conftest import PROJECT_ROOT, idempotency_headers, wait_for_json
 from workspace_shared.tenancy import ActorScope
 
@@ -173,7 +177,15 @@ async def test_render_hint_backpressure_returns_a_persisted_failed_job_and_idemp
         settings.ai,
         settings.knowledge,
         supervisor,
-        BufferedTelemetrySink(InMemoryTelemetryWriter(), 8, 1, 10, "drop_newest"),
+        ObservabilityPipeline(
+            InMemoryTelemetryWriter(),
+            ResourceMetadata("backend.test"),
+            8,
+            1,
+            10,
+            "drop_newest",
+            100,
+        ),
     )
     locks = ScopedKeyLocks()
     knowledge = KnowledgeApplicationService(

@@ -12,10 +12,10 @@ from .database import (
     normalize_asyncpg_dsn,
 )
 from .models import Base
+from .observability import PostgresTelemetryWriter
 from .repositories import TenantScopedRepository, scope_parameters, scoped_select
 from .runtime_repository import (
     PostgresIdempotencyRegistry,
-    PostgresTelemetryWriter,
     PostgresWorkspaceRepository,
 )
 
