@@ -94,7 +94,7 @@ def _write_settings(
     @param security 可选 ``security`` 配置节 / Optional ``security`` configuration section.
     @return 新配置文件路径 / New configuration-file path.
     """
-    payload = json5.loads((PROJECT_ROOT / "config.jsonc").read_text(encoding="utf-8"))
+    payload = json5.loads((PROJECT_ROOT / "example.jsonc").read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
     payload["environment"] = environment
     if security is None:

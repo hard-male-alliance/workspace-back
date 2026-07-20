@@ -32,7 +32,6 @@
     // 运行时、迁移器和管理员的 DSN 环境变量名称。
     "application_dsn_env": "AIWS_APP_DATABASE_DSN",
     "migrator_dsn_env": "AIWS_MIGRATOR_DATABASE_DSN",
-    "admin_dsn_env": "AIWS_ADMIN_DATABASE_DSN",
     // Dashboard 只能使用该只读角色的独立 DSN，绝不复用 application DSN。
     "dashboard_dsn_env": "AIWS_DASHBOARD_DATABASE_DSN",
     // 单一长生命周期连接池上限，禁止请求路径临时无限建连。
@@ -155,22 +154,5 @@
       "warning_saturation": 0.7,
       "critical_saturation": 0.9
     }
-  },
-  "database_administration": {
-    "database_name": "ai_job_workspace",
-    "owner_role": "workspace_owner",
-    "migrator_role": "workspace_migrator",
-    "app_role": "workspace_app",
-    "dashboard_role": "workspace_dashboard",
-    // bootstrap 创建、owner 持有并按最小权限授权的全部 schema。
-    "schemas": ["identity", "resume", "agent", "interview", "knowledge", "observability"],
-    // Dashboard 可读 schema；必须是 schemas 的成员。
-    "observability_schema": "observability",
-    // 仅在 --local-postgres 显式模式下传给 sudo -u；禁止 shell=True。
-    "local_postgres_user": "postgres",
-    // 管理员 DSN 在创建项目数据库前连接的 maintenance database。
-    "maintenance_database": "postgres",
-    // 仅角色密码所在的环境变量名，绝不把密码写入配置；可省略或保留空映射。
-    "password_env_by_role": {}
   }
 }

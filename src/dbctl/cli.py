@@ -36,7 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=Path("config.jsonc"),
-        help="根 JSONC 配置文件路径（默认：config.jsonc）。",
+        help="本地私密运行配置路径（默认：config.jsonc）。",
+    )
+    parser.add_argument(
+        "--dbinit",
+        type=Path,
+        default=Path("dbinit.jsonc"),
+        help="数据库初始化声明路径（默认：dbinit.jsonc）。",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -45,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="生成并可选执行幂等 PostgreSQL role、database、schema、权限计划。",
     )
     _add_subcommand_config_override(bootstrap)
+    _add_subcommand_dbinit_override(bootstrap)
     bootstrap.add_argument(
         "--dry-run",
         action="store_true",
@@ -56,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="显式使用 migrator DSN 执行 Alembic migration；后端启动从不自动执行。",
     )
     _add_subcommand_config_override(migrate)
+    _add_subcommand_dbinit_override(migrate)
     migrate.add_argument(
         "--revision",
         default="head",
@@ -67,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="按 observability.retention_days 受限清理过期遥测；默认仅 dry-run。",
     )
     _add_subcommand_config_override(prune_telemetry)
+    _add_subcommand_dbinit_override(prune_telemetry)
     execution_mode = prune_telemetry.add_mutually_exclusive_group()
     execution_mode.add_argument(
         "--dry-run",
@@ -106,20 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
             f"{MAX_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS}）。"
         ),
     )
-    bootstrap.add_argument(
-        "--local-postgres",
-        action="store_true",
-        help=(
-            "显式使用本机 sudo -u <local_postgres_user> psql；"
-            "默认优先管理员 DSN，绝不自动回退到 sudo。"
-        ),
-    )
-
     shell = subparsers.add_parser(
         "shell",
         help="直接 exec 到以合适登录身份连接的 psql。",
     )
     _add_subcommand_config_override(shell)
+    _add_subcommand_dbinit_override(shell)
     shell.add_argument(
         "--role",
         choices=(DatabaseRole.APP.value, DatabaseRole.MIGRATOR.value, DatabaseRole.DASHBOARD.value),
@@ -151,16 +152,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
     try:
-        composition = DbctlComposition.from_config_path(arguments.config)
+        composition = DbctlComposition.from_config_path(
+            arguments.config,
+            dbinit_path=arguments.dbinit,
+        )
         if arguments.command == "bootstrap":
             plan = composition.build_bootstrap_plan()
             if arguments.dry_run:
                 print(plan.render_dry_run())
                 return 0
-            result = composition.execute_bootstrap(
-                plan,
-                local_postgres=arguments.local_postgres,
-            )
+            result = composition.execute_bootstrap(plan)
             database_status = "已创建" if result.database_created else "已存在"
             print(
                 "dbctl bootstrap 完成：目标数据库"
@@ -207,6 +208,20 @@ def _add_subcommand_config_override(parser: argparse.ArgumentParser) -> None:
     """
     parser.add_argument(
         "--config",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+
+
+def _add_subcommand_dbinit_override(parser: argparse.ArgumentParser) -> None:
+    """@brief 支持把 --dbinit 写在子命令后 / Support placing --dbinit after a subcommand.
+
+    @param parser 子命令 parser / Subcommand parser.
+    @return 无返回值 / No return value.
+    """
+    parser.add_argument(
+        "--dbinit",
         type=Path,
         default=argparse.SUPPRESS,
         help=argparse.SUPPRESS,

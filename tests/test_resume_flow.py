@@ -154,7 +154,7 @@ async def test_render_hint_backpressure_returns_a_persisted_failed_job_and_idemp
     因而它覆盖真实的 ``BackpressureError`` 分支、失败 Job 持久化和同 client batch 的
     重放语义，防止“revision 已提交但客户端只拿到 503”的部分成功状态。
     """
-    settings = BackendSettings.from_file(PROJECT_ROOT / "config.jsonc")
+    settings = BackendSettings.from_file(PROJECT_ROOT / "example.jsonc")
     scope = ActorScope("usr_klee", "ws_backpressure", "usr_klee")
     repository = InMemoryWorkspaceRepository()
     supervisor = BoundedTaskSupervisor(

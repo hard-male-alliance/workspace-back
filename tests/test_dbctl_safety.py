@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,6 +17,7 @@ from dbctl.bootstrap import (
 )
 from dbctl.cli import main
 from dbctl.composition import DbctlComposition
+from dbctl.runners import LocalPsqlBootstrapRunner
 
 
 @dataclass
@@ -105,9 +107,9 @@ def test_dbctl_bootstrap_plan_is_least_privilege_and_secret_free_when_displayed(
     assert "pg_hba.conf" not in all_sql
 
     password_statements = [statement for statement in all_statements if statement.parameters]
-    assert len(password_statements) == 1
-    assert password_statements[0].parameters == (secret,)
-    assert secret not in repr(password_statements[0])
+    assert len(password_statements) == 3
+    assert all(statement.parameters != (secret,) for statement in password_statements)
+    assert all(secret not in repr(statement) for statement in password_statements)
     assert secret not in dry_run
     assert "<redacted>" in dry_run
     assert "不修改 pg_hba.conf" in dry_run
@@ -130,20 +132,15 @@ def test_dbctl_dry_run_never_invokes_bootstrap_execution(
         f"postgresql://workspace_app:{secret}@db.example.test:5432/ai_job_workspace",
     )
 
-    def unexpected_execution(
-        _: DbctlComposition, __: BootstrapPlan, *, local_postgres: bool
-    ) -> Any:
+    def unexpected_execution(_: DbctlComposition, __: BootstrapPlan) -> Any:
         """@brief 若 dry-run 错误执行则立即失败 / Fail immediately if dry-run wrongly executes.
 
         @param _ dbctl composition / dbctl composition.
         @param __ bootstrap 计划 / Bootstrap plan.
-        @param local_postgres 本地 psql 模式标志 / Local psql mode flag.
         @return 永不返回 / Never returns.
         """
 
-        raise AssertionError(
-            f"dry-run tried to execute bootstrap (local_postgres={local_postgres})"
-        )
+        raise AssertionError("dry-run tried to execute bootstrap")
 
     monkeypatch.setattr(DbctlComposition, "execute_bootstrap", unexpected_execution)
     exit_code = main(
@@ -196,3 +193,32 @@ def test_bootstrap_executor_skips_existing_database_on_repeat_without_external_i
     assert final_create_count == 1
     assert runner.calls[0][0] is ExecutionTarget.MAINTENANCE
     assert any(target is ExecutionTarget.DATABASE for target, _ in runner.calls)
+
+
+def test_bootstrap_runner_always_uses_terminal_sudo_psql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief bootstrap 必须固定使用 sudo psql，且不需要管理员 DSN / Bootstrap always uses sudo psql without an admin DSN.
+
+    @param monkeypatch pytest 替换夹具 / pytest patch fixture.
+    @return 无返回值 / No return value.
+    """
+    observed_commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        """@brief 记录本地命令并返回数据库不存在 / Record the local command and report an absent database.
+
+        @param command 无 shell argv / Shell-free argv.
+        @param _ subprocess 其余受控参数 / Remaining controlled subprocess parameters.
+        @return 成功的 psql 结果 / Successful psql result.
+        """
+        observed_commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="f\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    composition, _ = _composition_with_secret()
+    runner = composition._bootstrap_runner()
+    assert isinstance(runner, LocalPsqlBootstrapRunner)
+    assert runner.database_exists("ai_job_workspace") is False
+    assert observed_commands[0][:5] == ["sudo", "-u", "postgres", "--", "psql"]
+    assert "shell" not in observed_commands[0]

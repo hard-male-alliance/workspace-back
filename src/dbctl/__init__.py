@@ -32,7 +32,7 @@ from .identifiers import (
     validate_postgres_identifier,
 )
 from .migration import AlembicMigrationRunner
-from .runners import LocalPsqlBootstrapRunner, PsycopgBootstrapRunner
+from .runners import LocalPsqlBootstrapRunner
 from .shell import (
     PasswordPolicy,
     PreparedPsqlCommand,
@@ -64,7 +64,6 @@ __all__ = [
     "PasswordPolicy",
     "PreparedPsqlCommand",
     "PsqlShellLauncher",
-    "PsycopgBootstrapRunner",
     "ShellCredentialStrategy",
     "SqlStatement",
     "UnsafeIdentifierError",
