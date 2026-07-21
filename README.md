@@ -36,40 +36,51 @@ uv run pytest
 
 ## Docker 部署
 
-仓库根目录提供多阶段、非 root 的生产镜像和完整 Compose 拓扑。默认配置用于本机联调：业务数据持久化到 PostgreSQL 17/pgvector，AI、embedding、身份和简历 renderer 仍使用明确的 development mock；它不是可直接暴露公网的生产身份系统。
+仓库根目录提供多阶段、非 root 的生产镜像和完整 Compose 拓扑。Docker 不复制数据库初始化逻辑：`dbctl bootstrap` 仍是创建 `config.jsonc`、database、roles、schemas 与 permissions 的唯一入口。持久配置保存在私有 `runtime_config` volume；容器入口只生成临时运行投影，不生成数据库密码或修改 PostgreSQL。
 
 ```bash
 cp .env.docker.example .env
-docker compose up --build --detach
+# 只启动一个尚无业务数据库/角色的 PostgreSQL 17 + pgvector 实例。
+docker compose up --build --detach postgres
+
+# 交互式输入一次 .env 中的 PostgreSQL 管理密码；dbctl 生成随机应用凭证并完成 bootstrap。
+docker compose run --rm bootstrap
+
+# migration 同样是显式状态变更，不会夹带在 backend 启动流程中。
+docker compose run --rm migrate
+
+docker compose up --detach backend
 docker compose ps
 curl --fail http://127.0.0.1:8000/_internal/healthz
 ```
 
-Compose 首次创建空 PostgreSQL volume 时建立 `workspace_owner`、`workspace_migrator`、`workspace_app`、`workspace_dashboard` 四个隔离角色并启用 pgvector。`migrate` 是一次性服务：数据库健康后显式执行 Alembic，只有成功退出后 backend 才启动。后端不会在自身启动路径迁移数据库。应用镜像以 UID/GID `10001`、只读根文件系统、全部 capability 被移除的方式运行；只有 `/tmp` tmpfs 与 `application_data` 持久卷可写。backend 和可选 Dashboard 只发布到宿主 loopback。
+`bootstrap` 固定使用 `--access-mode prompt`：容器之间不存在可继承的宿主 `sudo`/Unix peer 身份，因此它通过私有 Compose 网络连接 `postgres`，只在 TTY 中读取一次管理员密码。密码不会进入 argv、应用镜像或 `config.jsonc`；`config.jsonc` 只保存 `dbctl` 自动生成的三个最小权限登录角色凭证。重复执行 bootstrap 会按 `dbctl` 的幂等计划收敛现状，而不是依赖“仅空 volume 执行一次”的镜像初始化脚本。
+
+Compose 不会在 `docker compose up backend` 时暗中 bootstrap 或 migrate；缺少持久配置或 schema 时会直接失败。应用镜像以 UID/GID `10001`、只读根文件系统、全部 capability 被移除的方式运行；只有 `/tmp` tmpfs 与 `application_data` 持久卷可写。backend 和可选 Dashboard 只发布到宿主 loopback。
 
 可选启动只读 Dashboard API：
 
 ```bash
-docker compose --profile dashboard up --build --detach
+docker compose --profile dashboard up --detach dashboard
 curl --fail http://127.0.0.1:8010/dashboard/v1/healthz
 ```
 
-查看一次性 migration 或服务日志：
+查看服务日志，或在变更窗口再次显式执行 migration：
 
 ```bash
-docker compose logs migrate
 docker compose logs --follow backend
+docker compose run --rm migrate
 ```
 
 生产部署前必须至少完成这些修改：
 
-1. 将 `.env` 中五个示例密码/token 全部替换为互不相同的随机值；数据库角色密码只在**空 volume 首次初始化**时生效，已有 volume 的凭证轮换必须走显式数据库运维流程。
+1. 替换 `.env` 中 PostgreSQL 管理密码与 Dashboard token；app、migrator、dashboard 数据库密码由 `dbctl bootstrap` 生成并保存在私有配置 volume，不在 `.env` 维护第二份状态。
 2. 设置 `AIWS_ENVIRONMENT=production`、`AIWS_IDENTITY_MODE=trusted_proxy_hmac`、至少 32 bytes 的 `AIWS_TRUSTED_PROXY_HMAC_SECRET` 与真实 `AIWS_PUBLIC_BASE_URL`。
 3. 在宿主 loopback 端口前部署能够认证用户、判定 workspace membership/role 并签发 HMAC 断言的 identity proxy；仓库中的 Nginx 示例本身不提供认证。
 4. 非 mock 模型需设置 `AIWS_AI_PROVIDER`、`AIWS_AI_MODEL`、HTTPS `AIWS_AI_BASE_URL`、`AIWS_AI_DATA_REGION` 和 `AIWS_LLM_API_KEY`。
 5. 基础镜像不安装 TeX Live/bubblewrap，故默认 renderer 为 mock。真实 XeLaTeX 必须使用经审阅的派生镜像与可工作的 OS sandbox，不能通过赋予 backend 广泛容器权限来绕过 fail-closed。
 
-需要完全自定义配置时，可挂载只读 JSONC，并设置 `AIWS_CONFIG_MODE=mounted` 与 `AIWS_CONFIG`；入口仍会从 wheel 写出无密钥 `dbinit.jsonc` 供 migration 使用。不要把生产 secret 烘焙进镜像层或提交到仓库。
+Docker 专用 `deploy/docker/dbinit.jsonc` 只把连接端点从宿主 loopback 改为 Compose 服务名 `postgres`；其 database/role/schema 声明必须与根 `dbinit.jsonc` 保持一致。不要把生产 secret 烘焙进镜像层或提交到仓库。
 
 ## 生产前置条件
 

@@ -23,6 +23,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY alembic ./alembic
 COPY src ./src
 COPY example.jsonc dbinit.jsonc ./
+COPY deploy/docker/dbinit.jsonc ./deploy/docker/dbinit.jsonc
 COPY workspace-shared-docs/contracts/v1/ai-job-workspace.contract.schema.json \
     ./workspace-shared-docs/contracts/v1/ai-job-workspace.contract.schema.json
 
@@ -32,11 +33,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 FROM ${PYTHON_IMAGE} AS runtime
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates \
+    && apt-get install --yes --no-install-recommends ca-certificates postgresql-client \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 aiws \
     && useradd --uid 10001 --gid aiws --no-create-home --shell /usr/sbin/nologin aiws \
-    && install --directory --owner aiws --group aiws --mode 0700 /var/lib/aiws
+    && install --directory --owner aiws --group aiws --mode 0700 \
+        /var/lib/aiws /var/lib/aiws-config
 
 ENV AIWS_CONFIG=/tmp/aiws/config.jsonc \
     PATH=/app/.venv/bin:$PATH \
@@ -46,6 +48,8 @@ ENV AIWS_CONFIG=/tmp/aiws/config.jsonc \
 WORKDIR /app
 
 COPY --from=builder --chown=aiws:aiws /app/.venv /app/.venv
+COPY --from=builder --chown=aiws:aiws \
+    /app/deploy/docker/dbinit.jsonc /app/deploy/docker/dbinit.jsonc
 
 USER 10001:10001
 
