@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from typing import Final
 
 from .errors import UnsafeIdentifierError
 
 _POSTGRES_IDENTIFIER_MAX_BYTES: Final[int] = 63
+_POSTGRES_PORTABLE_IDENTIFIER: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def validate_postgres_identifier(value: str, *, kind: str = "标识符") -> str:
@@ -15,13 +17,13 @@ def validate_postgres_identifier(value: str, *, kind: str = "标识符") -> str:
     @param value 待校验的名称 / Candidate name.
     @param kind 错误信息中使用的名称类别 / Name category used in diagnostics.
     @return 已校验的原始名称 / Validated original name.
-    @raise UnsafeIdentifierError 名称为空、含 NUL 或超过 PostgreSQL 的 63 字节限制时抛出。
-    / Raised when the name is empty, contains NUL, or exceeds PostgreSQL's 63-byte limit.
+    @raise UnsafeIdentifierError 名称不满足跨 migration 一致的可移植白名单时抛出。
+    / Raised when the name violates the portable allow-list shared by migrations.
 
-    @note 允许合法的带引号标识符字符；调用方必须继续通过
-    :func:`quote_postgres_identifier` 输出 SQL。
-    / Valid quoted-identifier characters are allowed; callers must still emit SQL
-    through :func:`quote_postgres_identifier`.
+    @note 即使最终 SQL 仍会双引号引用，也只接受 ASCII 字母、数字与下划线，确保
+    bootstrap、Alembic env 和历史 revision 使用同一契约。
+    / SQL is still quoted, but the portable ASCII allow-list keeps bootstrap, Alembic env,
+    and historical revisions on one identifier contract.
     """
     if not isinstance(value, str):
         raise UnsafeIdentifierError(f"{kind}必须是字符串。")
@@ -29,6 +31,8 @@ def validate_postgres_identifier(value: str, *, kind: str = "标识符") -> str:
         raise UnsafeIdentifierError(f"{kind}不能为空。")
     if "\x00" in value:
         raise UnsafeIdentifierError(f"{kind}不能包含 NUL 字符。")
+    if not _POSTGRES_PORTABLE_IDENTIFIER.fullmatch(value):
+        raise UnsafeIdentifierError(f"{kind}只能包含 ASCII 字母、数字和下划线，且不能以数字开头。")
     if len(value.encode("utf-8")) > _POSTGRES_IDENTIFIER_MAX_BYTES:
         raise UnsafeIdentifierError(
             f"{kind}超过 PostgreSQL {_POSTGRES_IDENTIFIER_MAX_BYTES} 字节标识符限制。"

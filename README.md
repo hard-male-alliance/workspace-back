@@ -125,11 +125,19 @@ uv run dbctl bootstrap
 
 # 3. 以 migrator DSN 显式升级数据库
 uv run dbctl migrate --revision head
+
+# 4. 自动使用 config.jsonc 的 app role 与密码进入 psql；不会再次询问密码
+uv run dbctl shell
+
+# 可选：同样从 config.jsonc 自动选择 migrator 或 dashboard 身份
+uv run dbctl shell --role migrator
 ```
 
 使用非默认位置时，同时传入 `--config <runtime.jsonc>` 与 `--dbinit <dbinit.jsonc>`。`config.jsonc` 属于本机 secret 载体，不应提交；`dbinit.jsonc` 是可审阅、可提交的声明式初始化计划。
 
 可用 `bootstrap --access-mode sudo` 强制 POSIX sudo，或用 `bootstrap --access-mode prompt` 强制跨平台 PostgreSQL 密码提示。prompt 只读取一次不回显密码，临时写入仅供本轮 psql 子进程使用的受限 pgpass 文件，并在执行结束后删除；密码不会进入 argv、`config.jsonc` 或子进程环境变量值。
+
+只有 `bootstrap` 可以创建或补全私密 `config.jsonc`。`migrate`、`shell` 与执行态维护命令只读既有配置；配置缺失时直接失败，绝不会偷偷生成一套尚未写入 PostgreSQL 的新密码。`shell` 为本次 psql 创建权限为 `0600` 的临时 `PGPASSFILE`，强制 `--no-password`，继承真实 TTY，并在 psql 退出后清理文件；配置密码不会进入 argv，也不会被外部 `.pgpass` 或 `PGPASSWORD` 覆盖。
 
 首次运行和每次发布都应在受控变更窗口检查 migration revision。`bootstrap` 不能替代 migration；反过来，migration 也不创建缺失的数据库角色。
 

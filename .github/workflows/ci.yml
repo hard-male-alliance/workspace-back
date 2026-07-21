@@ -28,7 +28,7 @@ jobs:
         run: uv sync --locked --extra dev
 
       - name: Lint
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests alembic
 
       - name: Type-check production packages
         run: uv run mypy
@@ -51,6 +51,7 @@ jobs:
     env:
       AIWS_MIGRATOR_DATABASE_DSN: postgresql://workspace_migrator:ci_migrator_password@127.0.0.1:5432/ai_job_workspace
       AIWS_TEST_POSTGRES_DSN: postgresql://workspace_app:ci_app_password@127.0.0.1:5432/ai_job_workspace
+      AIWS_DASHBOARD_DATABASE_DSN: postgresql://workspace_dashboard:ci_dashboard_password@127.0.0.1:5432/ai_job_workspace
     services:
       postgres:
         image: pgvector/pgvector:0.8.2-pg17-bookworm
@@ -116,19 +117,23 @@ jobs:
       - name: Apply all database migrations
         run: |
           uv run python - <<'PY'
+          import json
           import os
           from pathlib import Path
 
-          from dbctl.migration import AlembicMigrationRunner
+          import json5
 
-          AlembicMigrationRunner(
+          root = json5.loads(Path("example.jsonc").read_text(encoding="utf-8"))
+          root["database"].update(
+              application_dsn=os.environ["AIWS_TEST_POSTGRES_DSN"],
               migrator_dsn=os.environ["AIWS_MIGRATOR_DATABASE_DSN"],
-              script_location=Path("alembic"),
-              owner_role="workspace_owner",
-              app_role="workspace_app",
-              dashboard_role="workspace_dashboard",
-          ).upgrade("head")
+              dashboard_dsn=os.environ["AIWS_DASHBOARD_DATABASE_DSN"],
+          )
+          config_path = Path("config.jsonc")
+          config_path.write_text(json.dumps(root), encoding="utf-8")
+          config_path.chmod(0o600)
           PY
+          uv run dbctl --config config.jsonc --dbinit dbinit.jsonc migrate
 
       - name: Verify PostgreSQL and pgvector prerequisites
         run: |

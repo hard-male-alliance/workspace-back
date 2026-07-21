@@ -98,7 +98,7 @@ with alembic_script_location() as scripts:
     assert (scripts / 'env.py').is_file()
     assert (scripts / 'versions' / '20260721_0006_observability_signal_envelope.py').is_file()
 
-settings = DbctlConfigurationService().load()
+settings = DbctlConfigurationService().initialize()
 assert settings.administration.database_name == 'ai_job_workspace'
 assert Path('config.jsonc').is_file()
 backend_settings = BackendSettings.from_file(Path('config.jsonc'))
@@ -134,7 +134,7 @@ def test_explicit_missing_paths_do_not_fall_back_to_packaged_defaults(tmp_path: 
         (PROJECT_ROOT / "dbinit.jsonc").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
-    with pytest.raises(DbctlConfigurationError, match=r"config\.jsonc 不存在"):
+    with pytest.raises(DbctlConfigurationError, match=r"配置文件不存在"):
         DbctlConfigurationService(explicit_config, explicit_dbinit).load()
     assert not explicit_config.exists()
 

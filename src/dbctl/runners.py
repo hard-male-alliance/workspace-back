@@ -7,12 +7,12 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 from collections.abc import Callable, Mapping
 from enum import StrEnum
 from pathlib import Path
 
 from .bootstrap import ExecutionTarget, SqlStatement
+from .credentials import create_pgpass_file
 from .errors import BootstrapExecutionError, DatabaseAlreadyExistsError, DbctlConfigurationError
 from .identifiers import quote_postgres_literal, validate_postgres_identifier
 
@@ -245,34 +245,13 @@ class LocalPsqlBootstrapRunner:
         )
         if not isinstance(password, str) or not password or "\x00" in password:
             raise DbctlConfigurationError("bootstrap 管理角色密码不能为空或包含 NUL。")
-        escaped_user = _escape_pgpass_field(self._bootstrap_database_user)
-        escaped_password = _escape_pgpass_field(password)
-        path: Path | None = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
+            path = create_pgpass_file(
+                self._bootstrap_database_user,
+                password,
                 prefix="dbctl-pgpass-",
-                delete=False,
-            ) as password_file:
-                password_file.write(f"*:*:*:{escaped_user}:{escaped_password}\n")
-                path = Path(password_file.name)
-            path.chmod(0o600)
+            )
         except OSError as error:
-            if path is not None:
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
             raise BootstrapExecutionError("无法创建临时 PostgreSQL 密码文件。") from error
         self._password_file = path
         return path
-
-
-def _escape_pgpass_field(value: str) -> str:
-    """@brief 转义 pgpass 字段 / Escape one pgpass field.
-
-    @param value 用户名或密码 / User name or password.
-    @return 已转义的 pgpass 字段 / Escaped pgpass field.
-    """
-    return value.replace("\\", "\\\\").replace(":", "\\:")

@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
-from .config import DatabaseAdministrationSettings, DatabaseRole
+from .config import DatabaseAdministrationSettings
+from .domain import DatabaseRole
 from .errors import DatabaseAlreadyExistsError, DbctlConfigurationError
 from .identifiers import quote_postgres_identifier, quote_postgres_literal
 
@@ -89,6 +90,7 @@ class SqlStatement:
         @raise DbctlConfigurationError 字面量渲染器返回非文本时抛出。
         / Raised when the literal renderer returns non-text.
         """
+
         def render(parameter: str) -> str:
             literal = literal_renderer(parameter)
             if not isinstance(literal, str):
@@ -142,7 +144,9 @@ class BootstrapPlan:
         yield from (
             (ExecutionTarget.MAINTENANCE, statement) for statement in self.pre_database_statements
         )
-        yield from ((ExecutionTarget.MAINTENANCE, statement) for statement in self.maintenance_statements)
+        yield from (
+            (ExecutionTarget.MAINTENANCE, statement) for statement in self.maintenance_statements
+        )
         yield from ((ExecutionTarget.DATABASE, statement) for statement in self.database_statements)
 
     def render_dry_run(self) -> str:
@@ -285,7 +289,6 @@ class BootstrapPlanBuilder:
         )
 
 
-@runtime_checkable
 class BootstrapRunner(Protocol):
     """@brief bootstrap 执行端口 / Bootstrap execution port.
 
@@ -565,8 +568,7 @@ def _database_privilege_statements(
                 SqlStatement(
                     label=f"授予 app 对 schema {schema_name} 序列的必要权限",
                     sql=(
-                        f"GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA {schema} "
-                        f"TO {app};"
+                        f"GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA {schema} TO {app};"
                     ),
                 ),
                 SqlStatement(
@@ -621,15 +623,9 @@ def _conditional_relation_grant_statement(
             "        FROM pg_catalog.pg_class AS relation\n"
             "        JOIN pg_catalog.pg_namespace AS namespace\n"
             "          ON namespace.oid = relation.relnamespace\n"
-            "        WHERE namespace.nspname = "
-            + quote_postgres_literal(schema_name)
-            + "\n"
-            "          AND relation.relname = "
-            + quote_postgres_literal(relation_name)
-            + "\n"
-            "          AND relation.relkind IN ("
-            + allowed_kinds
-            + ")\n"
+            "        WHERE namespace.nspname = " + quote_postgres_literal(schema_name) + "\n"
+            "          AND relation.relname = " + quote_postgres_literal(relation_name) + "\n"
+            "          AND relation.relkind IN (" + allowed_kinds + ")\n"
             "    ) THEN\n"
             f"        GRANT {privileges} ON TABLE {schema}.{relation} TO {role_identifier};\n"
             "    END IF;\n"

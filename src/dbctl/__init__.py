@@ -13,10 +13,10 @@ from .composition import DbctlComposition
 from .config import (
     DatabaseAdministrationSettings,
     DatabaseConnectionSettings,
-    DatabaseRole,
     DbctlConfigurationService,
     DbctlSettings,
 )
+from .domain import DatabaseLogin, DatabaseRole, LoginRole
 from .errors import (
     BootstrapExecutionError,
     DatabaseAlreadyExistsError,
@@ -34,10 +34,8 @@ from .identifiers import (
 from .migration import AlembicMigrationRunner
 from .runners import BootstrapAccessMode, LocalPsqlBootstrapRunner
 from .shell import (
-    PasswordPolicy,
     PreparedPsqlCommand,
     PsqlShellLauncher,
-    ShellCredentialStrategy,
 )
 
 __all__ = [
@@ -52,6 +50,7 @@ __all__ = [
     "DatabaseAdministrationSettings",
     "DatabaseAlreadyExistsError",
     "DatabaseConnectionSettings",
+    "DatabaseLogin",
     "DatabaseRole",
     "DbctlComposition",
     "DbctlConfigurationError",
@@ -61,11 +60,10 @@ __all__ = [
     "DbctlSettings",
     "ExecutionTarget",
     "LocalPsqlBootstrapRunner",
+    "LoginRole",
     "MigrationExecutionError",
-    "PasswordPolicy",
     "PreparedPsqlCommand",
     "PsqlShellLauncher",
-    "ShellCredentialStrategy",
     "SqlStatement",
     "UnsafeIdentifierError",
     "quote_postgres_identifier",

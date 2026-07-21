@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .composition import DbctlComposition
-from .config import DatabaseRole
+from .domain import LoginRole
 from .errors import DbctlError
 from .retention import (
     DEFAULT_TELEMETRY_PRUNE_BATCH_SIZE,
@@ -21,15 +21,14 @@ from .retention import (
     MAX_TELEMETRY_PRUNE_STATEMENT_TIMEOUT_MS,
 )
 from .runners import BootstrapAccessMode
-from .shell import PasswordPolicy
 
 
 def build_parser() -> argparse.ArgumentParser:
     """@brief 创建 dbctl 参数解析器 / Create the dbctl argument parser.
 
     @return 已配置的 argparse parser / Configured argparse parser.
-    @note CLI 不接受 DSN 或密码参数；所有敏感配置均从环境变量读取。
-    / The CLI accepts no DSN or password argument; all sensitive configuration is read from environment variables.
+    @note CLI 不接受 DSN 或密码参数；登录身份只从 config.jsonc 读取。
+    / The CLI accepts no DSN or password argument; login identities come only from config.jsonc.
     """
     parser = argparse.ArgumentParser(
         prog="dbctl",
@@ -136,24 +135,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     shell = subparsers.add_parser(
         "shell",
-        help="直接 exec 到以合适登录身份连接的 psql。",
+        help="使用 config.jsonc 中所选登录身份启动 psql，不交互询问数据库密码。",
     )
     _add_subcommand_config_override(shell)
     _add_subcommand_dbinit_override(shell)
     shell.add_argument(
         "--role",
-        choices=(DatabaseRole.APP.value, DatabaseRole.MIGRATOR.value, DatabaseRole.DASHBOARD.value),
-        default=DatabaseRole.APP.value,
+        choices=tuple(role.value for role in LoginRole),
+        default=LoginRole.APP.value,
         help="psql 身份（默认：app）。owner 是 NOLOGIN，故不可选。",
-    )
-    shell.add_argument(
-        "--password-source",
-        choices=tuple(policy.value for policy in PasswordPolicy),
-        default=PasswordPolicy.AUTO.value,
-        help=(
-            "认证策略：auto 优先 .pgpass 后提示；pgpass 强制 .pgpass；"
-            "prompt 强制提示；environment 仅在显式请求时使用 PGPASSWORD。"
-        ),
     )
     return parser
 
@@ -165,8 +155,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     / Optional argument sequence; reads process command line when ``None``.
     @return 成功为 ``0``，可展示配置/执行错误为 ``2``。
     / ``0`` on success and ``2`` for displayable configuration/execution errors.
-    @note ``shell`` 成功时会由 ``os.execvp`` 替换进程，通常不会返回。
-    / On success ``shell`` replaces the process through ``os.execvp`` and normally does not return.
+    @note ``shell`` 继承当前 TTY，返回真实 psql 退出码并清理临时凭证文件。
+    / ``shell`` inherits the current TTY, returns psql's exit status, and cleans temporary credentials.
     """
     parser = build_parser()
     arguments = parser.parse_args(argv)
@@ -174,6 +164,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         composition = DbctlComposition.from_config_path(
             arguments.config,
             dbinit_path=arguments.dbinit,
+            initialize_config=arguments.command == "bootstrap",
         )
         if arguments.command == "bootstrap":
             plan = composition.build_bootstrap_plan()
@@ -193,12 +184,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if arguments.command == "shell":
             prepared = composition.prepare_shell(
-                DatabaseRole(arguments.role),
-                password_policy=PasswordPolicy(arguments.password_source),
+                LoginRole(arguments.role),
             )
             print(f"dbctl shell：{prepared.policy_message()}", file=sys.stderr)
-            composition.exec_prepared_shell(prepared)
-            return 0
+            return composition.run_prepared_shell(prepared)
         if arguments.command == "migrate":
             composition.execute_migration(arguments.revision)
             print(f"dbctl migrate 完成：已升级至 {arguments.revision}。")

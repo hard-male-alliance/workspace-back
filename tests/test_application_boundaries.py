@@ -55,6 +55,23 @@ def test_executable_application_packages_never_import_each_other(package: str) -
     assert not violations, "跨可执行应用 import 破坏模块边界：\n" + "\n".join(violations)
 
 
+def test_packaged_alembic_runtime_never_imports_executable_applications() -> None:
+    """@brief dbctl 的 Alembic 资源不得反向导入应用 / Alembic runtime stays app-independent.
+
+    @return 无返回值 / No return value.
+    @note migration upgrade 使用显式 revision，不需要 backend ORM metadata；开发期 autogenerate
+    应使用单独入口，不能把安装态 dbctl 与 backend infrastructure 粘合。
+    / Explicit revisions need no backend ORM metadata. Development autogenerate belongs in a separate
+    authoring entry point and must not couple installed dbctl runtime to backend infrastructure.
+    """
+    violations: list[str] = []
+    for source in (_PROJECT_ROOT / "alembic").rglob("*.py"):
+        foreign_imports = _imported_application_packages(source)
+        if foreign_imports:
+            violations.append(f"{source.relative_to(_PROJECT_ROOT)} -> {sorted(foreign_imports)}")
+    assert not violations, "Alembic runtime 反向依赖 executable app：\n" + "\n".join(violations)
+
+
 def test_backend_domain_never_imports_infrastructure() -> None:
     """@brief 领域层不得倒置依赖基础设施 / Domain layer must never depend on infrastructure.
 
@@ -69,11 +86,15 @@ def test_backend_domain_never_imports_infrastructure() -> None:
     for source in domain_root.rglob("*.py"):
         tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.level == 0 and (
-                node.module == "backend.infrastructure"
-                or (
-                    isinstance(node.module, str)
-                    and node.module.startswith("backend.infrastructure.")
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.level == 0
+                and (
+                    node.module == "backend.infrastructure"
+                    or (
+                        isinstance(node.module, str)
+                        and node.module.startswith("backend.infrastructure.")
+                    )
                 )
             ):
                 violations.append(f"{source.relative_to(_PROJECT_ROOT)} -> {node.module}")
@@ -109,9 +130,7 @@ def test_backend_application_never_imports_infrastructure() -> None:
                     if alias.name == "backend.infrastructure" or alias.name.startswith(
                         "backend.infrastructure."
                     ):
-                        violations.append(
-                            f"{source.relative_to(_PROJECT_ROOT)} -> {alias.name}"
-                        )
+                        violations.append(f"{source.relative_to(_PROJECT_ROOT)} -> {alias.name}")
                 continue
             if imported == "backend.infrastructure" or (
                 isinstance(imported, str) and imported.startswith("backend.infrastructure.")
@@ -160,9 +179,7 @@ def test_dashboard_core_layers_only_depend_inward(
                 for alias in node.names:
                     root_name = alias.name.partition(".")[0]
                     if root_name in forbidden_libraries:
-                        violations.append(
-                            f"{source.relative_to(_PROJECT_ROOT)} -> {alias.name}"
-                        )
+                        violations.append(f"{source.relative_to(_PROJECT_ROOT)} -> {alias.name}")
                 continue
             if not imported:
                 continue

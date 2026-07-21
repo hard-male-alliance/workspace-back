@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -168,7 +169,9 @@ class FailingConnection:
         @param __ 绑定参数 / Bound parameters.
         @return 永不返回 / Never returns.
         """
-        raise RuntimeError("postgresql://workspace_migrator:password-sentinel@unsafe.example/secret")
+        raise RuntimeError(
+            "postgresql://workspace_migrator:password-sentinel@unsafe.example/secret"
+        )
 
     def close(self) -> None:
         """@brief 模拟关闭 / Simulate close.
@@ -239,9 +242,7 @@ def test_apply_uses_bounded_batches_and_reports_remaining_state() -> None:
     assert result.has_more is True
     assert result.reached_batch_limit is False
     assert all(call[1:] == (3, 1_234, 500) for call in runner.delete_calls)
-    assert runner.probe_calls == [
-        (datetime(2026, 7, 8, 12, 0, tzinfo=UTC), 1_234, 500)
-    ]
+    assert runner.probe_calls == [(datetime(2026, 7, 8, 12, 0, tzinfo=UTC), 1_234, 500)]
     assert "删除 7 条；仍有过期记录" in result.render_operator_summary()
 
 
@@ -337,18 +338,31 @@ def test_psycopg_runner_hides_driver_secret_and_raw_error(
 
 def test_composition_consumes_root_retention_and_cli_defaults_to_dry_run(
     capsys: pytest.CaptureFixture[str],
+    dbctl_config_path: Path,
 ) -> None:
     """@brief composition 从根配置读取 retention_days，CLI 默认不需要 migrator DSN / Composition reads root retention_days and CLI default needs no migrator DSN.
 
     @param capsys pytest 标准流捕获夹具 / pytest standard-stream capture fixture.
     """
 
-    composition = DbctlComposition.from_config_path(PROJECT_ROOT / "config.jsonc", environ={})
+    composition = DbctlComposition.from_config_path(
+        dbctl_config_path,
+        dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
+        environ={},
+    )
     result = composition.prune_telemetry()
     assert result.retention_days == 30
     assert result.applied is False
 
-    exit_code = main(["--config", str(PROJECT_ROOT / "config.jsonc"), "prune-telemetry"])
+    exit_code = main(
+        [
+            "--config",
+            str(dbctl_config_path),
+            "--dbinit",
+            str(PROJECT_ROOT / "dbinit.jsonc"),
+            "prune-telemetry",
+        ]
+    )
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "dry-run" in captured.out
@@ -358,6 +372,7 @@ def test_composition_consumes_root_retention_and_cli_defaults_to_dry_run(
 def test_cli_apply_is_the_only_deletion_opt_in(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    dbctl_config_path: Path,
 ) -> None:
     """@brief CLI 只有 --apply 才应向 composition 传递删除授权 / Only --apply must authorize deletion in CLI composition.
 
@@ -405,7 +420,9 @@ def test_cli_apply_is_the_only_deletion_opt_in(
     exit_code = main(
         [
             "--config",
-            str(PROJECT_ROOT / "config.jsonc"),
+            str(dbctl_config_path),
+            "--dbinit",
+            str(PROJECT_ROOT / "dbinit.jsonc"),
             "prune-telemetry",
             "--apply",
             "--batch-size",
