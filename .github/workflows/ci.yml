@@ -42,8 +42,7 @@ jobs:
       - name: Run tests that do not require PostgreSQL
         run: >-
           uv run pytest
-          --ignore=tests/test_postgres_knowledge_vector.py
-          --ignore=tests/test_postgres_render_job_link.py
+          --ignore-glob=tests/test_postgres_*.py
 
   postgres:
     name: PostgreSQL 17 and pgvector integration tests
@@ -139,7 +138,28 @@ jobs:
             --command "TABLE identity.alembic_version;"
 
       - name: Run live PostgreSQL integration tests
+        run: uv run pytest tests/test_postgres_*.py
+
+  container:
+    name: Build deployment image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository and pinned submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Validate Compose model
+        run: docker compose --env-file .env.docker.example config --quiet
+
+      - name: Build production image
+        run: docker build --tag ai-job-workspace-backend:ci .
+
+      - name: Verify non-root runtime image
         run: >-
-          uv run pytest
-          tests/test_postgres_knowledge_vector.py
-          tests/test_postgres_render_job_link.py
+          docker run --rm
+          --entrypoint python
+          ai-job-workspace-backend:ci
+          -c
+          "import os; assert os.getuid() == 10001; import backend, dashboard, dbctl"
