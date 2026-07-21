@@ -62,7 +62,7 @@ def _source_contract() -> Path | None:
         return None
     if not (repository_root / "src" / "backend" / "__init__.py").is_file():
         return None
-    return repository_root / "contract" / _CONTRACT_SCHEMA
+    return repository_root / "workspace-shared-docs" / "contracts" / "v1" / _CONTRACT_SCHEMA
 
 
 __all__ = ["read_contract_schema_text"]

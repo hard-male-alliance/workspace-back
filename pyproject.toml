@@ -57,7 +57,7 @@ packages = ["src/backend", "src/dashboard", "src/dbctl", "src/workspace_shared"]
 "alembic" = "dbctl/resources/alembic"
 "example.jsonc" = "dbctl/resources/example.jsonc"
 "dbinit.jsonc" = "dbctl/resources/dbinit.jsonc"
-"contract/ai-job-workspace.contract.schema.json" = "backend/resources/ai-job-workspace.contract.schema.json"
+"workspace-shared-docs/contracts/v1/ai-job-workspace.contract.schema.json" = "backend/resources/ai-job-workspace.contract.schema.json"
 
 [tool.pytest.ini_options]
 addopts = "-ra"
