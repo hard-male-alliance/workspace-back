@@ -89,7 +89,7 @@ VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
 
 `source_ids` 留空时后端可使用当前 Resume 自动关联的 KnowledgeSource。完整 Operation、Render 和 Proposal decision 字段以
-`contract/ai-job-workspace.contract.schema.json` 为准，不要由 UI 文案反推请求结构。
+以 `workspace-shared-docs/contracts/v1/ai-job-workspace.contract.schema.json` 为准，不要由 UI 文案反推请求结构。
 
 ## 4. 前端必须修改的部分
 

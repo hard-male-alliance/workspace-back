@@ -20,13 +20,16 @@ from backend.infrastructure.contracts import ContractValidator
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 """@brief 项目根目录 / Repository root directory."""
 
-CONTRACT_SCHEMA_PATH = PROJECT_ROOT / "contract" / "ai-job-workspace.contract.schema.json"
+CONTRACT_DIRECTORY = PROJECT_ROOT / "workspace-shared-docs" / "contracts" / "v1"
+"""@brief 共享契约 submodule 中的 v1 目录 / V1 directory in the shared-contract submodule."""
+
+CONTRACT_SCHEMA_PATH = CONTRACT_DIRECTORY / "ai-job-workspace.contract.schema.json"
 """@brief 严格 JSON Schema 的权威路径 / Authoritative strict JSON Schema path."""
 
-CONTRACT_SCHEMA_JSONC_PATH = PROJECT_ROOT / "contract" / "ai-job-workspace.contract.schema.jsonc"
+CONTRACT_SCHEMA_JSONC_PATH = CONTRACT_DIRECTORY / "ai-job-workspace.contract.schema.jsonc"
 """@brief 带注释 Schema 源文件路径 / Comment-bearing schema source path."""
 
-CONTRACT_EXAMPLES_PATH = PROJECT_ROOT / "contract" / "ai-job-workspace.contract.examples.jsonc"
+CONTRACT_EXAMPLES_PATH = CONTRACT_DIRECTORY / "ai-job-workspace.contract.examples.jsonc"
 """@brief 已发布 JSONC 示例路径 / Published JSONC examples path."""
 
 
