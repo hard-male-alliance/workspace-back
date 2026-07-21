@@ -4,15 +4,142 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  quality:
+    name: Static checks and unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --locked --extra dev
-      - run: uv run ruff check src tests
-      - run: uv run mypy src tests
-      - run: uv run mypy alembic
-      - run: uv run python -m compileall -q src tests alembic
-      - run: uv run pytest
+      - name: Check out repository and pinned submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          version: "0.11.25"
+          enable-cache: true
+
+      - name: Install locked development dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Type-check production packages
+        run: uv run mypy
+
+      - name: Type-check migrations
+        run: uv run mypy alembic
+
+      - name: Compile Python sources
+        run: uv run python -m compileall -q src tests alembic
+
+      - name: Run tests that do not require PostgreSQL
+        run: >-
+          uv run pytest
+          --ignore=tests/test_postgres_knowledge_vector.py
+          --ignore=tests/test_postgres_render_job_link.py
+
+  postgres:
+    name: PostgreSQL 17 and pgvector integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AIWS_MIGRATOR_DATABASE_DSN: postgresql://workspace_migrator:ci_migrator_password@127.0.0.1:5432/ai_job_workspace
+      AIWS_TEST_POSTGRES_DSN: postgresql://workspace_app:ci_app_password@127.0.0.1:5432/ai_job_workspace
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg17-bookworm
+        env:
+          POSTGRES_DB: ai_job_workspace
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_admin_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_job_workspace"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Check out repository and pinned submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          version: "0.11.25"
+          enable-cache: true
+
+      - name: Install locked development dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Create least-privilege CI database roles
+        run: |
+          docker exec --interactive "${{ job.services.postgres.id }}" \
+            psql --set ON_ERROR_STOP=1 --username postgres --dbname postgres <<'SQL'
+          CREATE ROLE workspace_owner
+            NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+          CREATE ROLE workspace_migrator
+            LOGIN PASSWORD 'ci_migrator_password'
+            NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+          CREATE ROLE workspace_app
+            LOGIN PASSWORD 'ci_app_password'
+            NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+          CREATE ROLE workspace_dashboard
+            LOGIN PASSWORD 'ci_dashboard_password'
+            NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+          GRANT workspace_owner TO workspace_migrator;
+          ALTER DATABASE ai_job_workspace OWNER TO workspace_owner;
+          REVOKE ALL ON DATABASE ai_job_workspace FROM PUBLIC;
+          REVOKE CREATE, TEMPORARY ON DATABASE ai_job_workspace
+            FROM workspace_migrator, workspace_app, workspace_dashboard;
+          GRANT CONNECT ON DATABASE ai_job_workspace
+            TO workspace_migrator, workspace_app, workspace_dashboard;
+          SQL
+
+          docker exec --interactive "${{ job.services.postgres.id }}" \
+            psql --set ON_ERROR_STOP=1 --username postgres --dbname ai_job_workspace <<'SQL'
+          CREATE EXTENSION IF NOT EXISTS vector;
+          REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+          REVOKE ALL ON SCHEMA public
+            FROM workspace_migrator, workspace_app, workspace_dashboard;
+          SQL
+
+      - name: Apply all database migrations
+        run: |
+          uv run python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from dbctl.migration import AlembicMigrationRunner
+
+          AlembicMigrationRunner(
+              migrator_dsn=os.environ["AIWS_MIGRATOR_DATABASE_DSN"],
+              script_location=Path("alembic"),
+              owner_role="workspace_owner",
+              app_role="workspace_app",
+              dashboard_role="workspace_dashboard",
+          ).upgrade("head")
+          PY
+
+      - name: Verify PostgreSQL and pgvector prerequisites
+        run: |
+          docker exec "${{ job.services.postgres.id }}" \
+            psql --set ON_ERROR_STOP=1 --username postgres --dbname ai_job_workspace \
+            --command "SELECT extversion AS pgvector_version FROM pg_extension WHERE extname = 'vector';" \
+            --command "TABLE identity.alembic_version;"
+
+      - name: Run live PostgreSQL integration tests
+        run: >-
+          uv run pytest
+          tests/test_postgres_knowledge_vector.py
+          tests/test_postgres_render_job_link.py
