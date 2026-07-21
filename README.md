@@ -34,6 +34,43 @@ uv run pytest
 本地默认值使用确定性的内存 repository、mock 模型和仅开发/测试允许的 `X-Mock-*` 租户头。它们不需要 PostgreSQL 或外部模型密钥，也绝不能用于 staging/production。
 `backend` 默认读取当前工作目录的 `config.jsonc`，也可用 `--config` 或 `AIWS_CONFIG` 覆盖；日志与知识库 blob 的相对路径统一以该配置文件所在目录为基准，因此 wheel 安装态不会把运行数据误写进虚拟环境。
 
+## Docker 部署
+
+仓库根目录提供多阶段、非 root 的生产镜像和完整 Compose 拓扑。默认配置用于本机联调：业务数据持久化到 PostgreSQL 17/pgvector，AI、embedding、身份和简历 renderer 仍使用明确的 development mock；它不是可直接暴露公网的生产身份系统。
+
+```bash
+cp .env.docker.example .env
+docker compose up --build --detach
+docker compose ps
+curl --fail http://127.0.0.1:8000/_internal/healthz
+```
+
+Compose 首次创建空 PostgreSQL volume 时建立 `workspace_owner`、`workspace_migrator`、`workspace_app`、`workspace_dashboard` 四个隔离角色并启用 pgvector。`migrate` 是一次性服务：数据库健康后显式执行 Alembic，只有成功退出后 backend 才启动。后端不会在自身启动路径迁移数据库。应用镜像以 UID/GID `10001`、只读根文件系统、全部 capability 被移除的方式运行；只有 `/tmp` tmpfs 与 `application_data` 持久卷可写。backend 和可选 Dashboard 只发布到宿主 loopback。
+
+可选启动只读 Dashboard API：
+
+```bash
+docker compose --profile dashboard up --build --detach
+curl --fail http://127.0.0.1:8010/dashboard/v1/healthz
+```
+
+查看一次性 migration 或服务日志：
+
+```bash
+docker compose logs migrate
+docker compose logs --follow backend
+```
+
+生产部署前必须至少完成这些修改：
+
+1. 将 `.env` 中五个示例密码/token 全部替换为互不相同的随机值；数据库角色密码只在**空 volume 首次初始化**时生效，已有 volume 的凭证轮换必须走显式数据库运维流程。
+2. 设置 `AIWS_ENVIRONMENT=production`、`AIWS_IDENTITY_MODE=trusted_proxy_hmac`、至少 32 bytes 的 `AIWS_TRUSTED_PROXY_HMAC_SECRET` 与真实 `AIWS_PUBLIC_BASE_URL`。
+3. 在宿主 loopback 端口前部署能够认证用户、判定 workspace membership/role 并签发 HMAC 断言的 identity proxy；仓库中的 Nginx 示例本身不提供认证。
+4. 非 mock 模型需设置 `AIWS_AI_PROVIDER`、`AIWS_AI_MODEL`、HTTPS `AIWS_AI_BASE_URL`、`AIWS_AI_DATA_REGION` 和 `AIWS_LLM_API_KEY`。
+5. 基础镜像不安装 TeX Live/bubblewrap，故默认 renderer 为 mock。真实 XeLaTeX 必须使用经审阅的派生镜像与可工作的 OS sandbox，不能通过赋予 backend 广泛容器权限来绕过 fail-closed。
+
+需要完全自定义配置时，可挂载只读 JSONC，并设置 `AIWS_CONFIG_MODE=mounted` 与 `AIWS_CONFIG`；入口仍会从 wheel 写出无密钥 `dbinit.jsonc` 供 migration 使用。不要把生产 secret 烘焙进镜像层或提交到仓库。
+
 ## 生产前置条件
 
 1. 将部署配置设为 `"environment": "production"`、`"database.mode": "postgresql"`，并将 `security.identity_mode` 设为 `"trusted_proxy_hmac"`。生产/预发布环境缺少 `security`，或仍使用 `development_mock` 时，后端会拒绝加载配置。

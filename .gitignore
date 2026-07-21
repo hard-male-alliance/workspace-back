@@ -1,5 +1,8 @@
 # @brief 忽略本地生成物 / Ignore local build artefacts.
 /config.jsonc
+.env
+.env.*
+!.env.docker.example
 .venv/
 .pytest_cache/
 .ruff_cache/
