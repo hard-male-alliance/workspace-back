@@ -12,8 +12,8 @@ import pytest
 
 from backend.config import BackendSettings
 from dashboard.infrastructure.config import DashboardSettings
-from dbctl.cli import main as dbctl_main
-from dbctl.container_entrypoint import build_runtime_config, write_runtime_config
+from dbctl.infrastructure.runtime_projection import build_runtime_config, write_runtime_config
+from dbctl.interfaces.cli import main as dbctl_main
 from workspace_shared.jsonc import ConfigurationError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

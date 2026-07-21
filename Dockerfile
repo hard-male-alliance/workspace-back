@@ -55,7 +55,7 @@ USER 10001:10001
 
 EXPOSE 8000 8010
 
-ENTRYPOINT ["python", "-m", "dbctl.container_entrypoint"]
+ENTRYPOINT ["python", "-m", "dbctl.interfaces.container"]
 CMD ["backend"]
 
 STOPSIGNAL SIGTERM

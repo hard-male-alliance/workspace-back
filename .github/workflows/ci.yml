@@ -14,14 +14,16 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository and pinned submodules
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           version: "0.11.25"
+          python-version: "3.14.6"
           enable-cache: true
 
       - name: Install locked development dependencies
@@ -39,18 +41,15 @@ jobs:
       - name: Compile Python sources
         run: uv run python -m compileall -q src tests alembic
 
-      - name: Run tests that do not require PostgreSQL
-        run: >-
-          uv run pytest
-          --ignore-glob=tests/test_postgres_*.py
+      - name: Run test suite
+        run: uv run pytest
 
   postgres:
-    name: PostgreSQL 17 and pgvector integration tests
+    name: PostgreSQL 17 migration verification
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       AIWS_MIGRATOR_DATABASE_DSN: postgresql://workspace_migrator:ci_migrator_password@127.0.0.1:5432/ai_job_workspace
-      AIWS_TEST_POSTGRES_DSN: postgresql://workspace_app:ci_app_password@127.0.0.1:5432/ai_job_workspace
       AIWS_DASHBOARD_DATABASE_DSN: postgresql://workspace_dashboard:ci_dashboard_password@127.0.0.1:5432/ai_job_workspace
     services:
       postgres:
@@ -69,18 +68,20 @@ jobs:
 
     steps:
       - name: Check out repository and pinned submodules
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           version: "0.11.25"
+          python-version: "3.14.6"
           enable-cache: true
 
-      - name: Install locked development dependencies
-        run: uv sync --locked --extra dev
+      - name: Install locked runtime dependencies
+        run: uv sync --locked
 
       - name: Create least-privilege CI database roles
         run: |
@@ -97,7 +98,8 @@ jobs:
           CREATE ROLE workspace_dashboard
             LOGIN PASSWORD 'ci_dashboard_password'
             NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-          GRANT workspace_owner TO workspace_migrator;
+          GRANT workspace_owner TO workspace_migrator
+            WITH INHERIT FALSE, SET TRUE, ADMIN FALSE;
           ALTER DATABASE ai_job_workspace OWNER TO workspace_owner;
           REVOKE ALL ON DATABASE ai_job_workspace FROM PUBLIC;
           REVOKE CREATE, TEMPORARY ON DATABASE ai_job_workspace
@@ -125,7 +127,7 @@ jobs:
 
           root = json5.loads(Path("example.jsonc").read_text(encoding="utf-8"))
           root["database"].update(
-              application_dsn=os.environ["AIWS_TEST_POSTGRES_DSN"],
+              application_dsn="postgresql://workspace_app:ci_app_password@127.0.0.1:5432/ai_job_workspace",
               migrator_dsn=os.environ["AIWS_MIGRATOR_DATABASE_DSN"],
               dashboard_dsn=os.environ["AIWS_DASHBOARD_DATABASE_DSN"],
           )
@@ -142,18 +144,16 @@ jobs:
             --command "SELECT extversion AS pgvector_version FROM pg_extension WHERE extname = 'vector';" \
             --command "TABLE identity.alembic_version;"
 
-      - name: Run live PostgreSQL integration tests
-        run: uv run pytest tests/test_postgres_*.py
-
   container:
     name: Build deployment image
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Check out repository and pinned submodules
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Validate Compose model
         run: >-

@@ -1,12 +1,9 @@
-"""@brief Docker 运行配置投影与进程入口 / Docker runtime-config projection and process entrypoint."""
+"""@brief Docker 运行配置投影基础设施 / Docker runtime-configuration projection infrastructure."""
 
 from __future__ import annotations
 
 import json
-import os
-import sys
-import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Final
 
@@ -14,25 +11,25 @@ import json5
 
 from workspace_shared.jsonc import ConfigurationError, require_mapping
 
-_DEFAULT_SOURCE_CONFIG_PATH: Final[Path] = Path("/var/lib/aiws-config/config.jsonc")
-"""@brief dbctl 持久配置默认路径 / Default path of the persistent dbctl-owned configuration."""
+from .private_files import atomic_write_private_text
 
-_DEFAULT_RUNTIME_CONFIG_PATH: Final[Path] = Path("/tmp/aiws/config.jsonc")
-"""@brief 容器运行副本默认路径 / Default path of the container runtime projection."""
+_PRIVATE_DIRECTORY_MODE: Final[int] = 0o700
+"""@brief 运行投影父目录的创建权限 / Creation mode for the runtime projection directory."""
 
 
 def build_runtime_config(
     source_config_path: Path,
     environ: Mapping[str, str],
 ) -> dict[str, Any]:
-    """@brief 从 dbctl 配置投影容器运行设置 / Project container settings from the dbctl-owned config.
+    """@brief 从 dbctl 配置投影容器运行设置 / Project container settings from dbctl configuration.
 
     @param source_config_path 已由 dbctl bootstrap 创建的持久配置。
     / Persistent configuration created by dbctl bootstrap.
-    @param environ 容器非数据库状态的环境覆盖 / Environment overrides for non-database container state.
-    @return 保留 dbctl DSN、适配容器边界的配置 / Config preserving dbctl DSNs and adapting container boundaries.
+    @param environ 容器非数据库状态的环境覆盖 / Environment overrides for non-database state.
+    @return 保留 dbctl DSN、适配容器边界的配置。
+    / Configuration preserving dbctl DSNs while adapting container boundaries.
     @raise ConfigurationError 源配置缺失、无效或生产 secret 缺失时抛出。
-    / Raised when the source config is absent or invalid, or a production secret is missing.
+    / Raised when the source configuration is missing or invalid, or a production secret is absent.
     """
 
     if not source_config_path.is_file():
@@ -134,45 +131,25 @@ def write_runtime_config(
     """@brief 原子写入临时运行投影 / Atomically write the ephemeral runtime projection.
 
     @param source_config_path dbctl 持久配置 / Persistent dbctl-owned configuration.
-    @param runtime_config_path 临时运行配置目标 / Ephemeral runtime-config destination.
+    @param runtime_config_path 临时运行配置目标 / Ephemeral runtime-configuration destination.
     @param environ 非数据库环境覆盖 / Non-database environment overrides.
     @return 无返回值 / No return value.
     """
 
-    payload = json.dumps(
-        build_runtime_config(source_config_path, environ),
-        ensure_ascii=False,
-        indent=2,
-    ) + "\n"
-    _atomic_write(runtime_config_path, payload, 0o600)
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """@brief 投影配置后以目标进程替换入口 / Project config and replace the entrypoint with the target process.
-
-    @param argv 待执行命令；None 时读取 sys.argv / Command to execute; reads ``sys.argv`` when None.
-    @return 仅参数或配置错误时返回 / Returns only for argument or configuration errors.
-    """
-
-    command = tuple(sys.argv[1:] if argv is None else argv)
-    if not command:
-        print("container entrypoint requires a command", file=sys.stderr)
-        return 2
-    source_config_path = Path(
-        os.environ.get("AIWS_SOURCE_CONFIG", str(_DEFAULT_SOURCE_CONFIG_PATH))
-    )
-    runtime_config_path = Path(os.environ.get("AIWS_CONFIG", str(_DEFAULT_RUNTIME_CONFIG_PATH)))
-    try:
-        write_runtime_config(source_config_path, runtime_config_path, os.environ)
-    except (ConfigurationError, OSError, ValueError):
-        print(
-            "container entrypoint could not read the dbctl-generated configuration; "
-            "run dbctl bootstrap first",
-            file=sys.stderr,
+    payload = (
+        json.dumps(
+            build_runtime_config(source_config_path, environ),
+            ensure_ascii=False,
+            indent=2,
         )
-        return 2
-    os.execvpe(command[0], command, os.environ)
-    return 0
+        + "\n"
+    )
+    runtime_config_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=_PRIVATE_DIRECTORY_MODE,
+    )
+    atomic_write_private_text(runtime_config_path, payload)
 
 
 def _optional_json_string_list(
@@ -184,8 +161,10 @@ def _optional_json_string_list(
 
     @param environ 环境变量映射 / Environment mapping.
     @param name 环境变量名 / Environment-variable name.
-    @param default 环境变量缺失时的配置值 / Config value used when the variable is absent.
+    @param default 环境变量缺失时的配置值 / Configuration value used when the variable is absent.
     @return 非空字符串列表 / List of non-empty strings.
+    @raise ConfigurationError 变量或默认值不是字符串数组时抛出。
+    / Raised when the variable or default value is not an array of strings.
     """
 
     raw_value = environ.get(name)
@@ -195,9 +174,7 @@ def _optional_json_string_list(
             parsed = json.loads(raw_value)
         except json.JSONDecodeError:
             raise ConfigurationError(f"{name} must be a JSON string array") from None
-    if not isinstance(parsed, list) or not all(
-        isinstance(item, str) and item for item in parsed
-    ):
+    if not isinstance(parsed, list) or not all(isinstance(item, str) and item for item in parsed):
         raise ConfigurationError(f"{name} must be a JSON string array")
     return parsed
 
@@ -208,6 +185,7 @@ def _required_text(environ: Mapping[str, str], name: str) -> str:
     @param environ 环境变量映射 / Environment mapping.
     @param name 环境变量名称 / Environment-variable name.
     @return 非空原值 / Non-empty original value.
+    @raise ConfigurationError 变量缺失或为空时抛出 / Raised when the variable is missing or empty.
     """
 
     value = environ.get(name)
@@ -221,42 +199,8 @@ def _optional_text(environ: Mapping[str, str], name: str) -> str | None:
 
     @param environ 环境变量映射 / Environment mapping.
     @param name 环境变量名称 / Environment-variable name.
-    @return 非空值或 None / Non-empty value or None.
+    @return 非空值或 ``None`` / Non-empty value or ``None``.
     """
 
     value = environ.get(name)
     return value if value else None
-
-
-def _atomic_write(path: Path, content: str, mode: int) -> None:
-    """@brief 在同目录原子写入文件 / Atomically write a file in its destination directory.
-
-    @param path 目标路径 / Destination path.
-    @param content UTF-8 文本 / UTF-8 text.
-    @param mode 最终 POSIX 权限 / Final POSIX permissions.
-    @return 无返回值 / No return value.
-    """
-
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            delete=False,
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-            os.fchmod(temporary.fileno(), mode)
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        temporary_path.replace(path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

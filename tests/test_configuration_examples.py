@@ -12,9 +12,9 @@ import pytest
 from backend.config import BackendSettings
 from dashboard.application.errors import DashboardConfigurationError
 from dashboard.infrastructure.config import DashboardQuerySettings, DashboardSettings
-from dbctl.config import DbctlConfigurationService
-from dbctl.connection import parse_postgres_dsn
-from dbctl.errors import DbctlConfigurationError
+from dbctl.application.errors import DbctlConfigurationError
+from dbctl.infrastructure.configuration import DbctlConfigStore
+from dbctl.infrastructure.postgres.conninfo import parse_postgres_dsn
 from workspace_shared.jsonc import ConfigurationError, load_jsonc
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +51,7 @@ def test_dbctl_creates_private_config_and_loads_separate_dbinit(
     (tmp_path / "example.jsonc").write_text(example, encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     config_path = tmp_path / "config.jsonc"
-    dbctl = DbctlConfigurationService(
+    dbctl = DbctlConfigStore(
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
     ).initialize()
 
@@ -64,18 +64,18 @@ def test_dbctl_creates_private_config_and_loads_separate_dbinit(
         "dashboard_dsn": "workspace_dashboard",
     }
     parsed = {field_name: parse_postgres_dsn(database[field_name]) for field_name in expected_users}
-    assert {field_name: dsn.user for field_name, dsn in parsed.items()} == expected_users
-    passwords = [dsn.password for dsn in parsed.values()]
+    assert {field_name: dsn.user.value for field_name, dsn in parsed.items()} == expected_users
+    passwords = [dsn.password.reveal() for dsn in parsed.values()]
     assert all(isinstance(password, str) and len(password) >= 32 for password in passwords)
     assert len(set(passwords)) == 3
     backend = BackendSettings.from_file(config_path)
     dashboard = DashboardSettings.from_root_mapping(generated)
     assert backend.database.application_dsn is not None
-    assert parse_postgres_dsn(backend.database.application_dsn).user == "workspace_app"
+    assert parse_postgres_dsn(backend.database.application_dsn).user.value == "workspace_app"
     assert dashboard.database.dsn is not None
-    assert parse_postgres_dsn(dashboard.database.dsn).user == "workspace_dashboard"
+    assert parse_postgres_dsn(dashboard.database.dsn).user.value == "workspace_dashboard"
     assert os.stat(config_path).st_mode & 0o777 == 0o600
-    assert dbctl.administration.observability_schema == "observability"
+    assert dbctl.blueprint.observability_schema.value == "observability"
 
 
 def test_dbctl_rejects_legacy_password_mapping_without_rewriting_config(tmp_path: Path) -> None:
@@ -99,8 +99,8 @@ def test_dbctl_rejects_legacy_password_mapping_without_rewriting_config(tmp_path
     config_path.chmod(0o600)
 
     original = config_path.read_text(encoding="utf-8")
-    with pytest.raises(DbctlConfigurationError, match="application_dsn"):
-        DbctlConfigurationService(config_path, PROJECT_ROOT / "dbinit.jsonc").load()
+    with pytest.raises(DbctlConfigurationError, match="migrator_dsn"):
+        DbctlConfigStore(config_path, PROJECT_ROOT / "dbinit.jsonc").load()
     assert config_path.read_text(encoding="utf-8") == original
 
 
