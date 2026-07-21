@@ -1,153 +1,218 @@
-"""@brief dbctl 纯计划、dry-run 与幂等执行编排的安全测试 / Safety tests for dbctl pure planning, dry-run, and idempotent execution orchestration."""
+"""@brief dbctl bootstrap 计划、编排与 psql 边界测试 / dbctl bootstrap planning, orchestration, and psql-boundary tests."""
 
 from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 import pytest
 
 from conftest import PROJECT_ROOT
-from dbctl.bootstrap import (
-    BootstrapExecutor,
+from dbctl.application.errors import DbctlConfigurationError
+from dbctl.application.provision import (
+    BootstrapAccessMode,
     BootstrapPlan,
+    BootstrapService,
+    BootstrapStage,
     ExecutionTarget,
-    SqlStatement,
+    StageCondition,
+    TransactionMode,
+    build_bootstrap_plan,
 )
-from dbctl.cli import main
-from dbctl.composition import DbctlComposition
-from dbctl.errors import DbctlConfigurationError
-from dbctl.runners import BootstrapAccessMode, LocalPsqlBootstrapRunner
+from dbctl.composition import compose_dbctl
+from dbctl.domain.names import DatabaseName
+from dbctl.domain.roles import Secret
+from dbctl.infrastructure.postgres.psql import LocalPsqlBootstrapRunnerFactory
+from dbctl.interfaces.cli import main
+from dbctl.interfaces.presenters import render_bootstrap_plan
 
 
 @dataclass
 class RecordingBootstrapRunner:
-    """@brief 不接触 PostgreSQL 的 bootstrap runner / Bootstrap runner that never touches PostgreSQL.
+    """@brief 不接触 PostgreSQL 的 stage runner / Stage runner that never touches PostgreSQL.
 
-    @param database_present 初始时目标数据库是否存在 / Whether target database initially exists.
-    @param calls 按执行顺序记录的 SQL 调用 / SQL calls recorded in execution order.
+    @param database_present 初始数据库存在状态 / Initial database-presence state.
+    @param stages 实际执行的 stage / Stages actually executed.
     """
 
     database_present: bool = False
-    calls: list[tuple[ExecutionTarget, SqlStatement]] = field(default_factory=list)
+    stages: list[BootstrapStage] = field(default_factory=list)
 
-    def database_exists(self, _: str) -> bool:
-        """@brief 返回内存中的数据库存在状态 / Return in-memory database existence state.
+    def __enter__(self) -> Self:
+        """@brief 进入 fake 生命周期 / Enter the fake lifecycle.
 
-        @param _ 已验证的数据库名 / Validated database name.
-        @return 数据库目前存在时为真 / True when database currently exists.
+        @return 当前 fake / This fake.
+        """
+
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        """@brief 离开 fake 生命周期 / Leave the fake lifecycle.
+
+        @param _exception_type 未使用异常类型 / Unused exception type.
+        @param _exception 未使用异常对象 / Unused exception value.
+        @param _traceback 未使用 traceback / Unused traceback.
+        @return 无返回值 / No return value.
+        """
+
+    def database_exists(self, _database: DatabaseName) -> bool:
+        """@brief 返回内存存在状态 / Return the in-memory presence state.
+
+        @param _database 强类型数据库名 / Strongly typed database name.
+        @return 当前存在状态 / Current presence state.
         """
 
         return self.database_present
 
-    def execute(self, target: ExecutionTarget, statement: SqlStatement) -> None:
-        """@brief 仅记录语句并模拟 CREATE DATABASE 成功 / Record a statement only and simulate successful CREATE DATABASE.
+    def execute_stage(self, stage: BootstrapStage) -> None:
+        """@brief 记录 stage 并模拟 CREATE DATABASE / Record a stage and simulate CREATE DATABASE.
 
-        @param target maintenance 或 database 目标 / Maintenance or database target.
-        @param statement 已计划 SQL / Planned SQL.
+        @param stage 应用层有序批次 / Application-layer ordered batch.
         @return 无返回值 / No return value.
         """
 
-        self.calls.append((target, statement))
-        if statement.sql.startswith("CREATE DATABASE "):
+        self.stages.append(stage)
+        if stage.condition is StageCondition.DATABASE_ABSENT:
             self.database_present = True
 
 
-def _composition_with_secret(config_path: Path) -> tuple[DbctlComposition, str]:
-    """@brief 构造只使用内存环境的 dbctl composition / Construct a dbctl composition using only an in-memory environment.
+@dataclass
+class RecordingBootstrapFactory:
+    """@brief 始终返回同一 fake runner 的 factory / Factory always returning one fake runner.
 
-    @return composition 与用于泄漏检测的秘密 / Composition and secret used for leakage detection.
+    @param runner 被复用的内存 runner / In-memory runner to reuse.
     """
 
-    composition = DbctlComposition.from_config_path(
+    runner: RecordingBootstrapRunner
+
+    def open(
+        self,
+        _plan: BootstrapPlan,
+        _access_mode: BootstrapAccessMode,
+    ) -> RecordingBootstrapRunner:
+        """@brief 返回受应用服务管理的 runner / Return the application-owned runner.
+
+        @param _plan 自足计划 / Self-contained plan.
+        @param _access_mode 访问模式 / Access mode.
+        @return 同一 fake runner / The same fake runner.
+        """
+
+        return self.runner
+
+
+def _plan_and_secret(config_path: Path) -> tuple[BootstrapPlan, str]:
+    """@brief 从隔离配置构建计划与泄漏哨兵 / Build a plan and leak sentinel from isolated config.
+
+    @param config_path 已初始化私密配置 / Initialized private config.
+    @return bootstrap plan 与 app 密码 / Bootstrap plan and app password.
+    """
+
+    application = compose_dbctl(
         config_path,
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
         environ={},
     )
-    return composition, composition.settings.database.application.password
+    return (
+        build_bootstrap_plan(application.settings),
+        application.settings.connections.application.password.reveal(),
+    )
 
 
-def test_dbctl_bootstrap_plan_is_least_privilege_and_secret_free_when_displayed(
+def test_bootstrap_plan_is_least_privilege_staged_and_secret_free(
     dbctl_config_path: Path,
 ) -> None:
-    """@brief 计划应定义四类最小权限角色并在展示层彻底脱敏 / Plan must define four least-privilege roles and fully redact display output."""
+    """@brief 计划表达事务、最小权限与完全脱敏 / Plan expresses transactions, least privilege, and full redaction.
 
-    composition, secret = _composition_with_secret(dbctl_config_path)
-    plan = composition.build_bootstrap_plan()
-    all_statements = (
-        *plan.pre_database_statements,
-        plan.create_database,
-        *plan.maintenance_statements,
-        *plan.database_statements,
+    @param dbctl_config_path 隔离私密配置 / Isolated private config.
+    @return 无返回值 / No return value.
+    """
+
+    plan, secret = _plan_and_secret(dbctl_config_path)
+    statements = tuple(statement for stage in plan.stages for statement in stage.statements)
+    all_sql = "\n".join(statement.sql for statement in statements)
+    dry_run = render_bootstrap_plan(plan)
+
+    assert plan.database.value == "ai_job_workspace"
+    assert len(plan.stages) == 5
+    assert sum(len(stage.statements) for stage in plan.stages) == 126
+    create_stage = next(
+        stage for stage in plan.stages if stage.condition is StageCondition.DATABASE_ABSENT
     )
-    all_sql = "\n".join(statement.sql for statement in all_statements)
-    dry_run = plan.render_dry_run()
-
-    assert plan.database_name == "ai_job_workspace"
+    assert create_stage.target is ExecutionTarget.MAINTENANCE
+    assert create_stage.transaction_mode is TransactionMode.AUTOCOMMIT
+    assert all(
+        stage.transaction_mode is TransactionMode.TRANSACTIONAL
+        for stage in plan.stages
+        if stage is not create_stage
+    )
     assert 'CREATE DATABASE "ai_job_workspace" OWNER "workspace_owner";' in all_sql
     assert '"workspace_owner" NOLOGIN NOINHERIT NOSUPERUSER' in all_sql
     for role in ("workspace_migrator", "workspace_app", "workspace_dashboard"):
         assert f'"{role}" LOGIN NOINHERIT NOSUPERUSER' in all_sql
-    assert 'GRANT "workspace_owner" TO "workspace_migrator";' in all_sql
+    assert (
+        'GRANT "workspace_owner" TO "workspace_migrator" '
+        "WITH INHERIT FALSE, SET TRUE, ADMIN FALSE;" in all_sql
+    )
+    assert 'REVOKE "workspace_owner" FROM "workspace_app", "workspace_dashboard";' in all_sql
+    assert "WITH RECURSIVE membership_path" in all_sql
+    assert "identity" in all_sql and "alembic_version" in all_sql
+    assert "REVOKE ALL ON TABLE" in all_sql
     assert "CREATE EXTENSION IF NOT EXISTS vector;" in all_sql
-    for schema in ("identity", "resume", "agent", "interview", "knowledge", "observability"):
-        assert f'CREATE SCHEMA IF NOT EXISTS "{schema}" AUTHORIZATION "workspace_owner";' in all_sql
     assert "GRANT CREATE ON SCHEMA" not in all_sql
-    assert (
-        'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "observability" TO "workspace_app";'
-        not in all_sql
-    )
-    assert (
-        'GRANT SELECT ON TABLE "observability"."dashboard_signals" TO "workspace_dashboard";'
-        in all_sql
-    )
-    assert (
-        'ALTER DEFAULT PRIVILEGES FOR ROLE "workspace_owner" IN SCHEMA "observability" '
-        'GRANT INSERT ON TABLES TO "workspace_app";' not in all_sql
-    )
     assert "ALTER SYSTEM" not in all_sql
     assert "pg_hba.conf" not in all_sql
 
-    password_statements = [statement for statement in all_statements if statement.parameters]
+    password_statements = tuple(statement for statement in statements if statement.parameters)
     assert len(password_statements) == 3
-    assert sum(statement.parameters == (secret,) for statement in password_statements) == 1
+    assert (
+        sum(
+            isinstance(statement.parameters[0], Secret)
+            and statement.parameters[0].reveal() == secret
+            for statement in password_statements
+        )
+        == 1
+    )
     assert all(secret not in repr(statement) for statement in password_statements)
     assert secret not in dry_run
     assert "<redacted>" in dry_run
     assert "不修改 pg_hba.conf" in dry_run
-    assert "不创建 PostgreSQL superuser" in dry_run
 
 
-def test_dbctl_dry_run_never_invokes_bootstrap_execution(
+def test_cli_dry_run_never_invokes_bootstrap_execution(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     dbctl_config_path: Path,
 ) -> None:
-    """@brief CLI --dry-run 不得创建 runner、连接数据库或执行 SQL / CLI --dry-run must not create a runner, connect to a database, or execute SQL.
+    """@brief dry-run 不得创建数据库会话或执行 SQL / Dry-run never opens a database session or executes SQL.
 
     @param monkeypatch pytest 替换夹具 / pytest patch fixture.
-    @param capsys pytest 标准流捕获夹具 / pytest standard-stream capture fixture.
+    @param capsys pytest 输出夹具 / pytest output fixture.
+    @param dbctl_config_path 隔离私密配置 / Isolated private config.
+    @return 无返回值 / No return value.
     """
 
     secret = "cli-password-sentinel-must-never-print"
-    monkeypatch.setenv(
-        "AIWS_APP_DATABASE_DSN",
-        f"postgresql://workspace_app:{secret}@db.example.test:5432/ai_job_workspace",
-    )
+    monkeypatch.setenv("PGPASSWORD", secret)
 
-    def unexpected_execution(_: DbctlComposition, __: BootstrapPlan) -> Any:
-        """@brief 若 dry-run 错误执行则立即失败 / Fail immediately if dry-run wrongly executes.
+    def unexpected_execution(*_arguments: object, **_keywords: object) -> object:
+        """@brief 若错误执行立即失败 / Fail immediately on unintended execution.
 
-        @param _ dbctl composition / dbctl composition.
-        @param __ bootstrap 计划 / Bootstrap plan.
+        @param _arguments 未使用位置参数 / Unused positional arguments.
+        @param _keywords 未使用关键字参数 / Unused keyword arguments.
         @return 永不返回 / Never returns.
         """
 
         raise AssertionError("dry-run tried to execute bootstrap")
 
-    monkeypatch.setattr(DbctlComposition, "execute_bootstrap", unexpected_execution)
+    monkeypatch.setattr(BootstrapService, "execute", unexpected_execution)
     exit_code = main(
         [
             "--config",
@@ -160,150 +225,229 @@ def test_dbctl_dry_run_never_invokes_bootstrap_execution(
     )
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert secret not in captured.out
-    assert secret not in captured.err
+    assert secret not in captured.out + captured.err
     assert "不执行任何 SQL" in captured.out
-    assert "<redacted>" in captured.out
 
 
-def test_bootstrap_executor_skips_existing_database_on_repeat_without_external_io(
+def test_bootstrap_service_skips_create_on_repeat_without_external_io(
     dbctl_config_path: Path,
 ) -> None:
-    """@brief 同一计划第二次执行不应再次发送 CREATE DATABASE / A second execution of the same plan must not send CREATE DATABASE again.
+    """@brief 重复执行只跳过条件 stage / Repeated execution skips only the conditional stage.
 
-    该测试只使用 RecordingBootstrapRunner；它验证幂等编排而不启动数据库、sudo 或
-    psql。
+    @param dbctl_config_path 隔离私密配置 / Isolated private config.
+    @return 无返回值 / No return value.
     """
 
-    composition, _ = _composition_with_secret(dbctl_config_path)
-    plan = composition.build_bootstrap_plan()
+    plan, _secret = _plan_and_secret(dbctl_config_path)
     runner = RecordingBootstrapRunner()
-    executor = BootstrapExecutor(runner)
+    service = BootstrapService(RecordingBootstrapFactory(runner))
 
-    first_result = executor.apply(plan)
-    first_create_count = sum(
-        statement.sql.startswith("CREATE DATABASE ") for _, statement in runner.calls
-    )
-    second_result = executor.apply(plan)
-    final_create_count = sum(
-        statement.sql.startswith("CREATE DATABASE ") for _, statement in runner.calls
-    )
+    first = service.execute(plan)
+    second = service.execute(plan)
 
-    expected_without_create = (
-        len(plan.pre_database_statements)
-        + len(plan.maintenance_statements)
-        + len(plan.database_statements)
-    )
-    assert first_result.database_created is True
-    assert first_result.executed_statement_count == expected_without_create + 1
-    assert second_result.database_created is False
-    assert second_result.executed_statement_count == expected_without_create
-    assert first_create_count == 1
-    assert final_create_count == 1
-    assert runner.calls[0][0] is ExecutionTarget.MAINTENANCE
-    assert any(target is ExecutionTarget.DATABASE for target, _ in runner.calls)
+    assert first.database_created is True
+    assert first.executed_stage_count == 5
+    assert first.executed_statement_count == 126
+    assert second.database_created is False
+    assert second.executed_stage_count == 4
+    assert second.skipped_stage_count == 1
+    assert second.executed_statement_count == 125
+    assert sum(stage.condition is StageCondition.DATABASE_ABSENT for stage in runner.stages) == 1
 
 
-def test_bootstrap_runner_uses_terminal_sudo_psql_on_supported_posix(
+def test_sudo_runner_batches_stage_into_one_transactional_psql_process(
     monkeypatch: pytest.MonkeyPatch,
     dbctl_config_path: Path,
 ) -> None:
-    """@brief 支持 sudo 的 POSIX 可显式使用 sudo psql / Supported POSIX platforms can explicitly use sudo psql.
+    """@brief 一个事务 stage 只启动一个 psql / One transactional stage starts one psql process.
 
     @param monkeypatch pytest 替换夹具 / pytest patch fixture.
+    @param dbctl_config_path 隔离私密配置 / Isolated private config.
     @return 无返回值 / No return value.
     """
-    observed_commands: list[list[str]] = []
 
-    def fake_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
-        """@brief 记录本地命令并返回数据库不存在 / Record the local command and report an absent database.
+    observed: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(command: list[str], **keywords: Any) -> subprocess.CompletedProcess[str]:
+        """@brief 记录批处理 subprocess / Record the batched subprocess.
 
         @param command 无 shell argv / Shell-free argv.
-        @param _ subprocess 其余受控参数 / Remaining controlled subprocess parameters.
-        @return 成功的 psql 结果 / Successful psql result.
+        @param keywords subprocess 参数 / Subprocess arguments.
+        @return 成功结果 / Successful result.
         """
-        observed_commands.append(command)
-        return subprocess.CompletedProcess(command, 0, stdout="f\n", stderr="")
+
+        observed.append((command, keywords))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    composition, _ = _composition_with_secret(dbctl_config_path)
-    runner = composition._bootstrap_runner(access_mode=BootstrapAccessMode.SUDO)
-    assert isinstance(runner, LocalPsqlBootstrapRunner)
-    assert runner.database_exists("ai_job_workspace") is False
-    assert observed_commands[0][:5] == ["sudo", "-u", "postgres", "--", "psql"]
-    assert "shell" not in observed_commands[0]
+    plan, _secret = _plan_and_secret(dbctl_config_path)
+    factory = LocalPsqlBootstrapRunnerFactory(
+        platform_name="posix",
+        executable_finder=lambda executable: f"/usr/bin/{executable}",
+        environ={"PGHOST": "attacker.example", "PGPASSWORD": "must-be-removed"},
+    )
+    stage = plan.stages[0]
+    with factory.open(plan, BootstrapAccessMode.SUDO) as runner:
+        runner.execute_stage(stage)
+
+    assert len(observed) == 1
+    command, keywords = observed[0]
+    assert command[:5] == ["/usr/bin/sudo", "-u", "postgres", "--", "psql"]
+    assert "--file=-" in command
+    assert "--single-transaction" in command
+    assert keywords["input"].count("ALTER ROLE") >= 4
+    assert all(not name.startswith("PG") for name in keywords["env"])
+
+
+def test_complete_bootstrap_uses_six_processes_for_126_logical_statements(
+    monkeypatch: pytest.MonkeyPatch,
+    dbctl_config_path: Path,
+) -> None:
+    """@brief 完整新库计划从 124 次进程降为 6 次 / A complete fresh plan reduces about 124 processes to six.
+
+    @param monkeypatch pytest 替换夹具 / pytest patch fixture.
+    @param dbctl_config_path 隔离私密配置 / Isolated private config.
+    @return 无返回值 / No return value.
+    """
+
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_keywords: Any) -> subprocess.CompletedProcess[str]:
+        """@brief 模拟全部 psql 调用并报告数据库不存在 / Simulate all psql calls and report database absence.
+
+        @param command psql argv / psql argv.
+        @param _keywords subprocess 参数 / Subprocess arguments.
+        @return 查询为 false、其他调用成功 / False for the probe and success otherwise.
+        """
+
+        commands.append(command)
+        stdout = "f\n" if "-A" in command else ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    plan, _secret = _plan_and_secret(dbctl_config_path)
+    service = BootstrapService(
+        LocalPsqlBootstrapRunnerFactory(
+            platform_name="posix",
+            executable_finder=lambda executable: f"/usr/bin/{executable}",
+            environ={},
+        )
+    )
+
+    result = service.execute(plan, access_mode=BootstrapAccessMode.SUDO)
+
+    assert result.database_created is True
+    assert result.executed_statement_count == 126
+    assert len(commands) == 6
+    assert sum("--single-transaction" in command for command in commands) == 4
+    assert sum("-A" in command for command in commands) == 1
 
 
 @pytest.mark.parametrize("platform_name", ("nt", "posix"))
-def test_bootstrap_runner_prompts_once_without_sudo(
+def test_prompt_runner_prompts_once_and_uses_exact_pgpass(
     platform_name: str,
     monkeypatch: pytest.MonkeyPatch,
+    dbctl_config_path: Path,
 ) -> None:
-    """@brief Windows 与无 sudo 平台应提示一次密码且不把密码放进 argv/environment / Windows and sudo-less platforms prompt once without exposing the password.
+    """@brief 无 sudo 时只提示一次并精确绑定 pgpass / Without sudo, prompt once and bind pgpass exactly.
 
     @param platform_name 模拟平台 / Simulated platform.
     @param monkeypatch pytest 替换夹具 / pytest patch fixture.
+    @param dbctl_config_path 隔离私密配置 / Isolated private config.
     @return 无返回值 / No return value.
     """
+
     secret = "bootstrap-admin-password-sentinel"
     prompt_count = 0
     observed: list[tuple[list[str], dict[str, Any]]] = []
 
-    def prompt(_: str) -> str:
-        """@brief 返回一次测试密码 / Return one test password.
+    def prompt(_message: str) -> str:
+        """@brief 返回测试密码 / Return the test password.
 
-        @param _ 安全提示文本 / Safe prompt text.
+        @param _message 安全提示 / Safe prompt.
         @return 测试密码 / Test password.
         """
+
         nonlocal prompt_count
         prompt_count += 1
         return secret
 
-    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        """@brief 捕获 prompt 模式命令 / Capture a prompt-mode command.
+    def fake_run(command: list[str], **keywords: Any) -> subprocess.CompletedProcess[str]:
+        """@brief 捕获 prompt 命令并报告数据库不存在 / Capture prompt command and report absence.
 
         @param command 无 shell argv / Shell-free argv.
-        @param kwargs subprocess 参数 / Subprocess arguments.
-        @return 数据库不存在的成功结果 / Successful absent-database result.
+        @param keywords subprocess 参数 / Subprocess arguments.
+        @return 数据库不存在的结果 / Database-absent result.
         """
-        observed.append((command, kwargs))
+
+        observed.append((command, keywords))
         return subprocess.CompletedProcess(command, 0, stdout="f\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    runner = LocalPsqlBootstrapRunner(
+    plan, _sentinel = _plan_and_secret(dbctl_config_path)
+    factory = LocalPsqlBootstrapRunnerFactory(
         platform_name=platform_name,
-        executable_finder=lambda _: None,
+        executable_finder=lambda _executable: None,
         password_prompt=prompt,
-        environ={"PGPASSWORD": "inherited-password-must-be-removed"},
-    ).with_target_database("ai_job_workspace")
-    try:
+        environ={"PGPASSWORD": "inherited-secret", "PGSERVICE": "unsafe"},
+    )
+    runner = factory.open(plan, BootstrapAccessMode.AUTO)
+    with runner:
         assert runner.access_mode is BootstrapAccessMode.PROMPT
-        assert runner.database_exists("ai_job_workspace") is False
-        assert runner.database_exists("ai_job_workspace") is False
-        command, arguments = observed[0]
-        assert command[0] == "psql"
-        assert "sudo" not in command
+        assert runner.database_exists(plan.database) is False
+        assert runner.database_exists(plan.database) is False
+        command, keywords = observed[0]
+        password_file = Path(keywords["env"]["PGPASSFILE"])
+        pgpass = password_file.read_text(encoding="utf-8")
+        assert pgpass == f"127.0.0.1:5432:postgres:postgres:{secret}\n"
+        assert "--host=127.0.0.1" in command
+        assert "--port=5432" in command
         assert "--username=postgres" in command
+        assert "PGPASSWORD" not in keywords["env"]
+        assert "PGSERVICE" not in keywords["env"]
         assert secret not in repr(command)
-        child_environment = arguments["env"]
-        assert isinstance(child_environment, dict)
-        assert "PGPASSWORD" not in child_environment
-        password_file = child_environment["PGPASSFILE"]
-        assert isinstance(password_file, str)
         assert prompt_count == 1
-    finally:
-        runner.close()
-    assert not Path(password_file).exists()
+    assert not password_file.exists()
 
 
-def test_explicit_sudo_mode_fails_closed_on_windows() -> None:
-    """@brief Windows 显式 sudo 模式必须 fail closed / Explicit sudo mode fails closed on Windows.
+def test_sudo_mode_fails_closed_for_windows_and_remote_targets(
+    dbctl_config_path: Path,
+) -> None:
+    """@brief sudo 在缺失或远程 target 上 fail closed / Sudo fails closed when unavailable or remote.
 
+    @param dbctl_config_path 隔离私密配置 / Isolated private config.
     @return 无返回值 / No return value.
     """
+
+    plan, _secret = _plan_and_secret(dbctl_config_path)
+    windows = LocalPsqlBootstrapRunnerFactory(
+        platform_name="nt",
+        executable_finder=lambda _executable: None,
+    )
     with pytest.raises(DbctlConfigurationError, match="未找到兼容的 sudo"):
-        LocalPsqlBootstrapRunner(
-            platform_name="nt",
-            executable_finder=lambda _: None,
-            access_mode=BootstrapAccessMode.SUDO,
-        )
+        windows.open(plan, BootstrapAccessMode.SUDO)
+
+    remote_plan = BootstrapPlan(
+        database=plan.database,
+        access=plan.access.__class__(
+            maintenance_target=plan.access.maintenance_target.__class__(
+                host="db.example.test",
+                port=plan.access.maintenance_target.port,
+                database=plan.access.maintenance_target.database,
+            ),
+            local_postgres_user=plan.access.local_postgres_user,
+            bootstrap_database_user=plan.access.bootstrap_database_user,
+        ),
+        database_target=plan.database_target.__class__(
+            host="db.example.test",
+            port=plan.database_target.port,
+            database=plan.database_target.database,
+        ),
+        stages=plan.stages,
+    )
+    posix = LocalPsqlBootstrapRunnerFactory(
+        platform_name="posix",
+        executable_finder=lambda executable: f"/usr/bin/{executable}",
+    )
+    with pytest.raises(DbctlConfigurationError, match="loopback"):
+        posix.open(remote_plan, BootstrapAccessMode.SUDO)

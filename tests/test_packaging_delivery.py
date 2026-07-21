@@ -31,8 +31,8 @@ def test_every_declared_console_target_is_importable_and_callable() -> None:
         assert callable(resolved), f"{command}: {target} 不是 callable"
 
 
-def test_built_wheel_contains_and_can_read_all_dbctl_resources(tmp_path: Path) -> None:
-    """@brief wheel 必须含全部 dbctl 资源并可脱离源码树读取 / The wheel ships and reads every dbctl resource outside the checkout.
+def test_built_wheel_contains_layered_dbctl_and_all_resources(tmp_path: Path) -> None:
+    """@brief wheel 必须交付分层 dbctl 及全部资源 / The wheel ships layered dbctl and every resource.
 
     @param tmp_path pytest 临时目录 / pytest temporary directory.
     @return 无返回值 / No return value.
@@ -55,7 +55,11 @@ def test_built_wheel_contains_and_can_read_all_dbctl_resources(tmp_path: Path) -
         "backend/resources/ai-job-workspace.contract.schema.json",
         "dbctl/resources/example.jsonc",
         "dbctl/resources/dbinit.jsonc",
+        "dbctl/resources/alembic/versions/20260721_0007_protect_alembic_version_table.py",
     }
+    for layer in ("domain", "application", "infrastructure", "interfaces"):
+        for source in (PROJECT_ROOT / "src" / "dbctl" / layer).rglob("*.py"):
+            expected_entries.add(source.relative_to(PROJECT_ROOT / "src").as_posix())
     for source in (PROJECT_ROOT / "alembic").rglob("*"):
         if source.is_file() and "__pycache__" not in source.parts and source.suffix != ".pyc":
             relative = source.relative_to(PROJECT_ROOT).as_posix()
@@ -87,8 +91,8 @@ from backend.app import create_app
 from backend.config import BackendSettings
 from backend.infrastructure.contracts import ContractValidator
 from backend.package_resources import read_contract_schema_text
-from dbctl.config import DbctlConfigurationService
-from dbctl.package_resources import alembic_script_location, read_default_text
+from dbctl.infrastructure.configuration import DbctlConfigStore
+from dbctl.infrastructure.resources import alembic_script_location, read_default_text
 from fastapi.testclient import TestClient
 
 assert str(wheel) in str(dbctl.__file__)
@@ -97,9 +101,10 @@ assert 'database_administration' in read_default_text('dbinit.jsonc')
 with alembic_script_location() as scripts:
     assert (scripts / 'env.py').is_file()
     assert (scripts / 'versions' / '20260721_0006_observability_signal_envelope.py').is_file()
+    assert (scripts / 'versions' / '20260721_0007_protect_alembic_version_table.py').is_file()
 
-settings = DbctlConfigurationService().initialize()
-assert settings.administration.database_name == 'ai_job_workspace'
+settings = DbctlConfigStore().initialize()
+assert settings.blueprint.database.value == 'ai_job_workspace'
 assert Path('config.jsonc').is_file()
 backend_settings = BackendSettings.from_file(Path('config.jsonc'))
 with TestClient(create_app(backend_settings)) as client:
@@ -123,8 +128,8 @@ def test_explicit_missing_paths_do_not_fall_back_to_packaged_defaults(tmp_path: 
     @return 无返回值 / No return value.
     """
 
-    from dbctl.config import DbctlConfigurationService
-    from dbctl.errors import DbctlConfigurationError
+    from dbctl.application.errors import DbctlConfigurationError
+    from dbctl.infrastructure.configuration import DbctlConfigStore
 
     config_case = tmp_path / "config-case"
     config_case.mkdir()
@@ -135,7 +140,7 @@ def test_explicit_missing_paths_do_not_fall_back_to_packaged_defaults(tmp_path: 
         encoding="utf-8",
     )
     with pytest.raises(DbctlConfigurationError, match=r"配置文件不存在"):
-        DbctlConfigurationService(explicit_config, explicit_dbinit).load()
+        DbctlConfigStore(explicit_config, explicit_dbinit).load()
     assert not explicit_config.exists()
 
     dbinit_case = tmp_path / "dbinit-case"
@@ -147,5 +152,5 @@ def test_explicit_missing_paths_do_not_fall_back_to_packaged_defaults(tmp_path: 
     )
     explicit_dbinit = dbinit_case / "database.jsonc"
     with pytest.raises(DbctlConfigurationError, match="dbinit文件不存在"):
-        DbctlConfigurationService(explicit_config, explicit_dbinit).load()
+        DbctlConfigStore(explicit_config, explicit_dbinit).load()
     assert not explicit_dbinit.exists()

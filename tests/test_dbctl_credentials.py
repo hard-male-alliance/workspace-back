@@ -1,4 +1,4 @@
-"""@brief dbctl 配置凭证到 migrate/shell 的端到端单元测试 / Config credential flow tests."""
+"""@brief dbctl 配置凭证到 migration/shell 的边界测试 / dbctl config-credential boundary tests for migration and shell."""
 
 from __future__ import annotations
 
@@ -12,12 +12,14 @@ from urllib.parse import quote
 import pytest
 
 from conftest import PROJECT_ROOT
-from dbctl.cli import main
-from dbctl.composition import DbctlComposition
-from dbctl.config import DbctlConfigurationService
-from dbctl.domain import DatabaseLogin, LoginRole
-from dbctl.errors import MigrationExecutionError
-from dbctl.migration import AlembicMigrationRunner
+from dbctl.application.errors import MigrationExecutionError
+from dbctl.application.migrate import MigrationRevision
+from dbctl.composition import compose_dbctl
+from dbctl.domain.database import LoginDatabase
+from dbctl.domain.roles import LoginRole
+from dbctl.infrastructure.alembic import AlembicMigrationAdapter
+from dbctl.infrastructure.configuration import DbctlConfigStore
+from dbctl.interfaces.cli import main
 from workspace_shared.jsonc import load_jsonc
 
 
@@ -27,77 +29,83 @@ def _initialized_config(
     app_password: str = "generated-app-password",
     migrator_password: str | None = None,
 ) -> Path:
-    """@brief 创建可独立修改的私密测试配置 / Create an isolated private test config.
+    """@brief 创建可独立修改的私密测试配置 / Create an independently mutable private test config.
 
-    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
     @param app_password application role 密码 / Application-role password.
     @param migrator_password 可选 migrator role 密码 / Optional migrator-role password.
     @return 已初始化配置路径 / Initialized config path.
     """
+
     config_path = tmp_path / "config.jsonc"
     config_path.write_text((PROJECT_ROOT / "example.jsonc").read_text(encoding="utf-8"))
-    DbctlConfigurationService(config_path, PROJECT_ROOT / "dbinit.jsonc").initialize()
+    DbctlConfigStore(config_path, PROJECT_ROOT / "dbinit.jsonc").initialize()
     root = load_jsonc(config_path)
     root["database"]["application_dsn"] = (
         f"postgresql://workspace_app:{quote(app_password, safe='')}@127.0.0.1:5432/ai_job_workspace"
     )
     if migrator_password is not None:
         root["database"]["migrator_dsn"] = (
-            "postgresql://workspace_migrator:"
-            f"{quote(migrator_password, safe='')}@127.0.0.1:5432/ai_job_workspace"
+            f"postgresql://workspace_migrator:{quote(migrator_password, safe='')}"
+            "@127.0.0.1:5432/ai_job_workspace"
         )
     config_path.write_text(json.dumps(root), encoding="utf-8")
     return config_path
 
 
-def test_shell_uses_config_password_via_temporary_pgpass_without_prompt(
+def test_shell_uses_exact_config_pgpass_without_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """@brief shell 应自动使用 config 密码并清理 pgpass / Shell uses config password and cleans pgpass.
+    """@brief shell 使用精确配置凭证并清理租约 / Shell uses exact config credentials and cleans its lease.
 
-    @param tmp_path pytest 临时目录 / Pytest temporary directory.
-    @param monkeypatch pytest 替换夹具 / Pytest patch fixture.
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @param monkeypatch pytest 替换夹具 / pytest patch fixture.
+    @return 无返回值 / No return value.
     """
+
     secret = "application:@/\\雪-password"
     config_path = _initialized_config(tmp_path, app_password=secret)
     inherited = {
         "PGPASSWORD": "must-not-win",
         "PGPASSFILE": str(tmp_path / "stale-pgpass"),
+        "PGHOST": "attacker.example",
         "PATH": os.environ.get("PATH", ""),
     }
-    composition = DbctlComposition.from_config_path(
+    application = compose_dbctl(
         config_path,
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
         environ=inherited,
     )
-    prepared = composition.prepare_shell(LoginRole.APP)
+    login = application.settings.connections.application
     observed_password_file: Path | None = None
 
-    def fake_run(command: tuple[str, ...], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        """@brief 在 psql 读取期间检查临时凭证 / Inspect credentials while psql would read them.
+    def fake_run(command: tuple[str, ...], **keywords: Any) -> subprocess.CompletedProcess[str]:
+        """@brief 在 psql 读取期间检查临时凭证 / Inspect temporary credentials while psql reads them.
 
         @param command psql argv / psql argv.
-        @param kwargs subprocess 参数 / Subprocess keyword arguments.
-        @return 固定非零退出结果 / Fixed non-zero completion.
+        @param keywords subprocess 参数 / Subprocess keyword arguments.
+        @return 固定非零退出结果 / Fixed non-zero result.
         """
+
         nonlocal observed_password_file
-        environment = kwargs["env"]
+        environment = keywords["env"]
         assert isinstance(environment, dict)
         assert "PGPASSWORD" not in environment
+        assert "PGHOST" not in environment
         observed_password_file = Path(environment["PGPASSFILE"])
         assert observed_password_file.is_file()
         assert os.stat(observed_password_file).st_mode & 0o777 == 0o600
-        pgpass = observed_password_file.read_text(encoding="utf-8")
-        assert "workspace_app" in pgpass
-        assert "application\\:@/\\\\雪-password" in pgpass
+        assert observed_password_file.read_text(encoding="utf-8") == (
+            "127.0.0.1:5432:ai_job_workspace:workspace_app:application\\:@/\\\\雪-password\n"
+        )
         assert "--no-password" in command
         assert all(secret not in argument for argument in command)
         return subprocess.CompletedProcess(command, 37)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    assert secret not in repr(prepared)
-    assert composition.run_prepared_shell(prepared) == 37
+    assert secret not in repr(login)
+    assert application.shell.execute(login) == 37
     assert observed_password_file is not None
     assert not observed_password_file.exists()
     assert inherited["PGPASSWORD"] == "must-not-win"
@@ -112,152 +120,159 @@ def test_shell_uses_config_password_via_temporary_pgpass_without_prompt(
         (LoginRole.DASHBOARD, "workspace_dashboard"),
     ),
 )
-def test_shell_role_selection_always_resolves_a_complete_config_login(
+def test_shell_role_selection_resolves_complete_typed_login(
     role: LoginRole,
     expected_name: str,
     tmp_path: Path,
 ) -> None:
-    """@brief 三种 shell 身份都必须完整来自 config / Every shell identity comes from config.
+    """@brief 三种 shell 身份都完整来自同一连接目录 / All shell identities come from one connection catalog.
 
-    @param role 待选择的登录用途 / Login purpose to select.
-    @param expected_name 预期 PostgreSQL role 名 / Expected PostgreSQL role name.
-    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @param role 待选择登录用途 / Login purpose to select.
+    @param expected_name 预期 PostgreSQL role / Expected PostgreSQL role.
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @return 无返回值 / No return value.
     """
-    config_path = _initialized_config(tmp_path)
-    composition = DbctlComposition.from_config_path(
-        config_path,
+
+    application = compose_dbctl(
+        _initialized_config(tmp_path),
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
     )
+    login = application.settings.connections.login_for(role)
 
-    prepared = composition.prepare_shell(role)
-
-    assert prepared.login.role is role
-    assert prepared.login.role_name == expected_name
-    assert prepared.login.password
-    assert prepared.login.password not in repr(prepared)
-    assert all(prepared.login.password not in argument for argument in prepared.argv)
-
-
-def test_migration_transports_percent_encoded_config_dsn_outside_configparser(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@brief 特殊字符 DSN 应通过 attributes 原样进入 Alembic / Encoded DSN bypasses ConfigParser.
-
-    @param monkeypatch pytest 替换夹具 / Pytest patch fixture.
-    """
-    secret = "migrator:@/%雪"
-    dsn = (
-        f"postgresql://workspace_migrator:{quote(secret, safe='')}@127.0.0.1:5432/ai_job_workspace"
-    )
-    login = DatabaseLogin(
-        role=LoginRole.MIGRATOR,
-        role_name="workspace_migrator",
-        dsn=dsn,
-        safe_conninfo=(
-            "user='workspace_migrator' host='127.0.0.1' port='5432' dbname='ai_job_workspace'"
-        ),
-        password=secret,
-    )
-
-    def fake_upgrade(config: Any, revision: str) -> None:
-        """@brief 验证 Alembic 收到的内存配置 / Verify Alembic's in-memory configuration.
-
-        @param config Alembic Config / Alembic Config.
-        @param revision 目标 revision / Target revision.
-        """
-        assert revision == "head"
-        assert config.attributes["aiws.migration_dsn"] == dsn
-        assert not config.get_main_option("sqlalchemy.url")
-
-    monkeypatch.setattr("alembic.command.upgrade", fake_upgrade)
-    runner = AlembicMigrationRunner(
-        login,
-        PROJECT_ROOT / "alembic",
-        "workspace_owner",
-        "workspace_app",
-        "workspace_dashboard",
-    )
-    runner.upgrade()
-    assert secret not in repr(runner)
+    assert login.role is role
+    assert login.role_name.value == expected_name
+    assert login.password.reveal()
+    assert login.password.reveal() not in repr(login)
+    assert login.target == application.settings.connections.target
 
 
-def test_migration_failure_never_displays_config_dsn(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@brief Alembic 底层异常不得把 config secret 带到 CLI / Migration errors redact config secrets.
-
-    @param monkeypatch pytest 替换夹具 / Pytest patch fixture.
-    """
-    secret = "migration-secret:@/%雪"
-    dsn = (
-        f"postgresql://workspace_migrator:{quote(secret, safe='')}@127.0.0.1:5432/ai_job_workspace"
-    )
-    login = DatabaseLogin(
-        role=LoginRole.MIGRATOR,
-        role_name="workspace_migrator",
-        dsn=dsn,
-        safe_conninfo="user='workspace_migrator' dbname='ai_job_workspace'",
-        password=secret,
-    )
-
-    def fail_with_dsn(_: Any, __: str) -> None:
-        """@brief 模拟会回显 DSN 的底层失败 / Simulate a lower-level failure echoing the DSN.
-
-        @param _ Alembic Config / Alembic Config.
-        @param __ revision / Migration revision.
-        """
-        raise ValueError(dsn)
-
-    monkeypatch.setattr("alembic.command.upgrade", fail_with_dsn)
-    runner = AlembicMigrationRunner(
-        login,
-        PROJECT_ROOT / "alembic",
-        "workspace_owner",
-        "workspace_app",
-        "workspace_dashboard",
-    )
-
-    with pytest.raises(MigrationExecutionError) as error_info:
-        runner.upgrade()
-    displayed = str(error_info.value)
-    assert secret not in displayed
-    assert dsn not in displayed
-    assert "postgresql://" not in displayed
-
-
-def test_composition_selects_migrator_role_and_password_from_config(
+def test_migration_transports_encoded_dsn_only_via_memory_attributes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """@brief migrate 自动选择 config migrator 身份 / Migrate selects config migrator identity.
+    """@brief 特殊字符 DSN 只经 attributes 进入 Alembic / Encoded DSN reaches Alembic only through attributes.
 
-    @param tmp_path pytest 临时目录 / Pytest temporary directory.
-    @param monkeypatch pytest 替换夹具 / Pytest patch fixture.
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @param monkeypatch pytest 替换夹具 / pytest patch fixture.
+    @return 无返回值 / No return value.
     """
-    secret = "migrator-config:@/%雪"
-    config_path = _initialized_config(tmp_path, migrator_password=secret)
-    observed: list[DatabaseLogin] = []
 
-    def fake_upgrade(runner: AlembicMigrationRunner, revision: str = "head") -> None:
-        """@brief 捕获 composition 交给 migration adapter 的身份 / Capture composed login.
-
-        @param runner Alembic runner / Alembic runner.
-        @param revision 目标 revision / Target revision.
-        """
-        assert revision == "head"
-        observed.append(runner._migrator)
-
-    monkeypatch.setattr(AlembicMigrationRunner, "upgrade", fake_upgrade)
-    composition = DbctlComposition.from_config_path(
-        config_path,
+    secret = "migrator:@/%雪"
+    application = compose_dbctl(
+        _initialized_config(tmp_path, migrator_password=secret),
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
     )
-    composition.execute_migration()
+    login = application.settings.connections.migrator
 
-    assert len(observed) == 1
-    assert observed[0].role is LoginRole.MIGRATOR
-    assert observed[0].role_name == "workspace_migrator"
-    assert observed[0].password == secret
+    def fake_upgrade(configuration: Any, revision: str) -> None:
+        """@brief 验证 Alembic 内存配置 / Verify Alembic in-memory configuration.
+
+        @param configuration Alembic Config / Alembic Config.
+        @param revision 目标 revision / Target revision.
+        @return 无返回值 / No return value.
+        """
+
+        assert revision == "head"
+        assert configuration.attributes["aiws.migration_dsn"] == login.dsn.reveal()
+        assert not configuration.get_main_option("sqlalchemy.url")
+        assert configuration.get_main_option("aiws.owner_role") == "workspace_owner"
+        assert configuration.get_main_option("aiws.migrator_role") == "workspace_migrator"
+        assert configuration.get_main_option("aiws.app_role") == "workspace_app"
+        assert configuration.get_main_option("aiws.dashboard_role") == "workspace_dashboard"
+
+    monkeypatch.setattr("alembic.command.upgrade", fake_upgrade)
+    AlembicMigrationAdapter().upgrade(
+        login,
+        MigrationRevision(),
+        application.settings.blueprint,
+    )
+
+
+def test_migration_failure_never_displays_or_chains_config_dsn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief Alembic 异常不进入显示文本或 cause chain / Alembic errors enter neither display text nor cause chains.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @param monkeypatch pytest 替换夹具 / pytest patch fixture.
+    @return 无返回值 / No return value.
+    """
+
+    secret = "migration-secret:@/%雪"
+    application = compose_dbctl(
+        _initialized_config(tmp_path, migrator_password=secret),
+        dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
+    )
+    login = application.settings.connections.migrator
+
+    def fail_with_dsn(_configuration: Any, _revision: str) -> None:
+        """@brief 模拟回显 DSN 的底层失败 / Simulate a lower-level DSN-bearing failure.
+
+        @param _configuration Alembic Config / Alembic Config.
+        @param _revision revision / Revision.
+        @return 永不返回 / Never returns.
+        """
+
+        raise ValueError(login.dsn.reveal())
+
+    monkeypatch.setattr("alembic.command.upgrade", fail_with_dsn)
+    with pytest.raises(MigrationExecutionError) as error_info:
+        AlembicMigrationAdapter().upgrade(
+            login,
+            MigrationRevision(),
+            application.settings.blueprint,
+        )
+    assert secret not in str(error_info.value)
+    assert "postgresql://" not in str(error_info.value)
+    assert error_info.value.__cause__ is None
+
+
+def test_composition_passes_only_migrator_and_nonsecret_blueprint_to_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief migration 端口只接收 migrator 与非秘密 blueprint / Migration port receives only migrator and a non-secret blueprint.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @param monkeypatch pytest 替换夹具 / pytest patch fixture.
+    @return 无返回值 / No return value.
+    """
+
+    secret = "migrator-config:@/%雪"
+    application = compose_dbctl(
+        _initialized_config(tmp_path, migrator_password=secret),
+        dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
+    )
+    observed: list[tuple[LoginDatabase, object]] = []
+
+    def fake_upgrade(
+        _adapter: AlembicMigrationAdapter,
+        login: LoginDatabase,
+        revision: MigrationRevision,
+        blueprint: object,
+    ) -> None:
+        """@brief 捕获应用服务传给 adapter 的 authority / Capture authority passed to the adapter.
+
+        @param _adapter adapter 实例 / Adapter instance.
+        @param login 强类型登录 / Typed login.
+        @param revision 迁移 revision / Migration revision.
+        @param blueprint 非秘密数据库 blueprint / Non-secret database blueprint.
+        @return 无返回值 / No return value.
+        """
+
+        assert revision.value == "head"
+        observed.append((login, blueprint))
+
+    monkeypatch.setattr(AlembicMigrationAdapter, "upgrade", fake_upgrade)
+    application.migration.execute(
+        application.settings.connections.migrator,
+        MigrationRevision(),
+        application.settings,
+    )
+
+    assert observed == [(application.settings.connections.migrator, application.settings.blueprint)]
+    assert observed[0][0].password.reveal() == secret
 
 
 @pytest.mark.parametrize("command", ("migrate", "shell"))
@@ -266,12 +281,14 @@ def test_non_bootstrap_commands_never_create_missing_config(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """@brief migrate/shell 缺配置时必须失败且无写入 / Non-bootstrap commands never initialize config.
+    """@brief 非 bootstrap 命令缺配置时只读失败 / Non-bootstrap commands fail read-only when config is missing.
 
     @param command dbctl 子命令 / dbctl subcommand.
-    @param tmp_path pytest 临时目录 / Pytest temporary directory.
-    @param capsys pytest 输出捕获 / Pytest output capture.
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @param capsys pytest 输出夹具 / pytest output fixture.
+    @return 无返回值 / No return value.
     """
+
     config_path = tmp_path / "config.jsonc"
     exit_code = main(
         [

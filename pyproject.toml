@@ -38,6 +38,7 @@ gui = [
 dev = [
   "httpx2>=2.7,<3",
   "mypy>=1.15,<2",
+  "plotly>=6,<7",
   "pytest>=8.3,<10",
   "pytest-asyncio>=1.4,<2",
   "ruff>=0.11,<1",

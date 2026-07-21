@@ -2,17 +2,23 @@
 
 v0.1.0 是一个面向 AI 求职工作流的模块化单体（modular monolith）后端。它提供简历操作与受限 XeLaTeX 渲染、流式 Agent、模拟面试 WebSocket、知识库、PostgreSQL/pgvector 持久化，以及只读运维 Dashboard。
 
-这不是一个可以把默认配置直接暴露到公网的“开箱即用 SaaS”。仓库提交的是无密钥 `example.jsonc` 与数据库目标状态 `dbinit.jsonc`；本地 `config.jsonc` 被 Git 忽略。首次执行需要加载配置的 `dbctl` 子命令时，若省略 `--config` 且默认 `config.jsonc` 不存在，`dbctl` 会优先复制同一运行目录的 `example.jsonc`，该目录没有模板时再读取 wheel 内置示例，并生成登录角色密码。生产启动前必须完成本文的数据库、身份和网络边界配置。
+这不是一个可以把默认配置直接暴露到公网的“开箱即用 SaaS”。仓库提交的是无密钥 `example.jsonc` 与数据库目标状态 `dbinit.jsonc`；本地 `config.jsonc` 被 Git 忽略。首次执行 `dbctl bootstrap` 时，若省略 `--config` 且默认 `config.jsonc` 不存在，`dbctl` 会优先读取同一运行目录的 `example.jsonc`，该目录没有模板时再读取 wheel 内置示例，在内存中补全登录角色密码后一次原子写入。其他子命令永不创建配置。生产启动前必须完成本文的数据库、身份和网络边界配置。
 
 ## 进程边界
 
-三个可执行应用共享根 JSONC 配置和 `workspace_shared` 中的纯数据类型，且不通过 HTTP 相互调用。Dashboard 不导入 backend 或 dbctl；`dbctl migrate` 所执行的 Alembic 环境会复用 backend 的持久化 metadata，这是当前唯一明确的跨应用 Python 依赖。
+三个可执行应用共享根 JSONC 配置和 `workspace_shared` 中的纯数据类型，且不通过 HTTP 相互调用。Dashboard 不导入 backend 或 dbctl；dbctl 的 Alembic 环境使用显式 revision SQL，不导入 backend metadata。三个应用之间没有运行时 Python 依赖。
 
 | 可执行程序 | 职责 | 数据库身份/网络边界 |
 |---|---|---|
 | `backend` | 产品 REST、SSE、WebSocket 与领域编排 | 仅使用 application DSN；仅绑定 loopback 或 Unix socket |
 | `dashboard` / `dashboard-api` / `dashboard-gui` | 只读 CLI、私有 API 与可选 PyQt6 GUI；三者复用同一 application layer | 仅使用 dashboard 只读 DSN；默认仅内部网络 |
 | `dbctl` | 显式 bootstrap、Alembic migration、遥测保留期清理与 `psql` shell | bootstrap 使用 sudo 或终端密码验证；其余使用迁移器/目标身份；后端启动永不自动迁移 |
+
+`dbctl` 自身采用 src-layout 的分层架构：`domain` 只表达值对象与不变量，`application`
+包含四个用例及窄端口，`infrastructure` 实现 JSONC、PostgreSQL、Alembic 与本地进程适配器，
+`interfaces` 只负责 CLI/容器输入输出；`composition.py` 是唯一组合根。核心层的依赖方向由
+AST 测试执行，而不是只靠目录约定。设计取舍见
+[ADR 0004](docs/decisions/0004-dbctl-layered-domain-architecture.md)。
 
 产品路径、哪些 DTO 只是 mock，以及当前尚未冻结的传输协议，见 [docs/CONTRACT_GAPS.md](docs/CONTRACT_GAPS.md)。独立的 `workspace-shared-docs` submodule 是前后端共享契约的唯一事实来源；其中 `contracts/v1/ai-job-workspace.contract.schema.json` 会原样打入 backend wheel，但它目前不是完整 OpenAPI 或 AsyncAPI 描述。首次 clone 必须使用 `git clone --recurse-submodules`，已有 checkout 则执行 `git submodule update --init --recursive`。
 
@@ -94,7 +100,7 @@ Docker 专用 `deploy/docker/dbinit.jsonc` 只把连接端点从宿主 loopback 
 
 ### 本地凭证与最小权限
 
-以下 DSN 必须是相互独立的凭证，不能以 application DSN 代替 dashboard 或 migrator DSN。`dbctl` 将生成的角色与密码直接组成 DSN，写入权限为 `0600`、被 Git 忽略的本地 `config.jsonc`；DSN 和 HMAC secret 均不得进入可提交文件、日志、systemd unit 命令行或 shell history。bootstrap 不接受管理员 DSN：POSIX 上 `auto` 优先通过 `sudo -u postgres` 验证，Windows 或找不到 sudo 时在终端提示 `bootstrap_database_user` 的 PostgreSQL 密码。
+以下 DSN 必须是相互独立的凭证，不能以 application DSN 代替 dashboard 或 migrator DSN。`dbctl` 将生成的角色与密码直接组成 DSN，写入权限为 `0600`、被 Git 忽略的本地 `config.jsonc`；DSN 和 HMAC secret 均不得进入可提交文件、日志、systemd unit 命令行或 shell history。bootstrap 不接受管理员 DSN：只有明确的 loopback target 才允许 `auto` 选择 `sudo -u postgres`；远程 target、Windows 或找不到 sudo 时使用终端提示的 `bootstrap_database_user` 密码，显式要求远程 `sudo` 会 fail closed。
 
 | 本地 `config.jsonc` 字段 | 使用者 | 应有身份/权限 |
 |---|---|---|
@@ -120,7 +126,7 @@ Docker 专用 `deploy/docker/dbinit.jsonc` 只把连接端点从宿主 loopback 
 # 1. 先审阅脱敏、无连接的 bootstrap 计划
 uv run dbctl bootstrap --dry-run
 
-# 2. 自动选择 POSIX sudo 或跨平台终端密码验证
+# 2. loopback 上自动选择 POSIX sudo；远程/跨平台使用终端密码验证
 uv run dbctl bootstrap
 
 # 3. 以 migrator DSN 显式升级数据库
@@ -135,15 +141,15 @@ uv run dbctl shell --role migrator
 
 使用非默认位置时，同时传入 `--config <runtime.jsonc>` 与 `--dbinit <dbinit.jsonc>`。`config.jsonc` 属于本机 secret 载体，不应提交；`dbinit.jsonc` 是可审阅、可提交的声明式初始化计划。
 
-可用 `bootstrap --access-mode sudo` 强制 POSIX sudo，或用 `bootstrap --access-mode prompt` 强制跨平台 PostgreSQL 密码提示。prompt 只读取一次不回显密码，临时写入仅供本轮 psql 子进程使用的受限 pgpass 文件，并在执行结束后删除；密码不会进入 argv、`config.jsonc` 或子进程环境变量值。
+可用 `bootstrap --access-mode sudo` 强制明确 loopback 上的 POSIX sudo，或用 `bootstrap --access-mode prompt` 强制跨平台 PostgreSQL 密码提示。prompt 只读取一次不回显密码，为 maintenance database 与项目 database 分别创建精确匹配 host/port/database/user 的临时 pgpass 租约，并在执行结束后删除；密码不会进入 argv、`config.jsonc` 或普通子进程环境变量。事务 stage 通过 `psql --file=- --single-transaction` 整批执行，只有 `CREATE DATABASE` 保持独立 autocommit stage。
 
 只有 `bootstrap` 可以创建或补全私密 `config.jsonc`。`migrate`、`shell` 与执行态维护命令只读既有配置；配置缺失时直接失败，绝不会偷偷生成一套尚未写入 PostgreSQL 的新密码。`shell` 为本次 psql 创建权限为 `0600` 的临时 `PGPASSFILE`，强制 `--no-password`，继承真实 TTY，并在 psql 退出后清理文件；配置密码不会进入 argv，也不会被外部 `.pgpass` 或 `PGPASSWORD` 覆盖。
 
-首次运行和每次发布都应在受控变更窗口检查 migration revision。`bootstrap` 不能替代 migration；反过来，migration 也不创建缺失的数据库角色。
+首次运行和每次发布都应在受控变更窗口检查 migration revision。`bootstrap` 不能替代 migration；反过来，migration 也不创建缺失的数据库角色。head `20260721_0007` 只收紧 `identity.alembic_version` 的控制面 ACL，不改写业务数据；bootstrap 在每次权限收敛末尾也会再次撤销 app 对该 relation 的直接权限，因此 `bootstrap → migrate → bootstrap` 不会重新打开历史漏洞。
 
 ### 遥测保留期
 
-`observability.retention_days` 是以服务端 `observed_at` 为准的保留边界；`0` 明确禁用清理。清理不是请求路径后台任务，而是由受控调度器显式调用的有界维护命令。先完成 `20260721_0006` migration（它提供 v2 信号表、owner maintenance RLS policy 与清理索引），再按以下方式演练并执行。
+`observability.retention_days` 使用 dbctl 本轮固定的 UTC cutoff，并与数据库中的 `observed_at` 比较；`0` 明确禁用清理。清理不是请求路径后台任务，而是由受控调度器显式调用的有界维护命令。先完成 `20260721_0006` migration（它提供 v2 信号表、owner maintenance RLS policy 与清理索引），再按以下方式演练并执行。
 
 `20260721_0006` 是单事务 shadow-table 切换，不是在线双写 migration。它在取得
 `SHARE ROW EXCLUSIVE` 前执行 `SET LOCAL lock_timeout = '30s'`；任一次锁等待超过 30 秒都会让整个

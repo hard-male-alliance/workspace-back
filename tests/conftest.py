@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from backend.app import create_app
 from backend.config import BackendSettings
 from backend.infrastructure.contracts import ContractValidator
-from dbctl.config import DbctlConfigurationService
+from dbctl.infrastructure.configuration import DbctlConfigStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 """@brief 项目根目录 / Repository root directory."""
@@ -43,7 +43,7 @@ def dbctl_config_path(tmp_path: Path) -> Path:
     """
     config_path = tmp_path / "config.jsonc"
     config_path.write_text((PROJECT_ROOT / "example.jsonc").read_text(encoding="utf-8"))
-    DbctlConfigurationService(config_path, PROJECT_ROOT / "dbinit.jsonc").initialize()
+    DbctlConfigStore(config_path, PROJECT_ROOT / "dbinit.jsonc").initialize()
     return config_path
 
 
