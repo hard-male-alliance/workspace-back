@@ -151,7 +151,12 @@ jobs:
           submodules: recursive
 
       - name: Validate Compose model
-        run: docker compose --env-file .env.docker.example config --quiet
+        run: >-
+          docker compose
+          --env-file .env.docker.example
+          --profile tools
+          --profile dashboard
+          config --quiet
 
       - name: Build production image
         run: docker build --tag ai-job-workspace-backend:ci .
@@ -163,3 +168,6 @@ jobs:
           ai-job-workspace-backend:ci
           -c
           "import os; assert os.getuid() == 10001; import backend, dashboard, dbctl"
+
+      - name: Verify bootstrap client is available
+        run: docker run --rm --entrypoint psql ai-job-workspace-backend:ci --version
