@@ -4,37 +4,28 @@ Alembic 的 migration machinery 仍是同步 API；此文件只在 AsyncConnecti
 ``run_sync`` 建立清晰的同步边界，绝不把它误当成“全异步 migration API”。
 """
 
-# ruff: noqa: E402
-
 from __future__ import annotations
 
 import asyncio
-import os
 import re
-import sys
-from pathlib import Path
 from typing import Any
 
 from alembic import context
 from sqlalchemy import Connection, pool, text
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-SOURCE_ROOT = REPOSITORY_ROOT / "src"
-if str(SOURCE_ROOT) not in sys.path:
-    sys.path.insert(0, str(SOURCE_ROOT))
-
-from backend.infrastructure.persistence.database import normalize_asyncpg_dsn
-from backend.infrastructure.persistence.models import Base
-
 config = context.config
-target_metadata = Base.metadata
+target_metadata = None
 
 _VERSION_TABLE_SCHEMA = "identity"
 """@brief Alembic 版本表的 owner 管控 schema / Owner-controlled schema for Alembic versions."""
 
 _ROLE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 """@brief 经 dbctl 验证的 role 标识符模式 / dbctl-validated role identifier pattern."""
+
+_MIGRATION_LOCK_KEYS = (1_094_532_435, 1)
+"""@brief 本应用 migration 的事务级 advisory lock 键 / Transaction advisory-lock keys."""
 
 
 def _migration_url() -> str:
@@ -43,15 +34,20 @@ def _migration_url() -> str:
     @return 规范化后的 ``postgresql+asyncpg`` DSN。
     @raise RuntimeError 未配置 migrator DSN 时抛出。
 
-    @note 优先接受 Alembic 配置 ``sqlalchemy.url``，其次读取
-    ``AIWS_MIGRATOR_DATABASE_DSN``；不回退到应用运行时账号。
+    @note 只接受 dbctl 通过 Alembic attributes 注入的 config.jsonc 凭证；不读取环境变量，
+    也不经过 ConfigParser 的百分号插值。
     """
-    url = config.get_main_option("sqlalchemy.url") or os.environ.get("AIWS_MIGRATOR_DATABASE_DSN")
-    if not url:
-        raise RuntimeError(
-            "missing Alembic sqlalchemy.url or AIWS_MIGRATOR_DATABASE_DSN for migration"
-        )
-    return normalize_asyncpg_dsn(url)
+    raw_url = config.attributes.get("aiws.migration_dsn")
+    if not isinstance(raw_url, str) or not raw_url:
+        raise RuntimeError("missing dbctl-provided config migration identity")
+    url: URL = make_url(raw_url)
+    if url.get_backend_name() != "postgresql":
+        raise RuntimeError("dbctl migration identity is not PostgreSQL")
+    if url.drivername == "postgresql":
+        url = url.set(drivername="postgresql+asyncpg")
+    if url.drivername != "postgresql+asyncpg":
+        raise RuntimeError("dbctl migration identity requires the asyncpg driver")
+    return url.render_as_string(hide_password=False)
 
 
 def _owner_role_identifier() -> str:
@@ -108,6 +104,13 @@ def _run_sync_migrations(connection: Connection) -> None:
         compare_server_default=True,
     )
     with context.begin_transaction():
+        connection.execute(text("SET LOCAL lock_timeout = '30s'"))
+        connection.execute(
+            text(
+                "SELECT pg_advisory_xact_lock("
+                f"{_MIGRATION_LOCK_KEYS[0]}, {_MIGRATION_LOCK_KEYS[1]})"
+            )
+        )
         connection.execute(text(f"SET LOCAL ROLE {_owner_role_identifier()}"))
         connection.execute(text(f"CREATE SCHEMA IF NOT EXISTS {_VERSION_TABLE_SCHEMA}"))
         context.run_migrations()

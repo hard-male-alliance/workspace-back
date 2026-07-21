@@ -55,28 +55,26 @@ class RecordingBootstrapRunner:
             self.database_present = True
 
 
-def _composition_with_secret() -> tuple[DbctlComposition, str]:
+def _composition_with_secret(config_path: Path) -> tuple[DbctlComposition, str]:
     """@brief 构造只使用内存环境的 dbctl composition / Construct a dbctl composition using only an in-memory environment.
 
     @return composition 与用于泄漏检测的秘密 / Composition and secret used for leakage detection.
     """
 
-    secret = "password-sentinel-must-never-print"
     composition = DbctlComposition.from_config_path(
-        PROJECT_ROOT / "config.jsonc",
-        environ={
-            "AIWS_APP_DATABASE_DSN": (
-                f"postgresql://workspace_app:{secret}@db.example.test:5432/ai_job_workspace"
-            )
-        },
+        config_path,
+        dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
+        environ={},
     )
-    return composition, secret
+    return composition, composition.settings.database.application.password
 
 
-def test_dbctl_bootstrap_plan_is_least_privilege_and_secret_free_when_displayed() -> None:
+def test_dbctl_bootstrap_plan_is_least_privilege_and_secret_free_when_displayed(
+    dbctl_config_path: Path,
+) -> None:
     """@brief 计划应定义四类最小权限角色并在展示层彻底脱敏 / Plan must define four least-privilege roles and fully redact display output."""
 
-    composition, secret = _composition_with_secret()
+    composition, secret = _composition_with_secret(dbctl_config_path)
     plan = composition.build_bootstrap_plan()
     all_statements = (
         *plan.pre_database_statements,
@@ -107,15 +105,14 @@ def test_dbctl_bootstrap_plan_is_least_privilege_and_secret_free_when_displayed(
     )
     assert (
         'ALTER DEFAULT PRIVILEGES FOR ROLE "workspace_owner" IN SCHEMA "observability" '
-        'GRANT INSERT ON TABLES TO "workspace_app";'
-        not in all_sql
+        'GRANT INSERT ON TABLES TO "workspace_app";' not in all_sql
     )
     assert "ALTER SYSTEM" not in all_sql
     assert "pg_hba.conf" not in all_sql
 
     password_statements = [statement for statement in all_statements if statement.parameters]
     assert len(password_statements) == 3
-    assert all(statement.parameters != (secret,) for statement in password_statements)
+    assert sum(statement.parameters == (secret,) for statement in password_statements) == 1
     assert all(secret not in repr(statement) for statement in password_statements)
     assert secret not in dry_run
     assert "<redacted>" in dry_run
@@ -126,6 +123,7 @@ def test_dbctl_bootstrap_plan_is_least_privilege_and_secret_free_when_displayed(
 def test_dbctl_dry_run_never_invokes_bootstrap_execution(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    dbctl_config_path: Path,
 ) -> None:
     """@brief CLI --dry-run 不得创建 runner、连接数据库或执行 SQL / CLI --dry-run must not create a runner, connect to a database, or execute SQL.
 
@@ -153,7 +151,9 @@ def test_dbctl_dry_run_never_invokes_bootstrap_execution(
     exit_code = main(
         [
             "--config",
-            str(PROJECT_ROOT / "config.jsonc"),
+            str(dbctl_config_path),
+            "--dbinit",
+            str(PROJECT_ROOT / "dbinit.jsonc"),
             "bootstrap",
             "--dry-run",
         ]
@@ -166,14 +166,16 @@ def test_dbctl_dry_run_never_invokes_bootstrap_execution(
     assert "<redacted>" in captured.out
 
 
-def test_bootstrap_executor_skips_existing_database_on_repeat_without_external_io() -> None:
+def test_bootstrap_executor_skips_existing_database_on_repeat_without_external_io(
+    dbctl_config_path: Path,
+) -> None:
     """@brief 同一计划第二次执行不应再次发送 CREATE DATABASE / A second execution of the same plan must not send CREATE DATABASE again.
 
     该测试只使用 RecordingBootstrapRunner；它验证幂等编排而不启动数据库、sudo 或
     psql。
     """
 
-    composition, _ = _composition_with_secret()
+    composition, _ = _composition_with_secret(dbctl_config_path)
     plan = composition.build_bootstrap_plan()
     runner = RecordingBootstrapRunner()
     executor = BootstrapExecutor(runner)
@@ -204,6 +206,7 @@ def test_bootstrap_executor_skips_existing_database_on_repeat_without_external_i
 
 def test_bootstrap_runner_uses_terminal_sudo_psql_on_supported_posix(
     monkeypatch: pytest.MonkeyPatch,
+    dbctl_config_path: Path,
 ) -> None:
     """@brief 支持 sudo 的 POSIX 可显式使用 sudo psql / Supported POSIX platforms can explicitly use sudo psql.
 
@@ -223,7 +226,7 @@ def test_bootstrap_runner_uses_terminal_sudo_psql_on_supported_posix(
         return subprocess.CompletedProcess(command, 0, stdout="f\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    composition, _ = _composition_with_secret()
+    composition, _ = _composition_with_secret(dbctl_config_path)
     runner = composition._bootstrap_runner(access_mode=BootstrapAccessMode.SUDO)
     assert isinstance(runner, LocalPsqlBootstrapRunner)
     assert runner.database_exists("ai_job_workspace") is False

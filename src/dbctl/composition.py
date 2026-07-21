@@ -14,10 +14,10 @@ from .bootstrap import (
     BootstrapPlanBuilder,
 )
 from .config import (
-    DatabaseRole,
     DbctlConfigurationService,
     DbctlSettings,
 )
+from .domain import DatabaseRole, LoginRole
 from .migration import AlembicMigrationRunner
 from .package_resources import alembic_script_location
 from .retention import (
@@ -31,7 +31,7 @@ from .retention import (
     TelemetryPruneResult,
 )
 from .runners import BootstrapAccessMode, LocalPsqlBootstrapRunner
-from .shell import PasswordPolicy, PreparedPsqlCommand, PsqlShellLauncher
+from .shell import PreparedPsqlCommand, PsqlShellLauncher
 
 
 @dataclass(slots=True)
@@ -56,6 +56,7 @@ class DbctlComposition:
         *,
         dbinit_path: Path | str | None = None,
         environ: MutableMapping[str, str] | None = None,
+        initialize_config: bool = False,
     ) -> DbctlComposition:
         """@brief 从 JSONC 配置构造 composition root / Construct composition root from JSONC configuration.
 
@@ -64,11 +65,17 @@ class DbctlComposition:
         @param dbinit_path 独立数据库初始化声明路径 / Separate database-initialization declaration path.
         @param environ 可选可变环境映射；默认使用当前 ``os.environ``。
         / Optional mutable environment mapping; defaults to current ``os.environ``.
+        @param initialize_config 仅 bootstrap 可允许创建或补全私密配置。
+        / Only bootstrap may allow creating or completing private config.
         @return 已加载但尚未执行外部 I/O 的 DbctlComposition。
         / DbctlComposition loaded without executing external I/O.
         """
         configuration_service = DbctlConfigurationService(config_path, dbinit_path)
-        loaded_settings = configuration_service.load()
+        loaded_settings = (
+            configuration_service.initialize()
+            if initialize_config
+            else configuration_service.load()
+        )
         return cls(
             settings=loaded_settings,
             _environ=os.environ if environ is None else environ,
@@ -116,7 +123,7 @@ class DbctlComposition:
         """
         with alembic_script_location() as script_location:
             AlembicMigrationRunner(
-                self.settings.require_migrator_dsn(),
+                self.settings.require_migrator_login(),
                 script_location,
                 self.settings.administration.owner_role,
                 self.settings.administration.app_role,
@@ -163,7 +170,7 @@ class DbctlComposition:
         if request.disabled or not request.apply:
             return TelemetryPruneExecutor(None).execute(request)
         runner = PsycopgTelemetryRetentionRunner(
-            self.settings.require_migrator_dsn(),
+            self.settings.require_migrator_login().dsn,
             owner_role=self.settings.administration.owner_role,
             observability_schema=self.settings.administration.observability_schema,
         )
@@ -171,31 +178,25 @@ class DbctlComposition:
 
     def prepare_shell(
         self,
-        role: DatabaseRole,
-        *,
-        password_policy: PasswordPolicy | str = PasswordPolicy.AUTO,
+        role: LoginRole,
     ) -> PreparedPsqlCommand:
         """@brief 为某个登录 role 准备 psql shell / Prepare psql shell for a login role.
 
         @param role app、migrator 或 dashboard 登录角色 / app, migrator, or dashboard login role.
-        @param password_policy 密码来源策略 / Password-source policy.
         @return 不含密码 argv 的已准备 psql 命令 / Prepared psql command with password-free argv.
         @raise DbctlConfigurationError role 不是登录身份或相应 DSN 缺失时抛出。
         / Raised when role is not a login identity or its DSN is missing.
         """
-        dsn = self.settings.require_shell_dsn(role)
-        return PsqlShellLauncher(self._environ).prepare(
-            dsn,
-            password_policy=password_policy,
-        )
+        login = self.settings.require_shell_login(role)
+        return PsqlShellLauncher(self._environ).prepare(login)
 
-    def exec_prepared_shell(self, prepared: PreparedPsqlCommand) -> None:
-        """@brief 直接 exec 已准备的 psql shell / Directly exec a prepared psql shell.
+    def run_prepared_shell(self, prepared: PreparedPsqlCommand) -> int:
+        """@brief 运行并等待已准备的 psql shell / Run and wait for a prepared psql shell.
 
         @param prepared 不含密码 argv 的 psql 命令 / psql command with password-free argv.
-        @return 正常情况下不返回 / Does not normally return.
+        @return psql 退出码 / psql exit status.
         """
-        PsqlShellLauncher(self._environ).exec_prepared(prepared)
+        return PsqlShellLauncher(self._environ).run(prepared)
 
     def _bootstrap_runner(
         self,

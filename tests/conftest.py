@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from backend.app import create_app
 from backend.config import BackendSettings
 from backend.infrastructure.contracts import ContractValidator
+from dbctl.config import DbctlConfigurationService
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 """@brief 项目根目录 / Repository root directory."""
@@ -31,6 +32,19 @@ CONTRACT_SCHEMA_JSONC_PATH = CONTRACT_DIRECTORY / "ai-job-workspace.contract.sch
 
 CONTRACT_EXAMPLES_PATH = CONTRACT_DIRECTORY / "ai-job-workspace.contract.examples.jsonc"
 """@brief 已发布 JSONC 示例路径 / Published JSONC examples path."""
+
+
+@pytest.fixture
+def dbctl_config_path(tmp_path: Path) -> Path:
+    """@brief 初始化隔离的 dbctl 私密配置 / Initialize an isolated private dbctl config.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @return 含随机测试凭证的 config.jsonc 路径 / config.jsonc path with random test credentials.
+    """
+    config_path = tmp_path / "config.jsonc"
+    config_path.write_text((PROJECT_ROOT / "example.jsonc").read_text(encoding="utf-8"))
+    DbctlConfigurationService(config_path, PROJECT_ROOT / "dbinit.jsonc").initialize()
+    return config_path
 
 
 @pytest.fixture

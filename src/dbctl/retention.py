@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final, Protocol, runtime_checkable
+from typing import Any, Final, Protocol
 
 from .errors import (
     DbctlConfigurationError,
@@ -175,8 +175,7 @@ class TelemetryPruneResult:
         """
         if self.disabled:
             return (
-                "dbctl prune-telemetry：observability.retention_days=0，"
-                "清理已停用；未连接数据库。"
+                "dbctl prune-telemetry：observability.retention_days=0，清理已停用；未连接数据库。"
             )
         if not self.applied:
             if self.cutoff is None:
@@ -199,7 +198,7 @@ class TelemetryPruneResult:
             f"已提交 {self.batch_count}/{self.max_batches} 个短事务{limit_note}。"
         )
 
-@runtime_checkable
+
 class TelemetryRetentionRunner(Protocol):
     """@brief 受控遥测删除 I/O 端口 / Controlled telemetry-deletion I/O port.
 
@@ -398,9 +397,7 @@ class PsycopgTelemetryRetentionRunner:
             " WHERE telemetry.ctid = stale_rows.ctid;"
         )
         self._has_stale_sql = (
-            "SELECT EXISTS ("
-            f"SELECT 1 FROM {relation} WHERE observed_at < %s LIMIT 1"
-            ");"
+            f"SELECT EXISTS (SELECT 1 FROM {relation} WHERE observed_at < %s LIMIT 1);"
         )
 
     def delete_batch(
@@ -436,7 +433,7 @@ class PsycopgTelemetryRetentionRunner:
                 if not isinstance(deleted, int) or isinstance(deleted, bool) or deleted < 0:
                     raise TelemetryRetentionExecutionError("遥测保留期删除计数不可用。")
                 return deleted
-        except (DbctlConfigurationError, DbctlDependencyError):
+        except DbctlConfigurationError, DbctlDependencyError:
             raise
         except Exception as error:
             raise TelemetryRetentionExecutionError(
@@ -475,7 +472,7 @@ class PsycopgTelemetryRetentionRunner:
                 if row is None or not isinstance(row[0], bool):
                     raise TelemetryRetentionExecutionError("遥测保留期剩余状态不可用。")
                 return row[0]
-        except (DbctlConfigurationError, DbctlDependencyError, TelemetryRetentionExecutionError):
+        except DbctlConfigurationError, DbctlDependencyError, TelemetryRetentionExecutionError:
             raise
         except Exception as error:
             raise TelemetryRetentionExecutionError(
@@ -500,7 +497,9 @@ class PsycopgTelemetryRetentionRunner:
         try:
             return psycopg.connect(self._migrator_dsn, autocommit=False)
         except Exception as error:
-            raise TelemetryRetentionExecutionError("无法连接遥测清理数据库；连接详情已隐藏。") from error
+            raise TelemetryRetentionExecutionError(
+                "无法连接遥测清理数据库；连接详情已隐藏。"
+            ) from error
 
     def _prepare_short_transaction(
         self,
@@ -610,12 +609,7 @@ def _require_bounded_integer(value: object, name: str, *, lower: int, upper: int
     @raise DbctlConfigurationError 候选值不是区间内整数时抛出。
     / Raised when the candidate is not an integer in the range.
     """
-    if (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or value < lower
-        or value > upper
-    ):
+    if not isinstance(value, int) or isinstance(value, bool) or value < lower or value > upper:
         raise DbctlConfigurationError(f"{name} 必须介于 {lower} 与 {upper} 之间。")
 
 

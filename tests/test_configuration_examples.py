@@ -14,6 +14,7 @@ from dashboard.application.errors import DashboardConfigurationError
 from dashboard.infrastructure.config import DashboardQuerySettings, DashboardSettings
 from dbctl.config import DbctlConfigurationService
 from dbctl.connection import parse_postgres_dsn
+from dbctl.errors import DbctlConfigurationError
 from workspace_shared.jsonc import ConfigurationError, load_jsonc
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -52,7 +53,7 @@ def test_dbctl_creates_private_config_and_loads_separate_dbinit(
     config_path = tmp_path / "config.jsonc"
     dbctl = DbctlConfigurationService(
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
-    ).load()
+    ).initialize()
 
     generated = load_jsonc(config_path)
     assert "database_role_passwords" not in generated
@@ -77,8 +78,8 @@ def test_dbctl_creates_private_config_and_loads_separate_dbinit(
     assert dbctl.administration.observability_schema == "observability"
 
 
-def test_dbctl_migrates_legacy_password_mapping_without_rotation(tmp_path: Path) -> None:
-    """@brief 旧密码映射应迁移为真实 DSN 且不轮换 / Legacy passwords migrate to actual DSNs without rotation.
+def test_dbctl_rejects_legacy_password_mapping_without_rewriting_config(tmp_path: Path) -> None:
+    """@brief 旧密码表不得被静默迁移或改写 / Legacy password tables fail without rewriting config.
 
     @param tmp_path pytest 临时目录 / pytest temporary directory.
     @return 无返回值 / No return value.
@@ -95,23 +96,12 @@ def test_dbctl_migrates_legacy_password_mapping_without_rotation(tmp_path: Path)
     root["database_role_passwords"] = legacy_passwords
     config_path = tmp_path / "config.jsonc"
     config_path.write_text(json.dumps(root), encoding="utf-8")
+    config_path.chmod(0o600)
 
-    DbctlConfigurationService(config_path, PROJECT_ROOT / "dbinit.jsonc").load()
-
-    migrated = load_jsonc(config_path)
-    assert "database_role_passwords" not in migrated
-    assert (
-        parse_postgres_dsn(migrated["database"]["migrator_dsn"]).password
-        == legacy_passwords["migrator"]
-    )
-    assert (
-        parse_postgres_dsn(migrated["database"]["application_dsn"]).password
-        == legacy_passwords["app"]
-    )
-    assert (
-        parse_postgres_dsn(migrated["database"]["dashboard_dsn"]).password
-        == legacy_passwords["dashboard"]
-    )
+    original = config_path.read_text(encoding="utf-8")
+    with pytest.raises(DbctlConfigurationError, match="application_dsn"):
+        DbctlConfigurationService(config_path, PROJECT_ROOT / "dbinit.jsonc").load()
+    assert config_path.read_text(encoding="utf-8") == original
 
 
 def test_backend_postgresql_mode_requires_application_dsn_in_config(tmp_path: Path) -> None:
@@ -182,9 +172,7 @@ def test_backend_rejects_multiple_rotators_for_one_file(tmp_path: Path) -> None:
     """
 
     root = load_jsonc(PROJECT_ROOT / "example.jsonc")
-    file_route = next(
-        route for route in root["logging"]["routes"] if route["sink"] == "file"
-    )
+    file_route = next(route for route in root["logging"]["routes"] if route["sink"] == "file")
     root["logging"]["routes"].append(dict(file_route))
     path = tmp_path / "config.jsonc"
     path.write_text(json.dumps(root), encoding="utf-8")

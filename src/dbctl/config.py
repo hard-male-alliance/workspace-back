@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, assert_never
 from urllib.parse import quote
 
 import json5
 
 from .connection import parse_postgres_dsn
+from .domain import DatabaseLogin, DatabaseRole, LoginRole
 from .errors import DbctlConfigurationError
 from .identifiers import validate_postgres_identifier
 from .package_resources import read_default_text
@@ -44,15 +45,6 @@ _DEFAULT_DBINIT_NAME: Final[str] = "dbinit.jsonc"
 
 _DEFAULT_EXAMPLE_NAME: Final[str] = "example.jsonc"
 """@brief 默认公开配置模板名 / Default public configuration-template name."""
-
-
-class DatabaseRole(StrEnum):
-    """@brief dbctl 管理的角色类别 / Role categories managed by dbctl."""
-
-    OWNER = "owner"
-    MIGRATOR = "migrator"
-    APP = "app"
-    DASHBOARD = "dashboard"
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,47 +81,52 @@ class ObservabilityRetentionSettings:
 
 @dataclass(frozen=True, slots=True)
 class DatabaseConnectionSettings:
-    """@brief PostgreSQL DSN 设置 / PostgreSQL DSN settings.
+    """@brief PostgreSQL 登录身份设置 / PostgreSQL login-identity settings.
 
     @param mode 运行时数据库模式；dbctl 不会据此决定是否执行 bootstrap。
     / Runtime database mode; dbctl does not use it to decide whether bootstrap may run.
     """
 
     mode: str
-    application_dsn: str = field(repr=False)
-    migrator_dsn: str = field(repr=False)
-    dashboard_dsn: str = field(repr=False)
+    application: DatabaseLogin = field(repr=False)
+    migrator: DatabaseLogin = field(repr=False)
+    dashboard: DatabaseLogin = field(repr=False)
 
     def __post_init__(self) -> None:
-        """@brief 校验 DSN 环境变量名 / Validate DSN environment-variable names.
+        """@brief 校验三个配置身份与用途严格对应 / Validate identities against their purposes.
 
         @return 无返回值 / No return value.
-        @raise DbctlConfigurationError 字段为空或不是合法环境变量名时抛出。
-        / Raised when a field is empty or not a valid environment-variable name.
+        @raise DbctlConfigurationError mode 或登录身份用途不匹配时抛出。
+        / Raised when mode or a login identity purpose is invalid.
         """
         if not isinstance(self.mode, str) or not self.mode.strip():
             raise DbctlConfigurationError("database.mode 必须是非空字符串。")
         object.__setattr__(self, "mode", self.mode.strip())
-        for field_name in ("application_dsn", "migrator_dsn", "dashboard_dsn"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise DbctlConfigurationError(f"database.{field_name} 必须是非空字符串。")
-            object.__setattr__(self, field_name, value.strip())
+        expected_roles = {
+            "application": LoginRole.APP,
+            "migrator": LoginRole.MIGRATOR,
+            "dashboard": LoginRole.DASHBOARD,
+        }
+        for field_name, expected_role in expected_roles.items():
+            login = getattr(self, field_name)
+            if not isinstance(login, DatabaseLogin) or login.role is not expected_role:
+                raise DbctlConfigurationError(f"database.{field_name} 登录身份用途不匹配。")
+        if len({self.application.password, self.migrator.password, self.dashboard.password}) != 3:
+            raise DbctlConfigurationError("三个登录 role 必须使用互不相同的密码。")
 
-    def dsn_for(self, role: DatabaseRole) -> str:
-        """@brief 获取登录角色的直接 DSN / Get the direct DSN for a login role.
+    def login_for(self, role: LoginRole) -> DatabaseLogin:
+        """@brief 获取用途对应的完整登录身份 / Get the complete login identity for a purpose.
 
         @param role 请求连接的角色类别 / Requested connection role.
-        @return config.jsonc 中对应的 DSN / Corresponding DSN from config.jsonc.
-        @raise DbctlConfigurationError 请求 NOLOGIN owner 时抛出 / Raised for the NOLOGIN owner.
+        @return config.jsonc 中解析并验证的 DatabaseLogin / Parsed and validated config login.
         """
-        if role is DatabaseRole.APP:
-            return self.application_dsn
-        if role is DatabaseRole.MIGRATOR:
-            return self.migrator_dsn
-        if role is DatabaseRole.DASHBOARD:
-            return self.dashboard_dsn
-        raise DbctlConfigurationError("workspace_owner 是 NOLOGIN 角色，不能启动 psql shell。")
+        if role is LoginRole.APP:
+            return self.application
+        if role is LoginRole.MIGRATOR:
+            return self.migrator
+        if role is LoginRole.DASHBOARD:
+            return self.dashboard
+        assert_never(role)
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,60 +290,48 @@ class DbctlSettings:
     database: DatabaseConnectionSettings
     administration: DatabaseAdministrationSettings
     observability: ObservabilityRetentionSettings
-    role_passwords: Mapping[DatabaseRole, str] = field(repr=False)
 
-    def __post_init__(self) -> None:
-        """@brief 冻结本地生成的登录角色密码 / Freeze locally generated login-role passwords.
+    @property
+    def role_passwords(self) -> Mapping[DatabaseRole, str]:
+        """@brief 派生 bootstrap 所需的角色密码视图 / Derive the bootstrap role-password view.
 
-        @return 无返回值 / No return value.
-        @raise DbctlConfigurationError 密码映射包含 owner、未知角色或空密码时抛出。
-        / Raised when the password map contains owner, an unknown role, or an empty password.
+        @return 不保存重复 secret 状态的只读映射 / Read-only mapping without duplicate secret state.
         """
-        normalized: dict[DatabaseRole, str] = {}
-        for raw_role, password in self.role_passwords.items():
-            try:
-                role = DatabaseRole(raw_role)
-            except ValueError as error:
-                raise DbctlConfigurationError("数据库凭证包含未知角色。") from error
-            if role is DatabaseRole.OWNER:
-                raise DbctlConfigurationError("NOLOGIN owner role 不能配置密码。")
-            if not isinstance(password, str) or not password or "\x00" in password:
-                raise DbctlConfigurationError("登录 role 密码必须是非空且不含 NUL 的字符串。")
-            normalized[role] = password
-        required_roles = {DatabaseRole.MIGRATOR, DatabaseRole.APP, DatabaseRole.DASHBOARD}
-        if set(normalized) != required_roles:
-            raise DbctlConfigurationError("数据库凭证必须完整包含三个登录角色。")
-        object.__setattr__(self, "role_passwords", MappingProxyType(normalized))
+        return MappingProxyType(
+            {
+                login.role.as_database_role(): login.password
+                for login in (
+                    self.database.migrator,
+                    self.database.application,
+                    self.database.dashboard,
+                )
+            }
+        )
 
-    def require_migrator_dsn(self) -> str:
-        """@brief 获取迁移 DSN / Get the migrator DSN.
+    def require_migrator_login(self) -> DatabaseLogin:
+        """@brief 获取迁移专用完整登录身份 / Get the complete migrator login identity.
 
-        @return 非空 migrator DSN / Non-empty migrator DSN.
-        @raise DbctlConfigurationError 迁移 DSN 未设置时抛出，且不回显 DSN。
-        / Raised when migrator DSN is absent without echoing it.
+        @return config.jsonc 中的 migrator DatabaseLogin / Migrator DatabaseLogin from config.
         """
-        return self.database.migrator_dsn
+        return self.database.migrator
 
-    def require_shell_dsn(self, role: DatabaseRole) -> str:
-        """@brief 从环境读取 shell 身份对应的 DSN / Read the DSN for a shell identity.
+    def require_shell_login(self, role: LoginRole) -> DatabaseLogin:
+        """@brief 获取 shell 身份对应的完整配置凭证 / Get configured shell credentials.
 
         @param role 请求 shell 的可登录角色 / Login role requested for shell.
-        @return 非空的角色 DSN / Non-empty role DSN.
-        @raise DbctlConfigurationError DSN 缺失或请求 owner shell 时抛出。
-        / Raised when the DSN is missing or an owner shell is requested.
+        @return 与角色用途绑定的 DatabaseLogin / DatabaseLogin bound to the requested purpose.
         """
-        return self.database.dsn_for(role)
+        return self.database.login_for(role)
 
 
 class DbctlConfigurationService:
-    """@brief 读取私密运行配置与独立 dbinit 声明 / Load private runtime config and the separate dbinit declaration.
+    """@brief 初始化或只读加载私密配置与 dbinit / Initialize or read private config and dbinit.
 
-    默认 ``config.jsonc`` 是被 Git 忽略的本地运行配置，首次缺失时由 ``example.jsonc``
-    生成并写入随机登录角色密码；``dbinit.jsonc`` 是可提交、无密钥的数据库目标状态。
-    显式路径缺失时不会回退内置资源。/ Default ``config.jsonc`` is Git-ignored local runtime
-    configuration. When absent it is generated from ``example.jsonc`` and populated with random
-    login-role passwords; ``dbinit.jsonc`` is the committable, secret-free desired database state.
-    Missing explicit paths never fall back to bundled resources.
+    ``initialize()`` 是 bootstrap 独占的写边界：缺失时从模板生成并写入随机登录密码；
+    ``load()`` 永远只读，供 migrate、shell 和维护命令使用。``dbinit.jsonc`` 仍是可提交、
+    无密钥的数据库目标状态。/ ``initialize()`` is bootstrap's exclusive write boundary and
+    generates missing login credentials from the template. ``load()`` is always read-only for
+    migrate, shell, and maintenance commands. ``dbinit.jsonc`` remains secret-free desired state.
     """
 
     def __init__(
@@ -369,7 +354,6 @@ class DbctlConfigurationService:
             if dbinit_path is None
             else Path(dbinit_path)
         )
-        self._allow_packaged_config_fallback = uses_default_config
         self._allow_packaged_dbinit_fallback = uses_default_config and dbinit_path is None
 
     @property
@@ -389,11 +373,28 @@ class DbctlConfigurationService:
         return self._dbinit_path
 
     def load(self) -> DbctlSettings:
-        """@brief 加载 dbctl 设置 / Load dbctl settings.
+        """@brief 只读加载已由 bootstrap 初始化的设置 / Read existing bootstrap-initialized settings.
 
         @return 已完整验证的 DbctlSettings / Fully validated DbctlSettings.
         @raise DbctlConfigurationError 文件缺失、JSONC 无效或所需配置节不合规时抛出。
         / Raised for a missing file, invalid JSONC, or malformed required configuration sections.
+        """
+        return self._load(initialize=False)
+
+    def initialize(self) -> DbctlSettings:
+        """@brief 为 bootstrap 初始化私密配置后加载 / Initialize private config for bootstrap.
+
+        @return 已完整验证且可执行 bootstrap 的 DbctlSettings / Validated bootstrap settings.
+        @note 只有此入口允许创建 config、生成密码或原子写回 DSN。
+        / Only this entry point may create config, generate passwords, or atomically persist DSNs.
+        """
+        return self._load(initialize=True)
+
+    def _load(self, *, initialize: bool) -> DbctlSettings:
+        """@brief 按显式类型状态加载配置 / Load config under an explicit initialization state.
+
+        @param initialize 是否允许 bootstrap 初始化副作用 / Whether bootstrap initialization is allowed.
+        @return 已完整验证的 DbctlSettings / Fully validated DbctlSettings.
         """
         dbinit = self._load_dbinit_mapping()
         administration = _require_mapping(
@@ -426,14 +427,26 @@ class DbctlConfigurationService:
             host=_required_text(endpoint_mapping, "host"),
             port=_require_port(endpoint_mapping, "port"),
         )
-        root = self._load_or_create_private_root_mapping(administration_settings, endpoint)
+        root = (
+            self._load_or_create_private_root_mapping(administration_settings, endpoint)
+            if initialize
+            else self._load_mapping_file(self._config_path, "dbctl 配置")
+        )
+        if not initialize:
+            self._validate_private_permissions()
         database = _require_mapping(root.get("database"), "database")
         observability = _require_mapping(root.get("observability"), "observability")
         connection_settings = DatabaseConnectionSettings(
             mode=_required_text(database, "mode"),
-            application_dsn=_required_text(database, "application_dsn"),
-            migrator_dsn=_required_text(database, "migrator_dsn"),
-            dashboard_dsn=_required_text(database, "dashboard_dsn"),
+            application=_database_login(
+                database, "application_dsn", LoginRole.APP, administration_settings
+            ),
+            migrator=_database_login(
+                database, "migrator_dsn", LoginRole.MIGRATOR, administration_settings
+            ),
+            dashboard=_database_login(
+                database, "dashboard_dsn", LoginRole.DASHBOARD, administration_settings
+            ),
         )
         return DbctlSettings(
             database=connection_settings,
@@ -441,8 +454,25 @@ class DbctlConfigurationService:
             observability=ObservabilityRetentionSettings(
                 retention_days=_require_non_negative_int(observability, "retention_days"),
             ),
-            role_passwords=_passwords_from_dsns(connection_settings, administration_settings),
         )
+
+    def _validate_private_permissions(self) -> None:
+        """@brief 只读验证 config 不向组或其他用户开放 / Validate private config permissions.
+
+        @return 无返回值 / No return value.
+        @raise DbctlConfigurationError POSIX 权限允许 group/world 访问时抛出。
+        / Raised when POSIX permissions grant any group/world access.
+        """
+        if os.name == "nt":
+            return
+        try:
+            mode = self._config_path.stat().st_mode & 0o777
+        except OSError as error:
+            raise DbctlConfigurationError("无法检查 config.jsonc 文件权限。") from error
+        if mode & 0o077:
+            raise DbctlConfigurationError(
+                "config.jsonc 权限必须为 0600，拒绝读取可外泄的数据库密码。"
+            )
 
     def _load_dbinit_mapping(self) -> dict[str, Any]:
         """@brief 读取显式 dbinit 或默认内置声明 / Load explicit dbinit or the bundled default declaration.
@@ -468,8 +498,6 @@ class DbctlConfigurationService:
         / Raised when the template is absent, the file is unwritable, or configuration is invalid.
         """
         if not self._config_path.is_file():
-            if not self._allow_packaged_config_fallback:
-                raise DbctlConfigurationError(f"config.jsonc 不存在：{self._config_path}")
             template_path = self._config_path.parent / _DEFAULT_EXAMPLE_NAME
             template_text: str
             """@brief 即将落盘的公开模板文本 / Public template text to persist."""
@@ -635,13 +663,6 @@ def _parse_schemas(administration: Mapping[str, Any]) -> tuple[str, ...]:
         observability_schema = _text_with_default(
             administration, "observability_schema", "observability"
         )
-        if "application_schema" in administration or "schema_name" in administration:
-            application_schema = _text_with_default(
-                administration,
-                "application_schema",
-                administration.get("schema_name", "workspace"),
-            )
-            return tuple(dict.fromkeys((application_schema, observability_schema)))
         return tuple(
             observability_schema if schema == "observability" else schema
             for schema in _DEFAULT_BOOTSTRAP_SCHEMAS
@@ -667,55 +688,41 @@ def _ensure_database_dsns(
     @param administration 角色与数据库声明 / Role and database declaration.
     @param endpoint DSN 连接端点 / DSN connection endpoint.
     @return 配置是否发生变化 / Whether the configuration changed.
-    @note 旧版 database_role_passwords 会被原地迁移并删除，密码不会轮换。
-    / Legacy database_role_passwords is migrated in place and removed without rotating passwords.
+    @note 只为缺失 DSN 生成新密码；已存在但不完整的配置会直接失败。
+    / Generates passwords only for absent DSNs; existing incomplete configuration fails closed.
     """
     raw_database = root.get("database")
     if not isinstance(raw_database, dict):
         raise DbctlConfigurationError("database 必须是对象。")
-    legacy_credentials = root.get("database_role_passwords", {})
-    if not isinstance(legacy_credentials, Mapping):
-        raise DbctlConfigurationError("database_role_passwords 必须是对象。")
-
+    if "database_role_passwords" in root:
+        raise DbctlConfigurationError(
+            "不再支持 database_role_passwords；请删除旧配置并重新运行 bootstrap。"
+        )
     fields = {
-        DatabaseRole.MIGRATOR: "migrator_dsn",
-        DatabaseRole.APP: "application_dsn",
-        DatabaseRole.DASHBOARD: "dashboard_dsn",
+        LoginRole.MIGRATOR: "migrator_dsn",
+        LoginRole.APP: "application_dsn",
+        LoginRole.DASHBOARD: "dashboard_dsn",
     }
-    passwords: dict[DatabaseRole, str] = {}
+    passwords: dict[LoginRole, str] = {}
     changed = False
     for role, field_name in fields.items():
         raw_dsn = raw_database.get(field_name)
         if isinstance(raw_dsn, str) and raw_dsn.strip():
-            parsed = parse_postgres_dsn(raw_dsn)
-            if parsed.user != administration.role_name(role) or not parsed.password:
-                raise DbctlConfigurationError(
-                    f"database.{field_name} 必须包含 dbinit.jsonc 声明的角色和非空密码。"
-                )
-            passwords[role] = parsed.password
+            login = _database_login(raw_database, field_name, role, administration)
+            passwords[role] = login.password
             continue
-        legacy_password = legacy_credentials.get(role.value)
-        if legacy_password is not None and (
-            not isinstance(legacy_password, str) or not legacy_password or "\x00" in legacy_password
-        ):
-            raise DbctlConfigurationError(
-                f"database_role_passwords.{role.value} 必须是非空字符串。"
-            )
-        password = legacy_password or secrets.token_urlsafe(32)
+        password = secrets.token_urlsafe(32)
         passwords[role] = password
         raw_database[field_name] = _build_postgres_dsn(
             endpoint=endpoint,
             database_name=administration.database_name,
-            role_name=administration.role_name(role),
+            role_name=administration.role_name(role.as_database_role()),
             password=password,
         )
         changed = True
 
     if len(set(passwords.values())) != len(passwords):
         raise DbctlConfigurationError("三个登录 role 必须使用互不相同的密码。")
-    if "database_role_passwords" in root:
-        del root["database_role_passwords"]
-        changed = True
     return changed
 
 
@@ -745,23 +752,38 @@ def _build_postgres_dsn(
     )
 
 
-def _passwords_from_dsns(
-    database: DatabaseConnectionSettings,
+def _database_login(
+    database: Mapping[str, Any],
+    field_name: str,
+    role: LoginRole,
     administration: DatabaseAdministrationSettings,
-) -> dict[DatabaseRole, str]:
-    """@brief 从实际 DSN 派生 bootstrap 密码 / Derive bootstrap passwords from actual DSNs.
+) -> DatabaseLogin:
+    """@brief 从一个 config DSN 构造类型化登录身份 / Build a typed login from one config DSN.
 
-    @param database 三个运行时 DSN / Three runtime DSNs.
+    @param database config.jsonc 的 database 节 / database section from config.jsonc.
+    @param field_name DSN 字段名 / DSN field name.
+    @param role 该字段唯一允许的登录用途 / Sole login purpose allowed for the field.
     @param administration 角色声明 / Role declaration.
-    @return 登录角色到密码的映射 / Login-role-to-password mapping.
+    @return 已验证角色名和密码的 DatabaseLogin / DatabaseLogin with validated role and password.
     """
-    result: dict[DatabaseRole, str] = {}
-    for role in (DatabaseRole.MIGRATOR, DatabaseRole.APP, DatabaseRole.DASHBOARD):
-        parsed = parse_postgres_dsn(database.dsn_for(role))
-        if parsed.user != administration.role_name(role) or not parsed.password:
-            raise DbctlConfigurationError("config.jsonc DSN 与 dbinit.jsonc 角色声明不一致。")
-        result[role] = parsed.password
-    return result
+    dsn = _required_text(database, field_name)
+    if not dsn.casefold().startswith("postgresql://"):
+        raise DbctlConfigurationError(
+            f"database.{field_name} 必须使用 postgresql:// URI，不能使用其他驱动或 libpq key=value。"
+        )
+    parsed = parse_postgres_dsn(dsn)
+    expected_role_name = administration.role_name(role.as_database_role())
+    if parsed.user != expected_role_name or not parsed.password:
+        raise DbctlConfigurationError(
+            f"database.{field_name} 必须包含 dbinit.jsonc 声明的角色和非空密码。"
+        )
+    return DatabaseLogin(
+        role=role,
+        role_name=parsed.user,
+        dsn=dsn,
+        safe_conninfo=parsed.safe_conninfo,
+        password=parsed.password,
+    )
 
 
 def _require_port(mapping: Mapping[str, Any], key: str) -> int:
