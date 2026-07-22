@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import stat
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
@@ -1398,6 +1398,76 @@ def test_missing_application_snapshot_fails_closed() -> None:
     diagnostic = stderr.getvalue()
     assert "原始异常消息已隐藏" in diagnostic
     assert mutable_secret not in diagnostic
+
+
+def test_replaced_application_snapshot_fails_closed() -> None:
+    """@brief 复制载荷类型后替换正文仍无法伪造完整性 / Replacing payload text fails integrity.
+
+    @return 无返回值 / No return value.
+    """
+
+    replacement_secret = "application-payload-replacement-secret-sentinel"
+    stderr = StringIO()
+    try:
+        MigrationRevision("invalid revision")
+    except DbctlConfigurationError as failure:
+        key = "_dbctl_safe_diagnostic_notes"
+        original_payload = failure.__dict__[key]
+        failure.__dict__[key] = replace(original_payload, message=replacement_secret)
+        try:
+            raise failure
+        except DbctlConfigurationError as reraised:
+            OperatorConsole(stderr, no_color=True).failure("migrate", reraised, exit_code=2)
+
+    diagnostic = stderr.getvalue()
+    assert "原始异常消息已隐藏" in diagnostic
+    assert replacement_secret not in diagnostic
+
+
+def test_replaced_domain_snapshot_fails_closed() -> None:
+    """@brief 领域正文载荷被替换时拒绝显示 / Replaced domain-message payloads fail closed.
+
+    @return 无返回值 / No return value.
+    """
+
+    replacement_secret = "domain-payload-replacement-secret-sentinel"
+    stderr = StringIO()
+    try:
+        DatabaseName("invalid-name")
+    except DomainError as failure:
+        key = "_dbctl_domain_message"
+        original_payload = failure.__dict__[key]
+        failure.__dict__[key] = replace(original_payload, message=replacement_secret)
+        try:
+            raise failure
+        except DomainError as reraised:
+            OperatorConsole(stderr, no_color=True).failure("bootstrap", reraised, exit_code=2)
+
+    diagnostic = stderr.getvalue()
+    assert "原始异常消息已隐藏" in diagnostic
+    assert replacement_secret not in diagnostic
+
+
+def test_replaced_safe_notes_fail_closed() -> None:
+    """@brief 替换安全注释会使完整载荷失效 / Replacing safe notes invalidates the whole payload.
+
+    @return 无返回值 / No return value.
+    """
+
+    replacement_secret = "safe-note-payload-replacement-secret-sentinel"
+    failure = RuntimeError("raw-message-secret-sentinel")
+    add_safe_diagnostic_note(failure, "dbctl 构造的原始安全注释。")
+    key = "_dbctl_safe_diagnostic_notes"
+    original_payload = failure.__dict__[key]
+    failure.__dict__[key] = replace(original_payload, notes=(replacement_secret,))
+    stderr = StringIO()
+
+    OperatorConsole(stderr, no_color=True).failure("bootstrap", failure, exit_code=1)
+
+    diagnostic = stderr.getvalue()
+    assert replacement_secret not in diagnostic
+    assert "dbctl 构造的原始安全注释" not in diagnostic
+    assert "raw-message-secret-sentinel" not in diagnostic
 
 
 def test_safe_external_proxy_keeps_origin_grant_when_note_is_added() -> None:
