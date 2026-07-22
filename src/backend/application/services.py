@@ -2014,6 +2014,7 @@ class KnowledgeApplicationService:
         content_type: str,
         content: bytes,
         name: str | None,
+        visibility: dict[str, Any] | None,
         request_id: str | None,
     ) -> tuple[KnowledgeSourceRecord, dict[str, Any]]:
         """Create, privately store, and enqueue one uploaded knowledge file."""
@@ -2041,7 +2042,9 @@ class KnowledgeApplicationService:
             name=(name or normalized_filename).strip(),
             source_type="file",
             config=_file_source_config(blob),
-            visibility=_default_visibility(),
+            visibility=(
+                deepcopy(visibility) if visibility is not None else _default_visibility()
+            ),
             source_metadata={
                 "filename": blob.filename,
                 "content_type": blob.content_type,

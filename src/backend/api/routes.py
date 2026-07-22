@@ -883,10 +883,12 @@ async def upload_knowledge_source(
         Header(alias="Idempotency-Key", min_length=1, max_length=_MAX_IDEMPOTENCY_KEY_LENGTH),
     ],
     name: Annotated[str | None, Form(max_length=300)] = None,
+    visibility: Annotated[str | None, Form(max_length=20000)] = None,
 ) -> JSONResponse:
-    """Create and enqueue a bounded TXT, Markdown, PDF, or DOCX source."""
+    """Create and enqueue a bounded file with an explicit optional visibility policy."""
     del idempotency_key
     scope = _scope_from_headers(request)
+    visibility_policy = _multipart_visibility_policy(request, visibility)
     content = await _read_bounded_upload(
         file,
         _container(request).settings.knowledge.max_upload_bytes,
@@ -897,6 +899,7 @@ async def upload_knowledge_source(
         "filename": filename,
         "content_type": content_type,
         "name": name,
+        "visibility": visibility_policy,
         "size_bytes": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
     }
@@ -908,6 +911,7 @@ async def upload_knowledge_source(
             content_type=content_type,
             content=content,
             name=name,
+            visibility=visibility_policy,
             request_id=_request_id(request),
         )
         return {"source": source.as_dict(), "ingestion_job": job}
@@ -920,6 +924,35 @@ async def upload_knowledge_source(
         202,
         operation,
     )
+
+
+def _multipart_visibility_policy(
+    request: Request,
+    serialized: str | None,
+) -> dict[str, Any] | None:
+    """Parse and validate an optional multipart KnowledgeVisibilityPolicy JSON value."""
+    if serialized is None:
+        return None
+    try:
+        candidate = json.loads(serialized)
+    except json.JSONDecodeError as error:
+        raise DomainError(
+            Problem(
+                "knowledge.visibility_invalid",
+                422,
+                "Knowledge visibility must be valid JSON",
+            )
+        ) from error
+    if not isinstance(candidate, dict):
+        raise DomainError(
+            Problem(
+                "knowledge.visibility_invalid",
+                422,
+                "Knowledge visibility must be a JSON object",
+            )
+        )
+    _container(request).contracts.validate_definition("KnowledgeVisibilityPolicy", candidate)
+    return cast(dict[str, Any], candidate)
 
 
 @router.post(
