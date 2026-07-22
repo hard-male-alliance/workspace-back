@@ -16,19 +16,28 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.api.diagnostics import diagnostics_router
 from backend.api.errors import (
+    api_problem_response,
     domain_error_handler,
     http_exception_handler,
     request_validation_error_handler,
 )
+from backend.api.identity import is_hosted_identity_path, router_identity
 from backend.api.middleware.context import correlate_http_response
 from backend.api.middleware.transport import (
     TransportTelemetryMiddleware,
     log_http_start,
 )
+from backend.api.oauth import is_public_oauth_path, router_oauth
+from backend.api.oauth_metadata import (
+    is_public_oauth_metadata_path,
+    router_oauth_metadata,
+)
 from backend.api.routes import router
+from backend.api.v2 import PROTECTED_RESOURCE_METADATA_URL, is_public_v2_path, router_v2
 from backend.composition import build_container
 from backend.config import BackendSettings
 from backend.domain.common import DomainError, Problem
+from backend.domain.oauth import OAuthTokenValidationError
 from backend.infrastructure.identity import IdentityVerificationError, peer_is_trusted_proxy
 from backend.infrastructure.observability.context import (
     ObservabilityContext,
@@ -114,6 +123,10 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
         docs_url="/docs" if resolved_settings.environment != "production" else None,
     )
     app.include_router(router)
+    app.include_router(router_v2)
+    app.include_router(router_oauth_metadata)
+    app.include_router(router_oauth)
+    app.include_router(router_identity)
     app.include_router(diagnostics_router)
     app.add_exception_handler(DomainError, domain_error_handler)
     app.add_exception_handler(RequestValidationError, request_validation_error_handler)
@@ -147,7 +160,39 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
         if container is None:
             response = await call_next(request)
             return correlate_http_response(response, request, trace)
-        if request.url.path == "/_internal/healthz":
+        if (
+            request.url.path == "/_internal/healthz"
+            or is_public_v2_path(request.url.path)
+            or is_public_oauth_metadata_path(request.url.path)
+            or is_public_oauth_path(request.url.path)
+            or is_hosted_identity_path(request.url.path)
+        ):
+            response = await call_next(request)
+            return correlate_http_response(response, request, trace)
+        if request.url.path.startswith("/api/v2/"):
+            request.state.route_fallback = "pre_auth"
+            if not request.headers.getlist("X-Request-Id"):
+                response = api_problem_response(
+                    request,
+                    Problem("http.request_id_required", 400, "X-Request-Id is required"),
+                )
+                return correlate_http_response(response, request, trace)
+            authorization_headers = request.headers.getlist("Authorization")
+            scheme, separator, access_token = (
+                authorization_headers[0].partition(" ")
+                if len(authorization_headers) == 1
+                else ("", "", "")
+            )
+            if scheme.lower() != "bearer" or separator != " " or not access_token.strip():
+                response = _v2_bearer_problem(request)
+                return correlate_http_response(response, request, trace)
+            try:
+                request.state.oauth_claims = await container.oauth.verify_access_token(
+                    access_token.strip()
+                )
+            except OAuthTokenValidationError:
+                response = _v2_bearer_problem(request)
+                return correlate_http_response(response, request, trace)
             response = await call_next(request)
             return correlate_http_response(response, request, trace)
         log_http_start(request, trace)
@@ -221,11 +266,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
                 exc_info=error,
             )
         problem = Problem("internal.unexpected", 500, "Unexpected server error")
-        response = JSONResponse(
-            problem.as_dict(getattr(request.state, "request_id", None), request.url.path),
-            status_code=500,
-            media_type="application/problem+json",
-        )
+        response = api_problem_response(request, problem)
         request_id = getattr(request.state, "request_id", None)
         if isinstance(request_id, str):
             response.headers["X-Request-Id"] = request_id
@@ -239,9 +280,11 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
             CORSMiddleware,
             allow_origins=list(resolved_settings.network.cors_allowed_origins),
             allow_credentials=False,
-            allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=[
                 "Accept",
+                "Accept-Language",
+                "Authorization",
                 "Content-Type",
                 "Idempotency-Key",
                 "If-Match",
@@ -257,6 +300,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
                 "Content-Range",
                 "ETag",
                 "Location",
+                "Retry-After",
                 "X-Request-Id",
                 "traceparent",
             ],
@@ -265,4 +309,31 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
 
     app.add_middleware(TransportTelemetryMiddleware)
 
+    @app.middleware("http")
+    async def isolate_hosted_identity_from_cors(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        """Strip all CORS capability headers from cookie-authenticated identity routes."""
+
+        response = await call_next(request)
+        if is_hosted_identity_path(request.url.path):
+            for header in tuple(response.headers):
+                if header.lower().startswith("access-control-"):
+                    del response.headers[header]
+        return response
+
     return app
+
+
+def _v2_bearer_problem(request: Request) -> JSONResponse:
+    """Return the uniform v2 Bearer challenge without leaking token failure details."""
+
+    response = api_problem_response(
+        request,
+        Problem("oauth.invalid_token", 401, "Bearer access token is required or invalid"),
+    )
+    response.headers["WWW-Authenticate"] = (
+        f'Bearer resource_metadata="{PROTECTED_RESOURCE_METADATA_URL}"'
+    )
+    return response

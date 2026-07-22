@@ -16,4 +16,5 @@ htmlcov/
 artifacts/
 data/knowledge-blobs/
 data/logs/
+data/oauth-signing-key.pem
 *.log

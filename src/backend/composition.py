@@ -14,6 +14,8 @@ from typing import Protocol
 
 from backend.application.concurrency import BoundedTaskSupervisor, WorkLimits
 from backend.application.diagnostics import DiagnosticIngestionService, DiagnosticRateLimiter
+from backend.application.identity import HostedIdentityService
+from backend.application.oauth import OAuthAuthorizationService
 from backend.application.services import (
     AgentApplicationService,
     InterviewApplicationService,
@@ -30,9 +32,11 @@ from backend.domain.ports import (
     AgentRepository,
     ArtifactRepository,
     EmbeddingProvider,
+    HostedIdentityRepository,
     InterviewRepository,
     JobRepository,
     KnowledgeRepository,
+    OAuthAuthorizationRequestRepository,
     ResumeProposalRepository,
     ResumeRepository,
     TelemetryWriter,
@@ -43,11 +47,21 @@ from backend.infrastructure.embeddings import (
     DeterministicEmbeddingProvider,
     OpenAICompatibleEmbeddingProvider,
 )
+from backend.infrastructure.hosted_identity import (
+    InMemoryHostedIdentityRepository,
+    PostgresHostedIdentityRepository,
+)
 from backend.infrastructure.idempotency import IdempotencyRegistry
 from backend.infrastructure.identity import IdentityResolver, build_identity_resolver
+from backend.infrastructure.identity_email import identity_email_sender_for
 from backend.infrastructure.knowledge_parsing import LocalKnowledgeFileParser
 from backend.infrastructure.knowledge_storage import LocalKnowledgeBlobStorage
 from backend.infrastructure.memory import InMemoryWorkspaceRepository
+from backend.infrastructure.oauth import (
+    InMemoryOAuthAuthorizationRequestRepository,
+    PostgresOAuthAuthorizationRequestRepository,
+)
+from backend.infrastructure.oauth_tokens import OAuthTokenSigner
 from backend.infrastructure.observability.logging import LoggingRuntime, configure_logging
 from backend.infrastructure.observability.pipeline import (
     InMemoryTelemetryWriter,
@@ -99,6 +113,7 @@ class BackendContainer:
     settings: BackendSettings
     identity: IdentityResolver
     contracts: ContractValidator
+    contracts_v2: ContractValidator
     idempotency: IdempotencyRegistry | PostgresIdempotencyRegistry
     workspace: WorkspaceApplicationService
     resume: ResumeApplicationService
@@ -112,6 +127,8 @@ class BackendContainer:
     telemetry_writer: TelemetryWriter
     logging_runtime: LoggingRuntime
     diagnostics: DiagnosticIngestionService
+    oauth: OAuthAuthorizationService
+    hosted_identity: HostedIdentityService
     database: AsyncDatabase | None
 
 
@@ -131,6 +148,11 @@ async def build_container(
         default_scope=settings.default_scope,
         security=settings.security,
     )
+    oauth_token_signer = OAuthTokenSigner.from_paths(
+        settings.oauth.signing_private_key_paths,
+        runtime_root=runtime_root,
+        allow_generate=settings.environment in {"development", "test"},
+    )
     supervisor = BoundedTaskSupervisor(
         (
             WorkLimits("llm", settings.runtime.llm_concurrency),
@@ -143,6 +165,8 @@ async def build_container(
     )
     database: AsyncDatabase | None = None
     telemetry_database: AsyncDatabase | None = None
+    oauth_repository: OAuthAuthorizationRequestRepository
+    hosted_identity_repository: HostedIdentityRepository
     try:
         if settings.database.mode == "postgresql":
             dsn = settings.database.application_dsn
@@ -174,10 +198,14 @@ async def build_container(
             idempotency: IdempotencyRegistry | PostgresIdempotencyRegistry = (
                 PostgresIdempotencyRegistry(database)
             )
+            oauth_repository = PostgresOAuthAuthorizationRequestRepository(database)
+            hosted_identity_repository = PostgresHostedIdentityRepository(database)
         else:
             storage = InMemoryWorkspaceRepository()
             telemetry_writer = InMemoryTelemetryWriter()
             idempotency = IdempotencyRegistry()
+            oauth_repository = InMemoryOAuthAuthorizationRequestRepository()
+            hosted_identity_repository = InMemoryHostedIdentityRepository()
     except BaseException as database_initialization_error:
         try:
             await _close_runtime_resources(
@@ -279,10 +307,20 @@ async def build_container(
                 provider,
                 settings.ai,
             )
+            oauth_service = OAuthAuthorizationService(
+                oauth_repository,
+                settings.oauth,
+                oauth_token_signer,
+            )
+            identity_email_sender = identity_email_sender_for(
+                settings.hosted_identity.email,
+                environment=settings.environment,
+            )
             container = BackendContainer(
                 settings=settings,
                 identity=identity,
                 contracts=ContractValidator.from_json(read_contract_schema_text()),
+                contracts_v2=ContractValidator.from_jsonc(read_contract_schema_text("v2")),
                 idempotency=idempotency,
                 workspace=WorkspaceApplicationService(storage),
                 resume=resume,
@@ -299,6 +337,24 @@ async def build_container(
                     settings.observability.diagnostics,
                     telemetry,
                     DiagnosticRateLimiter(settings.observability.diagnostics),
+                ),
+                oauth=oauth_service,
+                hosted_identity=HostedIdentityService(
+                    hosted_identity_repository,
+                    oauth_service,
+                    identity_email_sender,
+                    lifetime_seconds=settings.hosted_identity.flow_ttl_seconds,
+                    email_code_ttl_seconds=settings.hosted_identity.email_code_ttl_seconds,
+                    email_code_max_attempts=settings.hosted_identity.email_code_max_attempts,
+                    email_send_limit_per_hour=(settings.hosted_identity.email_send_limit_per_hour),
+                    session_idle_ttl_seconds=settings.hosted_identity.session_idle_ttl_seconds,
+                    session_absolute_ttl_seconds=(
+                        settings.hosted_identity.session_absolute_ttl_seconds
+                    ),
+                    recent_reauthentication_seconds=(
+                        settings.hosted_identity.recent_reauthentication_seconds
+                    ),
+                    allow_test_email_codes=settings.environment in {"development", "test"},
                 ),
                 database=database,
             )

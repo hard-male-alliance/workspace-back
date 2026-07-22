@@ -8,12 +8,24 @@ from typing import Any, Protocol
 
 from backend.domain.agent import AgentRunRecord, ConversationRecord, MessageRecord
 from backend.domain.common import Job
+from backend.domain.identity import (
+    IdentityAuthenticatorRecord,
+    IdentityBrowserSessionRecord,
+    IdentityFlowRecord,
+    IdentitySessionRecord,
+    IdentityUserRecord,
+)
 from backend.domain.interview import InterviewSessionRecord
 from backend.domain.knowledge import (
     EmbeddingSpace,
     KnowledgeSourceRecord,
     ParsedKnowledgeDocument,
     StoredKnowledgeBlob,
+)
+from backend.domain.oauth import (
+    AuthorizationCodeExchange,
+    AuthorizationRequestRecord,
+    RefreshTokenRotation,
 )
 from backend.domain.observability import (
     AttributeValue,
@@ -28,6 +40,215 @@ from backend.domain.resume import ResumeRecord
 from workspace_shared.tenancy import ActorScope
 
 
+class OAuthAuthorizationRequestRepository(Protocol):
+    """Persistence boundary for short-lived Authorization Server transactions."""
+
+    async def create_authorization_request(self, record: AuthorizationRequestRecord) -> None:
+        """Persist a newly validated authorization request atomically."""
+
+    async def get_authorization_request(self, request_id: str) -> AuthorizationRequestRecord | None:
+        """Read one authorization request without accepting client-provided state."""
+
+    async def issue_authorization_code(
+        self,
+        request_id: str,
+        *,
+        subject: str,
+        user_id: str,
+        code_hash: str,
+        auth_time: datetime,
+        expires_at: datetime,
+    ) -> bool:
+        """Atomically complete a pending authorization request and persist a one-time code."""
+
+    async def exchange_authorization_code(
+        self,
+        code_hash: str,
+        *,
+        client_id: str,
+        redirect_uri: str,
+        verifier_challenge: str,
+        refresh_family_id: str | None,
+        refresh_token_id: str | None,
+        refresh_token_hash: str | None,
+        refresh_expires_at: datetime | None,
+    ) -> AuthorizationCodeExchange | None:
+        """Consume a matching code and create its refresh family in one transaction."""
+
+    async def rotate_refresh_token(
+        self,
+        token_hash: str,
+        *,
+        client_id: str,
+        replacement_token_id: str,
+        replacement_token_hash: str,
+        replacement_expires_at: datetime,
+    ) -> RefreshTokenRotation | None:
+        """Rotate once, revoking the family on reuse of a consumed token."""
+
+    async def revoke_refresh_token(self, token_hash: str) -> None:
+        """Revoke the complete refresh family if the opaque token is known."""
+
+    async def revoke_access_token(self, jti: str, expires_at: datetime) -> None:
+        """Persist an access-token denylist entry until its natural expiration."""
+
+    async def access_token_is_revoked(self, jti: str) -> bool:
+        """Check an access-token JTI without exposing it outside the identity boundary."""
+
+
+class OAuthTokenIssuerVerifier(Protocol):
+    """Asymmetric JWT issuance and verification port."""
+
+    @property
+    def jwks(self) -> dict[str, list[dict[str, str]]]:
+        """Return public-only signing keys."""
+
+    def issue_access_token(
+        self,
+        *,
+        subject: str,
+        client_id: str,
+        scopes: tuple[str, ...],
+        lifetime_seconds: int,
+        now: datetime | None = None,
+    ) -> tuple[str, datetime, str]:
+        """Issue one Resource Server access token."""
+
+    def issue_id_token(
+        self,
+        *,
+        subject: str,
+        client_id: str,
+        nonce: str,
+        lifetime_seconds: int,
+        auth_time: datetime,
+        now: datetime | None = None,
+    ) -> str:
+        """Issue one nonce-bound OIDC ID Token."""
+
+    def verify_access_token(self, token: str, *, now: datetime | None = None) -> dict[str, Any]:
+        """Verify one access token and return its required claims."""
+
+
+class HostedIdentityRepository(Protocol):
+    """Persistence boundary for hosted identity browser and flow state."""
+
+    async def create_browser_session(self, record: IdentityBrowserSessionRecord) -> None:
+        """Persist a new browser binding."""
+
+    async def get_browser_session(self, session_id: str) -> IdentityBrowserSessionRecord | None:
+        """Read a browser binding by opaque server identifier."""
+
+    async def create_flow(self, record: IdentityFlowRecord) -> None:
+        """Persist a new identity flow."""
+
+    async def get_flow(self, flow_id: str) -> IdentityFlowRecord | None:
+        """Read one identity flow."""
+
+    async def transition_flow(
+        self,
+        flow_id: str,
+        *,
+        browser_session_id: str,
+        step_id: str,
+        expected_step: str,
+        allowed_steps: tuple[str, ...],
+        status: str,
+        state_updates: dict[str, object],
+        user_id: str | None = None,
+        authorization_resume_uri: str | None = None,
+        webauthn_options: dict[str, object] | None = None,
+    ) -> IdentityFlowRecord | None:
+        """Atomically dedupe and apply one allowed finite-state transition."""
+
+    async def processed_step_kind(self, flow_id: str, step_id: str) -> str | None:
+        """Return the non-secret kind of an already processed step receipt."""
+
+    async def get_user_by_email(self, normalized_email: str) -> IdentityUserRecord | None:
+        """Resolve an account internally without changing public enumeration behavior."""
+
+    async def get_identity_user(self, user_id: str) -> IdentityUserRecord | None:
+        """Read an account after a server-authenticated session resolves its opaque ID."""
+
+    async def create_user_with_password(
+        self,
+        *,
+        user: IdentityUserRecord,
+        password_authenticator_id: str,
+        password_verifier: str,
+        now: datetime,
+        passkey: IdentityAuthenticatorRecord | None = None,
+    ) -> bool:
+        """Atomically create one unique account and its password authenticator."""
+
+    async def password_verifier(self, user_id: str) -> str | None:
+        """Read the active password verifier for authentication."""
+
+    async def replace_password_and_revoke_sessions(
+        self, user_id: str, *, password_verifier: str, now: datetime
+    ) -> bool:
+        """Atomically replace a password and revoke existing login/token families after recovery."""
+
+    async def create_login_session(self, record: IdentitySessionRecord) -> None:
+        """Persist a rotated Authorization Server login session."""
+
+    async def get_login_session(self, session_id: str) -> IdentitySessionRecord | None:
+        """Read a login session by opaque identifier."""
+
+    async def bind_browser_user(self, browser_session_id: str, user_id: str) -> None:
+        """Bind an authenticated user to the existing browser authorization session."""
+
+    async def list_login_sessions(self, user_id: str) -> list[IdentitySessionRecord]:
+        """List active login sessions for one authenticated account."""
+
+    async def revoke_login_session(self, user_id: str, session_id: str, now: datetime) -> bool:
+        """Revoke one owned login session and associated refresh families."""
+
+    async def list_authenticators(self, user_id: str) -> list[IdentityAuthenticatorRecord]:
+        """List active verifier metadata for one account."""
+
+    async def replace_recovery_codes(
+        self,
+        user_id: str,
+        *,
+        authenticator_id: str,
+        verifiers: tuple[str, ...],
+        now: datetime,
+    ) -> None:
+        """Atomically revoke old recovery codes and persist a new verifier-only bundle."""
+
+    async def revoke_authenticator(
+        self, user_id: str, authenticator_id: str, now: datetime
+    ) -> bool:
+        """Revoke an owned authenticator only while another recovery path remains."""
+
+    async def add_passkey(self, record: IdentityAuthenticatorRecord) -> bool:
+        """Persist one verified unique WebAuthn credential."""
+
+    async def get_passkey_by_credential_id(
+        self, credential_id: str
+    ) -> IdentityAuthenticatorRecord | None:
+        """Resolve an active passkey by its base64url credential identifier."""
+
+    async def update_passkey_sign_count(
+        self, authenticator_id: str, *, expected: int, replacement: int, now: datetime
+    ) -> bool:
+        """Advance a WebAuthn signature counter with optimistic concurrency."""
+
+    async def consume_recovery_code(self, user_id: str, verifier: str, now: datetime) -> bool:
+        """Atomically consume one exact recovery-code verifier once."""
+
+
+class IdentityEmailSender(Protocol):
+    """Secret-safe delivery boundary for identity verification and security notices."""
+
+    async def send_verification_code(self, recipient: str, code: str) -> None:
+        """Deliver a short-lived code without logging or retaining its plaintext."""
+
+    async def send_recovery_notification(self, recipient: str) -> None:
+        """Notify an account owner after credentials and sessions were rotated."""
+
+
 class WorkspaceRepository(Protocol):
     """Read-only current-user and workspace membership projections."""
 
@@ -37,9 +258,7 @@ class WorkspaceRepository(Protocol):
     async def list_workspaces(self, scope: ActorScope) -> list[dict[str, Any]]:
         """List workspaces authorized by the current identity assertion."""
 
-    async def get_workspace(
-        self, scope: ActorScope, workspace_id: str
-    ) -> dict[str, Any] | None:
+    async def get_workspace(self, scope: ActorScope, workspace_id: str) -> dict[str, Any] | None:
         """Read one authorized workspace."""
 
     async def list_workspace_members(
@@ -112,9 +331,7 @@ class ResumeProposalRepository(Protocol):
     ) -> ResumeProposalRecord | None:
         """Read a proposal without crossing workspace or owner boundaries."""
 
-    async def list_proposals(
-        self, scope: ActorScope, resume_id: str
-    ) -> list[ResumeProposalRecord]:
+    async def list_proposals(self, scope: ActorScope, resume_id: str) -> list[ResumeProposalRecord]:
         """List proposals for one scoped Resume in newest-first order."""
 
     async def save_proposal(self, scope: ActorScope, record: ResumeProposalRecord) -> None:
@@ -172,7 +389,9 @@ class AgentRepository(Protocol):
         @param record 会话聚合 / Conversation aggregate.
         """
 
-    async def get_conversation(self, scope: ActorScope, conversation_id: str) -> ConversationRecord | None:
+    async def get_conversation(
+        self, scope: ActorScope, conversation_id: str
+    ) -> ConversationRecord | None:
         """@brief 范围内查询会话 / Read a scoped conversation.
 
         @param scope workspace 范围 / Workspace scope.
@@ -236,7 +455,9 @@ class InterviewRepository(Protocol):
         @param record Session 记录 / Session record.
         """
 
-    async def get_session(self, scope: ActorScope, session_id: str) -> InterviewSessionRecord | None:
+    async def get_session(
+        self, scope: ActorScope, session_id: str
+    ) -> InterviewSessionRecord | None:
         """@brief 范围内查询面试 / Read a scoped interview session.
 
         @param scope workspace 范围 / Workspace scope.

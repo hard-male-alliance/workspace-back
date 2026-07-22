@@ -26,6 +26,73 @@ _SUPPORTED_ENVIRONMENTS = frozenset({"development", "test", "staging", "producti
 _MAX_TRUSTED_PROXY_CLOCK_SKEW_SECONDS = 600
 """@brief 允许的最大身份断言时钟偏差 / Maximum permitted identity-assertion clock skew in seconds."""
 
+_OAUTH_SCOPE_CHARS = frozenset(
+    "!#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+)
+
+_DEFAULT_OAUTH_SCOPES = (
+    "openid",
+    "profile",
+    "offline_access",
+    "workspace.read",
+    "resume.read",
+    "resume.write",
+    "resume.render",
+)
+
+
+OAuthClientType = Literal["web", "electron"]
+IdentityEmailMode = Literal["memory", "smtp"]
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthPublicClientSettings:
+    """One registered OAuth public client; public clients never carry a static secret."""
+
+    client_id: str
+    client_type: OAuthClientType
+    redirect_uris: tuple[str, ...]
+    allowed_scopes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthSettings:
+    """Authorization Server transaction and public-client settings."""
+
+    authorization_request_ttl_seconds: int
+    authorization_code_ttl_seconds: int
+    access_token_ttl_seconds: int
+    refresh_token_ttl_seconds: int
+    signing_private_key_paths: tuple[Path, ...]
+    public_clients: tuple[OAuthPublicClientSettings, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class IdentityEmailSettings:
+    """Hosted identity verification and security-notification delivery."""
+
+    mode: IdentityEmailMode
+    from_address: str | None
+    smtp_host: str | None
+    smtp_port: int
+    smtp_username: str | None
+    smtp_password: str | None = field(repr=False)
+    smtp_start_tls: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class HostedIdentitySettings:
+    """Hosted identity security lifetimes and delivery settings."""
+
+    flow_ttl_seconds: int
+    email_code_ttl_seconds: int
+    email_code_max_attempts: int
+    email_send_limit_per_hour: int
+    session_idle_ttl_seconds: int
+    session_absolute_ttl_seconds: int
+    recent_reauthentication_seconds: int
+    email: IdentityEmailSettings
+
 
 @dataclass(frozen=True, slots=True)
 class NetworkSettings:
@@ -255,6 +322,8 @@ class BackendSettings:
     observability: ObservabilitySettings
     logging: LoggingSettings
     security: SecuritySettings
+    oauth: OAuthSettings
+    hosted_identity: HostedIdentitySettings
     config_path: Path
 
     @classmethod
@@ -281,6 +350,8 @@ class BackendSettings:
         observability = require_mapping(root.get("observability"), "observability")
         logging = require_mapping(root.get("logging"), "logging")
         security = _security_settings(root.get("security"), environment)
+        oauth = _oauth_settings(root.get("oauth"), environment)
+        hosted_identity = _hosted_identity_settings(root.get("hosted_identity"), environment)
         database_mode = cast(
             DatabaseMode, _require_choice(database, "mode", {"memory", "postgresql"})
         )
@@ -419,6 +490,8 @@ class BackendSettings:
             ),
             logging=logging_settings,
             security=security,
+            oauth=oauth,
+            hosted_identity=hosted_identity,
             config_path=path,
         )
 
@@ -693,9 +766,7 @@ def _logging_settings(mapping: dict[str, Any]) -> LoggingSettings:
     )
     persist = _require_bool(mapping, "persist_structured_events")
     queue_capacity = _optional_positive_int(mapping, "queue_capacity", 2_048)
-    shutdown_timeout_ms = _optional_positive_int(
-        mapping, "shutdown_timeout_ms", 5_000
-    )
+    shutdown_timeout_ms = _optional_positive_int(mapping, "shutdown_timeout_ms", 5_000)
     if shutdown_timeout_ms > 60_000:
         raise ConfigurationError("logging.shutdown_timeout_ms must not exceed 60000")
     raw_routes = mapping.get("routes")
@@ -736,9 +807,7 @@ def _logging_settings(mapping: dict[str, Any]) -> LoggingSettings:
             backup_count = _require_positive_int(route, "backup_count")
         else:
             if sink in claimed_stream_sinks:
-                raise ConfigurationError(
-                    f"logging.routes[{index}] duplicates the {sink} sink"
-                )
+                raise ConfigurationError(f"logging.routes[{index}] duplicates the {sink} sink")
             claimed_stream_sinks.add(sink)
             if any(key in route for key in ("path", "max_bytes", "backup_count")):
                 raise ConfigurationError(
@@ -874,6 +943,237 @@ def _security_settings(value: object, environment: str) -> SecuritySettings:
         trusted_proxy_hmac_secret=secret,
         trusted_proxy_max_clock_skew_seconds=max_clock_skew_seconds,
     )
+
+
+def _oauth_settings(value: object, environment: str) -> OAuthSettings:
+    """Parse registered public clients and fail closed outside development/test."""
+
+    if value is None:
+        if environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS:
+            raise ConfigurationError("oauth configuration is required outside development/test")
+        return OAuthSettings(
+            authorization_request_ttl_seconds=600,
+            authorization_code_ttl_seconds=60,
+            access_token_ttl_seconds=600,
+            refresh_token_ttl_seconds=2_592_000,
+            signing_private_key_paths=(Path("data/oauth-signing-key.pem"),),
+            public_clients=(
+                OAuthPublicClientSettings(
+                    client_id="aiws-web-local",
+                    client_type="web",
+                    redirect_uris=(
+                        "http://127.0.0.1:5173/oauth/callback",
+                        "http://localhost:5173/oauth/callback",
+                    ),
+                    allowed_scopes=_DEFAULT_OAUTH_SCOPES,
+                ),
+                OAuthPublicClientSettings(
+                    client_id="aiws-electron-local",
+                    client_type="electron",
+                    redirect_uris=("http://127.0.0.1/oauth/callback",),
+                    allowed_scopes=_DEFAULT_OAUTH_SCOPES,
+                ),
+            ),
+        )
+
+    mapping = require_mapping(value, "oauth")
+    ttl_seconds = _require_positive_int(mapping, "authorization_request_ttl_seconds")
+    if ttl_seconds > 900:
+        raise ConfigurationError("oauth.authorization_request_ttl_seconds must not exceed 900")
+    raw_clients = mapping.get("public_clients")
+    if not isinstance(raw_clients, list) or not raw_clients:
+        raise ConfigurationError("oauth.public_clients must be a non-empty array")
+    clients = tuple(
+        _oauth_public_client(item, index, environment) for index, item in enumerate(raw_clients)
+    )
+    client_ids = [client.client_id for client in clients]
+    if len(client_ids) != len(set(client_ids)):
+        raise ConfigurationError("oauth.public_clients contains a duplicate client_id")
+    code_ttl_seconds = _require_positive_int(mapping, "authorization_code_ttl_seconds")
+    access_ttl_seconds = _require_positive_int(mapping, "access_token_ttl_seconds")
+    refresh_ttl_seconds = _require_positive_int(mapping, "refresh_token_ttl_seconds")
+    if code_ttl_seconds > 300:
+        raise ConfigurationError("oauth.authorization_code_ttl_seconds must not exceed 300")
+    if access_ttl_seconds > 900:
+        raise ConfigurationError("oauth.access_token_ttl_seconds must not exceed 900")
+    if refresh_ttl_seconds > 31_536_000:
+        raise ConfigurationError("oauth.refresh_token_ttl_seconds must not exceed 31536000")
+    raw_key_paths = mapping.get("signing_private_key_paths")
+    if not isinstance(raw_key_paths, list) or not raw_key_paths:
+        raise ConfigurationError("oauth.signing_private_key_paths must be a non-empty string array")
+    key_paths: list[Path] = []
+    for raw_key_path in raw_key_paths:
+        if not isinstance(raw_key_path, str) or not raw_key_path.strip():
+            raise ConfigurationError(
+                "oauth.signing_private_key_paths must be a non-empty string array"
+            )
+        key_path = Path(raw_key_path)
+        if key_path in key_paths:
+            raise ConfigurationError("oauth.signing_private_key_paths contains a duplicate path")
+        key_paths.append(key_path)
+    return OAuthSettings(
+        ttl_seconds,
+        code_ttl_seconds,
+        access_ttl_seconds,
+        refresh_ttl_seconds,
+        tuple(key_paths),
+        clients,
+    )
+
+
+def _hosted_identity_settings(value: object, environment: str) -> HostedIdentitySettings:
+    """Parse hosted identity limits and require real email delivery in deployed environments."""
+
+    if value is None:
+        if environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS:
+            raise ConfigurationError(
+                "hosted_identity configuration is required outside development/test"
+            )
+        return HostedIdentitySettings(
+            flow_ttl_seconds=600,
+            email_code_ttl_seconds=600,
+            email_code_max_attempts=5,
+            email_send_limit_per_hour=5,
+            session_idle_ttl_seconds=1_800,
+            session_absolute_ttl_seconds=2_592_000,
+            recent_reauthentication_seconds=300,
+            email=IdentityEmailSettings("memory", None, None, 587, None, None),
+        )
+    mapping = require_mapping(value, "hosted_identity")
+    flow_ttl = _require_positive_int(mapping, "flow_ttl_seconds")
+    code_ttl = _require_positive_int(mapping, "email_code_ttl_seconds")
+    attempts = _require_positive_int(mapping, "email_code_max_attempts")
+    send_limit = _require_positive_int(mapping, "email_send_limit_per_hour")
+    idle_ttl = _require_positive_int(mapping, "session_idle_ttl_seconds")
+    absolute_ttl = _require_positive_int(mapping, "session_absolute_ttl_seconds")
+    reauth_ttl = _require_positive_int(mapping, "recent_reauthentication_seconds")
+    if flow_ttl > 900 or code_ttl > 600:
+        raise ConfigurationError(
+            "hosted_identity flow TTL must not exceed 900 and email code TTL must not exceed 600"
+        )
+    if attempts > 10 or send_limit > 20:
+        raise ConfigurationError("hosted_identity credential limits are too permissive")
+    if idle_ttl > absolute_ttl:
+        raise ConfigurationError(
+            "hosted_identity.session_idle_ttl_seconds must not exceed the absolute lifetime"
+        )
+    email_mapping = require_mapping(mapping.get("email"), "hosted_identity.email")
+    mode = cast(
+        IdentityEmailMode,
+        _require_choice(email_mapping, "mode", {"memory", "smtp"}),
+    )
+    if mode == "memory":
+        email = IdentityEmailSettings("memory", None, None, 587, None, None)
+    else:
+        email = IdentityEmailSettings(
+            mode="smtp",
+            from_address=_require_string(email_mapping, "from_address"),
+            smtp_host=_require_string(email_mapping, "smtp_host"),
+            smtp_port=_require_positive_int(email_mapping, "smtp_port"),
+            smtp_username=_optional_string(email_mapping.get("smtp_username")),
+            smtp_password=_direct_optional_secret(
+                email_mapping, "smtp_password", "hosted_identity.email.smtp_password"
+            ),
+            smtp_start_tls=_require_bool(email_mapping, "smtp_start_tls"),
+        )
+        if (email.smtp_username is None) != (email.smtp_password is None):
+            raise ConfigurationError(
+                "hosted_identity.email SMTP username and password must be configured together"
+            )
+    return HostedIdentitySettings(
+        flow_ttl,
+        code_ttl,
+        attempts,
+        send_limit,
+        idle_ttl,
+        absolute_ttl,
+        reauth_ttl,
+        email,
+    )
+
+
+def _oauth_public_client(
+    value: object,
+    index: int,
+    environment: str,
+) -> OAuthPublicClientSettings:
+    """Parse one secretless Web or Electron OAuth client registration."""
+
+    path = f"oauth.public_clients[{index}]"
+    mapping = require_mapping(value, path)
+    client_id = _require_string(mapping, "client_id")
+    if len(client_id) > 128 or not all(
+        character.isalnum() or character in "._~-" for character in client_id
+    ):
+        raise ConfigurationError(f"{path}.client_id must be URL-safe ASCII")
+    client_type = cast(
+        OAuthClientType,
+        _require_choice(mapping, "client_type", {"web", "electron"}),
+    )
+    raw_redirects = mapping.get("redirect_uris")
+    if not isinstance(raw_redirects, list) or not raw_redirects:
+        raise ConfigurationError(f"{path}.redirect_uris must be a non-empty string array")
+    redirects: list[str] = []
+    for raw_redirect in raw_redirects:
+        if not isinstance(raw_redirect, str):
+            raise ConfigurationError(f"{path}.redirect_uris must be a non-empty string array")
+        _validate_oauth_redirect_uri(raw_redirect, client_type, environment, path)
+        redirects.append(raw_redirect)
+    if len(redirects) != len(set(redirects)):
+        raise ConfigurationError(f"{path}.redirect_uris contains a duplicate URI")
+    raw_scopes = mapping.get("allowed_scopes")
+    if not isinstance(raw_scopes, list) or not raw_scopes:
+        raise ConfigurationError(f"{path}.allowed_scopes must be a non-empty string array")
+    scopes: list[str] = []
+    for raw_scope in raw_scopes:
+        if (
+            not isinstance(raw_scope, str)
+            or not raw_scope
+            or any(character not in _OAUTH_SCOPE_CHARS for character in raw_scope)
+        ):
+            raise ConfigurationError(f"{path}.allowed_scopes contains an invalid OAuth scope")
+        scopes.append(raw_scope)
+    if "openid" not in scopes:
+        raise ConfigurationError(f"{path}.allowed_scopes must include openid")
+    if len(scopes) != len(set(scopes)):
+        raise ConfigurationError(f"{path}.allowed_scopes contains a duplicate scope")
+    return OAuthPublicClientSettings(client_id, client_type, tuple(redirects), tuple(scopes))
+
+
+def _validate_oauth_redirect_uri(
+    uri: str,
+    client_type: OAuthClientType,
+    environment: str,
+    path: str,
+) -> None:
+    """Validate registered redirects without allowing wildcard hosts or fragments."""
+
+    parsed = urlsplit(uri)
+    if (
+        not parsed.scheme
+        or not parsed.hostname
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ConfigurationError(f"{path}.redirect_uris contains an invalid absolute URI")
+    is_loopback = parsed.hostname in {"127.0.0.1", "::1"}
+    if client_type == "electron" and parsed.scheme == "http":
+        if not is_loopback or parsed.port is not None:
+            raise ConfigurationError(
+                f"{path}.redirect_uris Electron HTTP registration must use a loopback IP without a port"
+            )
+        return
+    if parsed.scheme == "https":
+        return
+    if (
+        environment in _DEVELOPMENT_IDENTITY_ENVIRONMENTS
+        and client_type == "web"
+        and parsed.scheme == "http"
+        and parsed.hostname in {"127.0.0.1", "localhost"}
+    ):
+        return
+    raise ConfigurationError(f"{path}.redirect_uris must use HTTPS")
 
 
 def _provider_endpoint(value: object, index: int) -> AIProviderEndpoint:

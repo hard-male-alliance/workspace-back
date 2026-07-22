@@ -117,8 +117,298 @@ class UserRecord(Base, TimestampedRevisionMixin):
     external_subject: Mapped[str] = mapped_column(String(320), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(256))
     email: Mapped[str | None] = mapped_column(String(320))
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     locale: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'zh-CN'"))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthAuthorizationRequestRecord(Base):
+    """Short-lived Authorization Code + PKCE transaction state."""
+
+    __tablename__ = "oauth_authorization_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'authenticated', 'consented', 'code_issued', 'expired', 'cancelled')",
+            name="oauth_authorization_requests_status",
+        ),
+        CheckConstraint(
+            "code_challenge_method = 'S256'",
+            name="oauth_authorization_requests_pkce_s256",
+        ),
+        Index("ix_oauth_authorization_requests_expires", "expires_at"),
+        {"schema": "identity"},
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    client_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    redirect_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(512), nullable=False)
+    nonce: Mapped[str] = mapped_column(String(512), nullable=False)
+    code_challenge: Mapped[str] = mapped_column(String(128), nullable=False)
+    code_challenge_method: Mapped[str] = mapped_column(String(8), nullable=False)
+    prompt: Mapped[str] = mapped_column(String(128), nullable=False, server_default=text("''"))
+    screen_hint: Mapped[str | None] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'pending'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class IdentityBrowserSessionRecord(Base):
+    """Hashed hosted-UI browser binding; no raw Cookie or CSRF value is stored."""
+
+    __tablename__ = "identity_browser_sessions"
+    __table_args__ = (
+        Index("ix_identity_browser_sessions_expires", "expires_at"),
+        {"schema": "identity"},
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    authorization_request_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("identity.oauth_authorization_requests.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    browser_secret_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    csrf_token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("identity.users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class IdentityFlowRecord(Base):
+    """Secret-free durable finite-state flow bound to an OAuth browser transaction."""
+
+    __tablename__ = "identity_flows"
+    __table_args__ = (
+        CheckConstraint(
+            "purpose IN ('register', 'login', 'recover', 'reauthenticate')",
+            name="identity_flows_purpose",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'verified', 'completed', 'failed', 'expired')",
+            name="identity_flows_status",
+        ),
+        Index("ix_identity_flows_expires", "expires_at"),
+        {"schema": "identity"},
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    allowed_steps: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    authorization_request_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("identity.oauth_authorization_requests.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    browser_session_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("identity.identity_browser_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    client_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    redirect_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    code_challenge: Mapped[str] = mapped_column(String(128), nullable=False)
+    authorization_resume_uri: Mapped[str | None] = mapped_column(Text)
+    webauthn_options: Mapped[JsonObject | None] = mapped_column(JSONB)
+    user_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("identity.users.id", ondelete="SET NULL")
+    )
+    internal_state: Mapped[JsonObject] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class IdentityFlowStepRecord(Base):
+    """One-time step-id receipt used to make secret-bearing retries idempotent."""
+
+    __tablename__ = "identity_flow_steps"
+    __table_args__ = (
+        UniqueConstraint("flow_id", "step_id", name="identity_flow_steps_flow_step"),
+        {"schema": "identity"},
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    flow_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("identity.identity_flows.id", ondelete="CASCADE"), nullable=False
+    )
+    step_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class IdentityAuthenticatorRecord(Base):
+    """Password/passkey/recovery verifier metadata; never raw credentials."""
+
+    __tablename__ = "identity_authenticators"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('passkey', 'password', 'recovery_code')",
+            name="identity_authenticators_kind",
+        ),
+        {"schema": "identity"},
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("identity.users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    verifier: Mapped[str] = mapped_column(Text, nullable=False)
+    credential_id: Mapped[str | None] = mapped_column(String(1024), unique=True)
+    credential_metadata: Mapped[JsonObject] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class IdentityLoginSessionRecord(Base):
+    """Hashed Authorization Server session cookie with idle and absolute expiry."""
+
+    __tablename__ = "identity_login_sessions"
+    __table_args__ = (
+        Index("ix_identity_login_sessions_expires", "absolute_expires_at"),
+        {"schema": "identity"},
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("identity.users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    client_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    client_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    device_name: Mapped[str | None] = mapped_column(String(200))
+    session_secret_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    idle_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    absolute_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthAuthorizationCodeRecord(Base):
+    """Hashed, one-time authorization code bound to client, redirect and PKCE challenge."""
+
+    __tablename__ = "oauth_authorization_codes"
+    __table_args__ = (
+        UniqueConstraint("code_hash", name="oauth_authorization_codes_code_hash"),
+        Index("ix_oauth_authorization_codes_expires", "expires_at"),
+        {"schema": "identity"},
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    authorization_request_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("identity.oauth_authorization_requests.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    subject: Mapped[str] = mapped_column(String(320), nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("identity.users.id", ondelete="RESTRICT"), nullable=False
+    )
+    client_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    redirect_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    nonce: Mapped[str] = mapped_column(String(512), nullable=False)
+    code_challenge: Mapped[str] = mapped_column(String(128), nullable=False)
+    auth_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthRefreshTokenFamilyRecord(Base):
+    """Revocable family shared by every rotated refresh token in one durable grant."""
+
+    __tablename__ = "oauth_refresh_token_families"
+    __table_args__ = ({"schema": "identity"},)
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    subject: Mapped[str] = mapped_column(String(320), nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("identity.users.id", ondelete="RESTRICT"), nullable=False
+    )
+    client_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reuse_detected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthRefreshTokenRecord(Base):
+    """Hashed refresh token that can be consumed exactly once."""
+
+    __tablename__ = "oauth_refresh_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="oauth_refresh_tokens_token_hash"),
+        UniqueConstraint("family_id", "sequence", name="oauth_refresh_tokens_family_sequence"),
+        Index("ix_oauth_refresh_tokens_expires", "expires_at"),
+        {"schema": "identity"},
+    )
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    family_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("identity.oauth_refresh_token_families.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    replaced_by_token_id: Mapped[str | None] = mapped_column(String(128))
+
+
+class OAuthRevokedAccessTokenRecord(Base):
+    """Hashed JWT identifier retained only until the access token expires."""
+
+    __tablename__ = "oauth_revoked_access_tokens"
+    __table_args__ = (
+        Index("ix_oauth_revoked_access_tokens_expires", "expires_at"),
+        {"schema": "identity"},
+    )
+
+    jti_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revoked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class WorkspaceRecord(Base, TimestampedRevisionMixin):
@@ -1125,9 +1415,7 @@ class TelemetryRecord(Base):
     __table_args__ = (
         CheckConstraint("kind IN ('metric', 'log', 'span')", name="telemetry_signal_kind"),
         CheckConstraint("source IN ('backend', 'frontend')", name="telemetry_signal_source"),
-        CheckConstraint(
-            "jsonb_typeof(attributes) = 'object'", name="telemetry_attributes_object"
-        ),
+        CheckConstraint("jsonb_typeof(attributes) = 'object'", name="telemetry_attributes_object"),
         CheckConstraint(
             "num_nonnulls(workspace_id, resource_owner_id, actor_id) IN (0, 3)",
             name="telemetry_scope_complete",
@@ -1253,6 +1541,11 @@ __all__ = [
     "ConversationRecord",
     "EmbeddingSpaceRecord",
     "IdempotencyRecord",
+    "IdentityAuthenticatorRecord",
+    "IdentityBrowserSessionRecord",
+    "IdentityFlowRecord",
+    "IdentityFlowStepRecord",
+    "IdentityLoginSessionRecord",
     "InterviewEventRecord",
     "InterviewReportJobRecord",
     "InterviewReportRecord",
@@ -1268,6 +1561,11 @@ __all__ = [
     "KnowledgeSourceVersionRecord",
     "KnowledgeVisibilityGrantRecord",
     "KnowledgeVisibilityPolicyRecord",
+    "OAuthAuthorizationCodeRecord",
+    "OAuthAuthorizationRequestRecord",
+    "OAuthRefreshTokenFamilyRecord",
+    "OAuthRefreshTokenRecord",
+    "OAuthRevokedAccessTokenRecord",
     "OutboxEventRecord",
     "PdfSourceMapEntryRecord",
     "RecordingArtifactRecord",
