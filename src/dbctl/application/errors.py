@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 import re
 import sys
@@ -64,8 +65,14 @@ _MAX_SAFE_INTEGER: Final[int] = 2**31 - 1
 _SAFE_DIAGNOSTIC_NOTES_ATTRIBUTE: Final[str] = "_dbctl_safe_diagnostic_notes"
 """@brief 显式可信诊断载荷的私有属性名 / Private attribute for explicitly trusted diagnostics."""
 
-_SAFE_DIAGNOSTIC_GUARD: Final[object] = object()
-"""@brief 防止同形属性被意外误信的模块身份 / Module identity rejecting accidental lookalike payloads."""
+_SAFE_DIAGNOSTIC_MAC_KEY: Final[bytes] = os.urandom(32)
+"""@brief 进程内诊断载荷完整性密钥 / Per-process diagnostic-payload integrity key."""
+
+_SAFE_DIAGNOSTIC_MAC_SIZE: Final[int] = 32
+"""@brief SHA-256 HMAC 的固定字节数 / Fixed byte length of a SHA-256 HMAC."""
+
+_MAX_SAFE_DIAGNOSTIC_NOTES: Final[int] = 32
+"""@brief 单个异常允许的安全注释上限 / Maximum safe notes attached to one exception."""
 
 _EXTERNAL_ERROR_CATEGORIES: Final[tuple[tuple[type[BaseException], str], ...]] = (
     (FileNotFoundError, "builtins.FileNotFoundError"),
@@ -103,14 +110,14 @@ _DBCTL_DOMAIN_ROOT: Final[str] = os.path.realpath(str(Path(__file__).parents[1] 
 class _SafeDiagnosticPayload:
     """@brief 仅由本模块构造的安全诊断载荷 / Safe diagnostic payload constructed only here.
 
-    @param guard 必须是模块私有身份对象 / Must be the module-private identity object.
+    @param mac 绑定异常身份及全部字段的 HMAC / HMAC binding exception identity and all fields.
     @param notes 已净化的不可变注释 / Sanitized immutable notes.
     @param message 已批准的异常正文；不存在时为 None / Approved error text, or ``None``.
     @param message_allows_external_origin 正文是否由安全外部代理工厂构造。
     / Whether a safe external-proxy factory constructed the text.
     """
 
-    guard: object
+    mac: bytes
     notes: tuple[str, ...] = ()
     message: str | None = None
     message_allows_external_origin: bool = False
@@ -224,7 +231,7 @@ def safe_process_exit_cause(*, program: str, exit_code: int) -> ExternalDiagnost
 
     @param program 不含路径的受控程序名 / Controlled program basename without a path.
     @param exit_code 子进程整数退出状态 / Integer subprocess status.
-    @return 带模块守卫安全正文的外部诊断 / External diagnostic with guarded safe text.
+    @return 带完整性校验安全正文的外部诊断 / External diagnostic with integrity-checked safe text.
     @note 该函数不接收子进程 stderr/stdout，因而不会意外回显驱动或服务端正文。
     / Child stdout and stderr are intentionally not accepted, preventing accidental disclosure of
     driver or server text.
@@ -514,17 +521,19 @@ def add_safe_diagnostic_note(error: BaseException, note: str) -> None:
         namespace = _exception_namespace(error)
         if namespace is None:
             return
-        existing = _safe_diagnostic_payload(namespace)
+        existing = _safe_diagnostic_payload(error, namespace)
         notes = existing.notes if existing is not None else ()
+        if len(notes) >= _MAX_SAFE_DIAGNOSTIC_NOTES:
+            return
         message = existing.message if existing is not None else None
         allows_external_origin = (
             existing.message_allows_external_origin if existing is not None else False
         )
-        namespace[_SAFE_DIAGNOSTIC_NOTES_ATTRIBUTE] = _SafeDiagnosticPayload(
-            guard=_SAFE_DIAGNOSTIC_GUARD,
+        namespace[_SAFE_DIAGNOSTIC_NOTES_ATTRIBUTE] = _new_safe_diagnostic_payload(
+            error,
             notes=(*notes, normalized),
             message=message,
-            message_allows_external_origin=allows_external_origin,
+            allows_external_origin=allows_external_origin,
         )
     except Exception:
         # 诊断增强永远不能遮蔽原始业务失败 / Diagnostic enrichment must never mask the failure.
@@ -541,7 +550,7 @@ def safe_diagnostic_notes(error: BaseException) -> tuple[str, ...]:
     namespace = _exception_namespace(error)
     if namespace is None:
         return ()
-    payload = _safe_diagnostic_payload(namespace)
+    payload = _safe_diagnostic_payload(error, namespace)
     if payload is None:
         return ()
     return tuple(
@@ -564,7 +573,7 @@ def safe_diagnostic_message_snapshot(
     namespace = _exception_namespace(error)
     if namespace is None:
         return None
-    payload = _safe_diagnostic_payload(namespace)
+    payload = _safe_diagnostic_payload(error, namespace)
     if payload is None or payload.message is None:
         return None
     rendered = redact_sensitive_text(payload.message)
@@ -593,13 +602,13 @@ def _approve_safe_diagnostic_message(
     namespace = _exception_namespace(error)
     if namespace is None:
         return
-    existing = _safe_diagnostic_payload(namespace)
+    existing = _safe_diagnostic_payload(error, namespace)
     notes = existing.notes if existing is not None else ()
-    namespace[_SAFE_DIAGNOSTIC_NOTES_ATTRIBUTE] = _SafeDiagnosticPayload(
-        guard=_SAFE_DIAGNOSTIC_GUARD,
+    namespace[_SAFE_DIAGNOSTIC_NOTES_ATTRIBUTE] = _new_safe_diagnostic_payload(
+        error,
         notes=notes,
         message=normalized,
-        message_allows_external_origin=allows_external_origin,
+        allows_external_origin=allows_external_origin,
     )
 
 
@@ -621,18 +630,94 @@ def _exception_namespace(error: BaseException) -> dict[str, object] | None:
 
 
 def _safe_diagnostic_payload(
+    error: BaseException,
     namespace: dict[str, object],
 ) -> _SafeDiagnosticPayload | None:
-    """@brief 验证 namespace 中的模块守卫载荷 / Validate the guarded payload in a namespace.
+    """@brief 验证 namespace 中诊断载荷的完整性 / Validate diagnostic-payload integrity.
 
+    @param error 载荷必须绑定的异常 / Exception to which the payload must be bound.
     @param namespace 异常原生属性字典 / Native exception attribute dictionary.
-    @return 身份匹配的不可变载荷或 None / Identity-matched immutable payload or ``None``.
+    @return 完整性校验通过的不可变载荷或 None / Integrity-checked payload or ``None``.
     """
 
     payload = dict.get(namespace, _SAFE_DIAGNOSTIC_NOTES_ATTRIBUTE)
-    if type(payload) is not _SafeDiagnosticPayload or payload.guard is not _SAFE_DIAGNOSTIC_GUARD:
+    if type(payload) is not _SafeDiagnosticPayload:
+        return None
+    if type(payload.mac) is not bytes or len(payload.mac) != _SAFE_DIAGNOSTIC_MAC_SIZE:
+        return None
+    if type(payload.notes) is not tuple or len(payload.notes) > _MAX_SAFE_DIAGNOSTIC_NOTES:
+        return None
+    if any(
+        type(note) is not str or len(note) > _MAX_EXTERNAL_DETAIL_LENGTH for note in payload.notes
+    ):
+        return None
+    if payload.message is not None and (
+        type(payload.message) is not str or len(payload.message) > _MAX_EXTERNAL_DETAIL_LENGTH
+    ):
+        return None
+    if type(payload.message_allows_external_origin) is not bool:
+        return None
+    expected = _safe_diagnostic_mac(
+        error,
+        notes=payload.notes,
+        message=payload.message,
+        allows_external_origin=payload.message_allows_external_origin,
+    )
+    if not hmac.compare_digest(payload.mac, expected):
         return None
     return payload
+
+
+def _new_safe_diagnostic_payload(
+    error: BaseException,
+    *,
+    notes: tuple[str, ...],
+    message: str | None,
+    allows_external_origin: bool,
+) -> _SafeDiagnosticPayload:
+    """@brief 创建绑定当前异常身份的诊断载荷 / Build a payload bound to this exception identity.
+
+    @param error 接收载荷的异常 / Exception receiving the payload.
+    @param notes 已净化安全注释 / Sanitized safe notes.
+    @param message 已批准正文 / Approved message.
+    @param allows_external_origin 是否允许外部 traceback 来源 / Whether external origin is allowed.
+    @return 带完整性标签的不可变载荷 / Immutable payload with an integrity tag.
+    """
+
+    return _SafeDiagnosticPayload(
+        mac=_safe_diagnostic_mac(
+            error,
+            notes=notes,
+            message=message,
+            allows_external_origin=allows_external_origin,
+        ),
+        notes=notes,
+        message=message,
+        message_allows_external_origin=allows_external_origin,
+    )
+
+
+def _safe_diagnostic_mac(
+    error: BaseException,
+    *,
+    notes: tuple[str, ...],
+    message: str | None,
+    allows_external_origin: bool,
+) -> bytes:
+    """@brief 认证异常身份和全部诊断字段 / Authenticate exception identity and all fields.
+
+    @param error 载荷所属异常 / Exception owning the payload.
+    @param notes 完整注释 tuple / Complete note tuple.
+    @param message 可选批准正文 / Optional approved message.
+    @param allows_external_origin 外部来源授权位 / External-origin authorization bit.
+    @return SHA-256 HMAC / SHA-256 HMAC.
+    """
+
+    material = repr((id(error), notes, message, allows_external_origin)).encode(
+        "utf-8",
+        errors="surrogatepass",
+    )
+    return hmac.digest(_SAFE_DIAGNOSTIC_MAC_KEY, material, "sha256")
 
 
 def _terminal_safe(text: str) -> str:
