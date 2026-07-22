@@ -22,7 +22,7 @@ from dbctl.application.prune_telemetry import (
     RetentionDisabled,
     StaleTelemetryProbe,
 )
-from dbctl.composition import compose_dbctl
+from dbctl.composition import compose_prune_telemetry
 from dbctl.domain.retention import PruneLimits, RetentionPolicy
 from dbctl.infrastructure.postgres.telemetry import PsycopgTelemetryRetentionAdapter
 from dbctl.interfaces.cli import main
@@ -176,10 +176,10 @@ def _adapter(config_path: Path) -> PsycopgTelemetryRetentionAdapter:
     @return Psycopg adapter / Psycopg adapter.
     """
 
-    settings = compose_dbctl(
+    settings, _prune = compose_prune_telemetry(
         config_path,
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
-    ).settings
+    )
     return PsycopgTelemetryRetentionAdapter(
         settings.connections.migrator,
         owner_role=settings.blueprint.roles.owner,
