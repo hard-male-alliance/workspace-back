@@ -5,6 +5,7 @@ from .errors import (
     BootstrapExecutionError,
     DatabaseAlreadyExistsError,
     DbctlConfigurationError,
+    ExternalDiagnosticError,
     MigrationExecutionError,
     RetentionExecutionError,
     ShellExecutionError,
@@ -18,6 +19,7 @@ from .ports import (
     ShellPort,
     TelemetryRetentionPort,
 )
+from .progress import OperationName, ProgressSink, ProgressState, ProgressUpdate
 from .provision import (
     BootstrapAccessMode,
     BootstrapPlan,
@@ -58,11 +60,16 @@ __all__ = (
     "DbctlConfigurationError",
     "DeleteTelemetryBatch",
     "ExecutionTarget",
+    "ExternalDiagnosticError",
     "MigrationExecutionError",
     "MigrationPort",
     "MigrationRevision",
     "MigrationService",
     "OpenShellService",
+    "OperationName",
+    "ProgressSink",
+    "ProgressState",
+    "ProgressUpdate",
     "PruneApplied",
     "PruneMode",
     "PruneOutcome",

@@ -6,7 +6,7 @@ from typing import Any, Final
 
 from psycopg import Connection, connect
 
-from dbctl.application.errors import RetentionExecutionError
+from dbctl.application.errors import RetentionExecutionError, safe_external_cause
 from dbctl.application.prune_telemetry import DeleteTelemetryBatch, StaleTelemetryProbe
 from dbctl.domain.database import MigratorLogin
 from dbctl.domain.names import RoleName, SchemaName
@@ -82,8 +82,15 @@ class PsycopgTelemetryRetentionAdapter:
             if not isinstance(rowcount, int) or isinstance(rowcount, bool):
                 raise RetentionExecutionError("PostgreSQL 未返回有效遥测删除计数。")
             return rowcount
-        except Exception:
-            raise RetentionExecutionError("遥测清理数据库操作失败；底层详情已隐藏。") from None
+        except RetentionExecutionError:
+            raise
+        except Exception as error:
+            raise RetentionExecutionError(
+                "遥测删除短事务未报告成功提交。"
+            ) from safe_external_cause(
+                error,
+                operation="执行 PostgreSQL 遥测删除短事务",
+            )
         finally:
             _close_quietly(connection)
 
@@ -108,8 +115,15 @@ class PsycopgTelemetryRetentionAdapter:
             if row is None or len(row) != 1 or not isinstance(row[0], bool):
                 raise RetentionExecutionError("PostgreSQL 返回了无效遥测剩余状态。")
             return row[0]
-        except Exception:
-            raise RetentionExecutionError("遥测清理数据库操作失败；底层详情已隐藏。") from None
+        except RetentionExecutionError:
+            raise
+        except Exception as error:
+            raise RetentionExecutionError(
+                "PostgreSQL 未能完成遥测剩余状态检查。"
+            ) from safe_external_cause(
+                error,
+                operation="查询 PostgreSQL 过期遥测状态",
+            )
         finally:
             _close_quietly(connection)
 
@@ -125,8 +139,13 @@ class PsycopgTelemetryRetentionAdapter:
                 self._login.dsn.reveal(),
                 connect_timeout=_CONNECT_TIMEOUT_SECONDS,
             )
-        except Exception:
-            raise RetentionExecutionError("无法连接 PostgreSQL 执行遥测清理。") from None
+        except Exception as error:
+            raise RetentionExecutionError(
+                "无法连接 PostgreSQL 执行遥测清理。"
+            ) from safe_external_cause(
+                error,
+                operation="建立 PostgreSQL migrator 连接",
+            )
 
     def _prepare_transaction(
         self,

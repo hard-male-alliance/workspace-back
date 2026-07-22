@@ -7,8 +7,15 @@ from typing import Final
 from dbctl.domain.database import DatabaseLogin, DbctlSettings, MigratorLogin
 from dbctl.domain.roles import LoginRole
 
-from .errors import DbctlConfigurationError, MigrationExecutionError
+from .errors import DbctlConfigurationError, MigrationExecutionError, add_safe_diagnostic_note
 from .ports import MigrationPort
+from .progress import (
+    OperationName,
+    ProgressSink,
+    ProgressState,
+    ProgressUpdate,
+    publish_progress,
+)
 
 _REVISION_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_+\-]+$")
 """@brief Alembic revision 的安全白名单 / Safe allow-list for Alembic revisions."""
@@ -50,12 +57,14 @@ HEAD_REVISION: Final[MigrationRevision] = MigrationRevision()
 class MigrationService:
     """@brief 将迁移身份、revision 与设置交给单一端口 / Delegate typed migration input to one port."""
 
-    def __init__(self, port: MigrationPort) -> None:
+    def __init__(self, port: MigrationPort, *, progress: ProgressSink | None = None) -> None:
         """@brief 初始化迁移用例 / Initialize the migration use case.
 
         @param port Alembic 基础设施端口 / Alembic infrastructure port.
+        @param progress 可选同步进度输出端口 / Optional synchronous progress output port.
         """
         self._port = port
+        self._progress = progress
 
     def execute(
         self,
@@ -78,4 +87,49 @@ class MigrationService:
             raise MigrationExecutionError("migration settings 必须是 DbctlSettings。")
         if login != settings.connections.migrator:
             raise MigrationExecutionError("migration 登录必须来自同一份 DbctlSettings。")
-        self._port.upgrade(login, revision, settings.blueprint)
+        detail = (
+            f"目标={login.target.host}:{login.target.port}/{login.target.database.value}；"
+            f"身份={login.role_name.value}；revision={revision.value}"
+        )
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.MIGRATION,
+                state=ProgressState.STARTED,
+                message="执行 Alembic schema upgrade",
+                detail=detail,
+            )
+        )
+        try:
+            self._port.upgrade(login, revision, settings.blueprint)
+        except Exception as error:
+            add_safe_diagnostic_note(error, f"dbctl migrate：{detail}。")
+            add_safe_diagnostic_note(
+                error,
+                "运维影响：migration 未报告完成；重试前请核验数据库当前 revision。",
+            )
+            self._publish(
+                ProgressUpdate(
+                    operation=OperationName.MIGRATION,
+                    state=ProgressState.FAILED,
+                    message="Alembic schema upgrade 未完成",
+                    detail="请根据 traceback 核验当前 revision 后再重试",
+                )
+            )
+            raise
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.MIGRATION,
+                state=ProgressState.SUCCEEDED,
+                message="Alembic schema upgrade 已完成",
+                detail=detail,
+            )
+        )
+
+    def _publish(self, update: ProgressUpdate) -> None:
+        """@brief 向可选输出端口同步发布进度 / Publish progress synchronously to the optional output port.
+
+        @param update 已验证且不含 secret 的进度 / Validated secret-free progress update.
+        @return 无返回值 / No return value.
+        """
+
+        publish_progress(self._progress, update)

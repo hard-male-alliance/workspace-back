@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from conftest import PROJECT_ROOT
-from dbctl.application.errors import DbctlConfigurationError
+from dbctl.application.errors import DbctlConfigurationError, ExternalDiagnosticError
 from dbctl.domain.errors import InvalidRetentionPolicyError
 from dbctl.domain.retention import PruneLimits
 from dbctl.domain.roles import Secret
@@ -98,7 +98,9 @@ def test_dsn_parser_rejects_implicit_routing_and_credential_options(option: str)
     with pytest.raises(DbctlConfigurationError) as error_info:
         parse_postgres_dsn(dsn)
     assert "secret-sentinel" not in str(error_info.value)
-    assert error_info.value.__cause__ is None
+    assert isinstance(error_info.value.__cause__, ExternalDiagnosticError)
+    assert "secret-sentinel" not in str(error_info.value.__cause__)
+    assert "postgresql://" not in str(error_info.value.__cause__)
 
 
 def test_dbinit_rejects_fake_schema_customization_before_writing_config(

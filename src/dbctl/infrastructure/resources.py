@@ -7,7 +7,7 @@ from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Final, Literal
 
-from dbctl.application.errors import DbctlConfigurationError
+from dbctl.application.errors import DbctlConfigurationError, safe_external_cause
 
 type DefaultTextResource = Literal["example.jsonc", "dbinit.jsonc"]
 """@brief 可读取的固定文本资源名 / Fixed text-resource names that may be read."""
@@ -35,13 +35,19 @@ def read_default_text(name: DefaultTextResource) -> str:
         try:
             return packaged.read_text(encoding="utf-8")
         except OSError as error:
-            raise DbctlConfigurationError(f"内置 {name} 资源无法读取。") from error
+            raise DbctlConfigurationError(f"内置 {name} 资源无法读取。") from safe_external_cause(
+                error,
+                operation=f"读取内置 {name} 资源",
+            )
     source_path = _source_checkout_resource(name)
     if source_path is not None and source_path.is_file():
         try:
             return source_path.read_text(encoding="utf-8")
         except OSError as error:
-            raise DbctlConfigurationError(f"源码树 {name} 资源无法读取。") from error
+            raise DbctlConfigurationError(f"源码树 {name} 资源无法读取。") from safe_external_cause(
+                error,
+                operation=f"读取源码树 {name} 资源",
+            )
     raise DbctlConfigurationError(f"未找到内置 {name} 资源。")
 
 
