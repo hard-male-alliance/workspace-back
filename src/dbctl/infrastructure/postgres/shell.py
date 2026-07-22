@@ -6,7 +6,11 @@ import os
 import subprocess
 from collections.abc import Mapping
 
-from dbctl.application.errors import ShellExecutionError
+from dbctl.application.errors import (
+    ShellExecutionError,
+    add_safe_diagnostic_note,
+    safe_external_cause,
+)
 from dbctl.domain.database import LoginDatabase
 from dbctl.infrastructure.postgres.pgpass import create_pgpass_lease
 from dbctl.infrastructure.postgres.process import sanitized_libpq_environment
@@ -40,8 +44,13 @@ class PsqlShellAdapter:
                 password=login.password,
                 prefix="dbctl-shell-pgpass-",
             )
-        except OSError, ValueError:
-            raise ShellExecutionError("无法创建临时 PostgreSQL 密码文件。") from None
+        except (OSError, ValueError) as error:
+            raise ShellExecutionError(
+                "无法创建临时 PostgreSQL 密码文件。"
+            ) from safe_external_cause(
+                error,
+                operation="创建 psql 临时 PGPASSFILE",
+            )
 
         command = (
             "psql",
@@ -65,16 +74,30 @@ class PsqlShellAdapter:
                     env=child_environment,
                 )
                 result = completed.returncode
-            except OSError:
+            except OSError as error:
                 process_error = ShellExecutionError("无法启动本地 PostgreSQL psql。")
+                process_error.__cause__ = safe_external_cause(
+                    error,
+                    operation="启动本地 psql 进程",
+                )
         finally:
             try:
                 lease.close()
-            except OSError:
+            except OSError as error:
                 if process_error is None:
                     process_error = ShellExecutionError("无法删除临时 PostgreSQL 密码文件。")
+                    process_error.__cause__ = safe_external_cause(
+                        error,
+                        operation="删除 psql 临时 PGPASSFILE",
+                    )
+                else:
+                    add_safe_diagnostic_note(
+                        process_error,
+                        "安全影响：psql 启动失败后，临时 PGPASSFILE 清理也失败；"
+                        "请检查系统临时目录并按 owner 权限手工删除残留凭据文件。",
+                    )
         if process_error is not None:
-            raise process_error from None
+            raise process_error
         if result is None:
             raise ShellExecutionError("psql 未返回退出状态。")
         return result

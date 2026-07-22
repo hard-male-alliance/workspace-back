@@ -14,8 +14,19 @@ from dbctl.domain.database import (
 from dbctl.domain.names import DatabaseName, RoleName, SchemaName
 from dbctl.domain.roles import DatabaseRole, RoleSet, Secret
 
-from .errors import BootstrapExecutionError, DatabaseAlreadyExistsError
+from .errors import (
+    BootstrapExecutionError,
+    DatabaseAlreadyExistsError,
+    add_safe_diagnostic_note,
+)
 from .ports import BootstrapRunnerFactory
+from .progress import (
+    OperationName,
+    ProgressSink,
+    ProgressState,
+    ProgressUpdate,
+    publish_progress,
+)
 
 
 class BootstrapAccessMode(StrEnum):
@@ -220,12 +231,19 @@ class BootstrapResult:
 class BootstrapService:
     """@brief 管理 runner 生命周期并执行 bootstrap 计划 / Own runner lifecycle and execute a plan."""
 
-    def __init__(self, runner_factory: BootstrapRunnerFactory) -> None:
+    def __init__(
+        self,
+        runner_factory: BootstrapRunnerFactory,
+        *,
+        progress: ProgressSink | None = None,
+    ) -> None:
         """@brief 初始化 bootstrap 用例 / Initialize the bootstrap use case.
 
         @param runner_factory 按访问模式打开 runner 的端口 / Port opening a runner by access mode.
+        @param progress 可选同步进度输出端口 / Optional synchronous progress output port.
         """
         self._runner_factory = runner_factory
+        self._progress = progress
 
     def execute(
         self,
@@ -250,28 +268,125 @@ class BootstrapService:
         skipped_stage_count = 0
         executed_statement_count = 0
         database_created = False
-        with self._runner_factory.open(plan, access_mode) as runner:
-            for stage in plan.stages:
-                if stage.condition is StageCondition.DATABASE_ABSENT:
-                    if runner.database_exists(plan.database):
-                        skipped_stage_count += 1
-                        continue
-                    try:
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.BOOTSTRAP,
+                state=ProgressState.STARTED,
+                message="解析 PostgreSQL 管理访问方式",
+                detail=f"请求模式={access_mode.value}",
+            )
+        )
+        runner_resource = self._runner_factory.open(plan, access_mode)
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.BOOTSTRAP,
+                state=ProgressState.SUCCEEDED,
+                message="PostgreSQL 管理访问方式已确定",
+                detail=f"实际模式={runner_resource.access_mode.value}",
+            )
+        )
+        with runner_resource as runner:
+            total_stages = len(plan.stages)
+            for stage_number, stage in enumerate(plan.stages, start=1):
+                stage_detail = (
+                    f"目标={stage.target.value}；事务={stage.transaction_mode.value}；"
+                    f"SQL={len(stage.statements)} 条"
+                )
+                self._publish(
+                    ProgressUpdate(
+                        operation=OperationName.BOOTSTRAP,
+                        state=ProgressState.STARTED,
+                        message=stage.label,
+                        detail=stage_detail,
+                        current=stage_number,
+                        total=total_stages,
+                    )
+                )
+                try:
+                    if stage.condition is StageCondition.DATABASE_ABSENT:
+                        if runner.database_exists(plan.database):
+                            skipped_stage_count += 1
+                            self._publish(
+                                ProgressUpdate(
+                                    operation=OperationName.BOOTSTRAP,
+                                    state=ProgressState.SKIPPED,
+                                    message=stage.label,
+                                    detail="目标数据库已存在；未执行 CREATE DATABASE",
+                                    current=stage_number,
+                                    total=total_stages,
+                                )
+                            )
+                            continue
+                        try:
+                            runner.execute_stage(stage)
+                        except DatabaseAlreadyExistsError:
+                            skipped_stage_count += 1
+                            self._publish(
+                                ProgressUpdate(
+                                    operation=OperationName.BOOTSTRAP,
+                                    state=ProgressState.SKIPPED,
+                                    message=stage.label,
+                                    detail="并发 bootstrap 已创建目标数据库；安全跳过",
+                                    current=stage_number,
+                                    total=total_stages,
+                                )
+                            )
+                            continue
+                        database_created = True
+                    else:
                         runner.execute_stage(stage)
-                    except DatabaseAlreadyExistsError:
-                        skipped_stage_count += 1
-                        continue
-                    database_created = True
-                else:
-                    runner.execute_stage(stage)
+                except Exception as error:
+                    impact = (
+                        f"此前已完成 {executed_stage_count} 个阶段、"
+                        f"执行 {executed_statement_count} 条计划 SQL；"
+                        "当前阶段未计入完成结果，后续阶段未执行"
+                    )
+                    add_safe_diagnostic_note(
+                        error,
+                        f"dbctl bootstrap 阶段 {stage_number}/{total_stages}：{stage.label}。"
+                    )
+                    add_safe_diagnostic_note(error, f"运维影响：{impact}。")
+                    self._publish(
+                        ProgressUpdate(
+                            operation=OperationName.BOOTSTRAP,
+                            state=ProgressState.FAILED,
+                            message=stage.label,
+                            detail=impact,
+                            current=stage_number,
+                            total=total_stages,
+                        )
+                    )
+                    raise
                 executed_stage_count += 1
                 executed_statement_count += len(stage.statements)
+                self._publish(
+                    ProgressUpdate(
+                        operation=OperationName.BOOTSTRAP,
+                        state=ProgressState.SUCCEEDED,
+                        message=stage.label,
+                        detail=(
+                            f"本阶段已提交 {len(stage.statements)} 条计划 SQL；"
+                            f"累计完成 {executed_stage_count} 个阶段"
+                        ),
+                        current=stage_number,
+                        total=total_stages,
+                    )
+                )
         return BootstrapResult(
             database_created=database_created,
             executed_stage_count=executed_stage_count,
             skipped_stage_count=skipped_stage_count,
             executed_statement_count=executed_statement_count,
         )
+
+    def _publish(self, update: ProgressUpdate) -> None:
+        """@brief 向可选输出端口同步发布进度 / Publish progress synchronously to the optional output port.
+
+        @param update 已验证且不含 secret 的进度 / Validated secret-free progress update.
+        @return 无返回值 / No return value.
+        """
+
+        publish_progress(self._progress, update)
 
 
 def build_bootstrap_plan(settings: DbctlSettings) -> BootstrapPlan:

@@ -8,8 +8,19 @@ from typing import Literal
 
 from dbctl.domain.retention import PruneLimits, RetentionPolicy
 
-from .errors import RetentionExecutionError
+from .errors import (
+    RetentionExecutionError,
+    add_safe_diagnostic_note,
+    safe_external_cause,
+)
 from .ports import TelemetryRetentionPort
+from .progress import (
+    OperationName,
+    ProgressSink,
+    ProgressState,
+    ProgressUpdate,
+    publish_progress,
+)
 
 
 class PruneMode(StrEnum):
@@ -210,15 +221,18 @@ class PruneTelemetryService:
         port: TelemetryRetentionPort | None,
         *,
         clock: Callable[[], datetime] = _utc_now,
+        progress: ProgressSink | None = None,
     ) -> None:
         """@brief 初始化遥测清理用例 / Initialize the telemetry-pruning use case.
 
         @param port apply 模式使用的 I/O 端口；其他分支可为 None。
         / I/O port for apply mode; other branches permit None.
         @param clock 可注入的带时区时钟 / Injectable timezone-aware clock.
+        @param progress 可选同步进度输出端口 / Optional synchronous progress output port.
         """
         self._port = port
         self._clock = clock
+        self._progress = progress
 
     def execute(self, request: PruneRequest) -> PruneOutcome:
         """@brief 执行或预览一轮遥测清理 / Apply or preview one telemetry-pruning run.
@@ -229,10 +243,26 @@ class PruneTelemetryService:
         if not isinstance(request, PruneRequest):
             raise RetentionExecutionError("prune use case 需要 PruneRequest。")
         if not request.policy.enabled:
+            self._publish(
+                ProgressUpdate(
+                    operation=OperationName.PRUNE_TELEMETRY,
+                    state=ProgressState.SKIPPED,
+                    message="遥测保留清理已停用",
+                    detail="retention_days=0；未连接数据库，未删除记录",
+                )
+            )
             return RetentionDisabled(policy=request.policy, limits=request.limits)
 
         cutoff = _cutoff(self._clock(), request.policy)
         if request.mode is PruneMode.DRY_RUN:
+            self._publish(
+                ProgressUpdate(
+                    operation=OperationName.PRUNE_TELEMETRY,
+                    state=ProgressState.SUCCEEDED,
+                    message="遥测清理预览已生成",
+                    detail=(f"cutoff={cutoff.isoformat()}；未连接数据库，未删除记录"),
+                )
+            )
             return PrunePreview(policy=request.policy, limits=request.limits, cutoff=cutoff)
         if self._port is None:
             raise RetentionExecutionError("apply 模式缺少 TelemetryRetentionPort。")
@@ -240,22 +270,121 @@ class PruneTelemetryService:
         batch_count = 0
         deleted_count = 0
         command = DeleteTelemetryBatch(cutoff=cutoff, limits=request.limits)
-        for _batch_number in range(request.limits.max_batches):
-            deleted_in_batch = self._port.delete_batch(command)
-            if (
-                not isinstance(deleted_in_batch, int)
-                or isinstance(deleted_in_batch, bool)
-                or not 0 <= deleted_in_batch <= request.limits.batch_size
-            ):
-                raise RetentionExecutionError("遥测删除端口违反单批删除边界。")
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.PRUNE_TELEMETRY,
+                state=ProgressState.STARTED,
+                message="执行有界遥测清理",
+                detail=(
+                    f"cutoff={cutoff.isoformat()}；每批上限={request.limits.batch_size}；"
+                    f"最多批次={request.limits.max_batches}"
+                ),
+            )
+        )
+        for batch_number in range(1, request.limits.max_batches + 1):
+            self._publish(
+                ProgressUpdate(
+                    operation=OperationName.PRUNE_TELEMETRY,
+                    state=ProgressState.STARTED,
+                    message="删除一批过期遥测并提交短事务",
+                    detail=f"此前累计删除={deleted_count} 条",
+                    current=batch_number,
+                    total=request.limits.max_batches,
+                )
+            )
+            try:
+                deleted_in_batch = self._port.delete_batch(command)
+                if (
+                    not isinstance(deleted_in_batch, int)
+                    or isinstance(deleted_in_batch, bool)
+                    or not 0 <= deleted_in_batch <= request.limits.batch_size
+                ):
+                    raise RetentionExecutionError("遥测删除端口违反单批删除边界。")
+            except Exception as error:
+                impact = (
+                    f"此前已提交 {batch_count} 个短事务、删除 {deleted_count} 条；"
+                    "当前批次未计入完成结果，后续批次未执行"
+                )
+                add_safe_diagnostic_note(
+                    error,
+                    f"dbctl prune-telemetry 批次 {batch_number}/{request.limits.max_batches}。"
+                )
+                add_safe_diagnostic_note(
+                    error,
+                    f"运维影响：{impact}。固定 cutoff={cutoff.isoformat()}。",
+                )
+                self._publish(
+                    ProgressUpdate(
+                        operation=OperationName.PRUNE_TELEMETRY,
+                        state=ProgressState.FAILED,
+                        message="遥测删除批次未完成",
+                        detail=impact,
+                        current=batch_number,
+                        total=request.limits.max_batches,
+                    )
+                )
+                raise
             batch_count += 1
             deleted_count += deleted_in_batch
+            self._publish(
+                ProgressUpdate(
+                    operation=OperationName.PRUNE_TELEMETRY,
+                    state=ProgressState.SUCCEEDED,
+                    message="遥测删除短事务已提交",
+                    detail=(f"本批删除={deleted_in_batch} 条；累计删除={deleted_count} 条"),
+                    current=batch_number,
+                    total=request.limits.max_batches,
+                )
+            )
             if deleted_in_batch < request.limits.batch_size:
                 break
 
-        has_more = self._port.has_stale(StaleTelemetryProbe(cutoff=cutoff, limits=request.limits))
-        if not isinstance(has_more, bool):
-            raise RetentionExecutionError("遥测删除端口返回了无效剩余状态。")
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.PRUNE_TELEMETRY,
+                state=ProgressState.STARTED,
+                message="检查是否仍有早于 cutoff 的遥测",
+                detail=f"已提交批次={batch_count}；累计删除={deleted_count} 条",
+            )
+        )
+        try:
+            has_more = self._port.has_stale(
+                StaleTelemetryProbe(cutoff=cutoff, limits=request.limits)
+            )
+            if not isinstance(has_more, bool):
+                raise RetentionExecutionError("遥测删除端口返回了无效剩余状态。")
+        except Exception as error:
+            impact = (
+                f"删除已完成并提交 {batch_count} 个短事务、共 {deleted_count} 条；"
+                "仅剩余状态检查失败"
+            )
+            add_safe_diagnostic_note(
+                error,
+                "dbctl prune-telemetry：删除后的剩余状态检查失败。",
+            )
+            add_safe_diagnostic_note(
+                error,
+                f"运维影响：{impact}。固定 cutoff={cutoff.isoformat()}。",
+            )
+            self._publish(
+                ProgressUpdate(
+                    operation=OperationName.PRUNE_TELEMETRY,
+                    state=ProgressState.FAILED,
+                    message="遥测剩余状态检查失败",
+                    detail=impact,
+                )
+            )
+            raise
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.PRUNE_TELEMETRY,
+                state=ProgressState.SUCCEEDED,
+                message="遥测剩余状态检查完成",
+                detail=(
+                    "仍有过期记录，需安排下一轮清理" if has_more else "早于本轮 cutoff 的记录已清空"
+                ),
+            )
+        )
         return PruneApplied(
             policy=request.policy,
             limits=request.limits,
@@ -264,6 +393,15 @@ class PruneTelemetryService:
             deleted_count=deleted_count,
             has_more=has_more,
         )
+
+    def _publish(self, update: ProgressUpdate) -> None:
+        """@brief 向可选输出端口同步发布进度 / Publish progress synchronously to the optional output port.
+
+        @param update 已验证且不含 secret 的进度 / Validated secret-free progress update.
+        @return 无返回值 / No return value.
+        """
+
+        publish_progress(self._progress, update)
 
 
 def _cutoff(now: datetime, policy: RetentionPolicy) -> datetime:
@@ -277,7 +415,12 @@ def _cutoff(now: datetime, policy: RetentionPolicy) -> datetime:
     try:
         return now.astimezone(UTC) - timedelta(days=policy.days)
     except (OverflowError, ValueError) as error:
-        raise RetentionExecutionError("retention days 超出 datetime 可表示范围。") from error
+        raise RetentionExecutionError(
+            "retention days 超出 datetime 可表示范围。"
+        ) from safe_external_cause(
+            error,
+            operation="计算遥测保留 cutoff",
+        )
 
 
 def _require_aware_datetime(value: datetime, *, label: str) -> None:

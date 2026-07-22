@@ -12,15 +12,45 @@ from urllib.parse import quote
 import pytest
 
 from conftest import PROJECT_ROOT
-from dbctl.application.errors import MigrationExecutionError
+from dbctl.application.errors import (
+    ExternalDiagnosticError,
+    MigrationExecutionError,
+    ShellExecutionError,
+    safe_diagnostic_notes,
+)
 from dbctl.application.migrate import MigrationRevision
 from dbctl.composition import compose_dbctl
 from dbctl.domain.database import LoginDatabase
 from dbctl.domain.roles import LoginRole
 from dbctl.infrastructure.alembic import AlembicMigrationAdapter
 from dbctl.infrastructure.configuration import DbctlConfigStore
+from dbctl.infrastructure.postgres.shell import PsqlShellAdapter
 from dbctl.interfaces.cli import main
 from workspace_shared.jsonc import load_jsonc
+
+
+class FailingCleanupLease:
+    """@brief close 固定失败的临时凭据租约 / Temporary credential lease whose close always fails.
+
+    @param path 供子进程环境引用的测试路径 / Test path referenced by the child environment.
+    """
+
+    def __init__(self, path: Path) -> None:
+        """@brief 保存测试路径 / Retain the test path.
+
+        @param path 临时凭据路径 / Temporary credential path.
+        """
+
+        self.path = path
+
+    def close(self) -> None:
+        """@brief 模拟凭据文件清理失败 / Simulate credential-file cleanup failure.
+
+        @return 永不返回 / Never returns.
+        @raise OSError 固定清理错误 / Fixed cleanup failure.
+        """
+
+        raise OSError("opaque-cleanup-error-sentinel")
 
 
 def _initialized_config(
@@ -112,6 +142,61 @@ def test_shell_uses_exact_config_pgpass_without_prompt(
     assert inherited["PGPASSFILE"] == str(tmp_path / "stale-pgpass")
 
 
+def test_shell_reports_secondary_pgpass_cleanup_risk_without_masking_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief shell 主故障保留且凭据清理风险可见 / Shell keeps the primary failure and reports cleanup risk.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @param monkeypatch pytest 替换夹具 / Pytest monkeypatch fixture.
+    @return 无返回值 / No return value.
+    """
+
+    application = compose_dbctl(
+        _initialized_config(tmp_path),
+        dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
+    )
+    lease = FailingCleanupLease(tmp_path / "leased-pgpass")
+
+    def fake_lease(**_keywords: object) -> FailingCleanupLease:
+        """@brief 返回清理失败租约 / Return the cleanup-failing lease.
+
+        @param _keywords 未使用租约参数 / Unused lease arguments.
+        @return 共享测试租约 / Shared test lease.
+        """
+
+        return lease
+
+    def fail_to_start(*_arguments: object, **_keywords: object) -> object:
+        """@brief 模拟 psql 启动失败 / Simulate failure to launch psql.
+
+        @param _arguments 未使用位置参数 / Unused positional arguments.
+        @param _keywords 未使用关键字参数 / Unused keyword arguments.
+        @return 永不返回 / Never returns.
+        @raise OSError 固定启动错误 / Fixed launch failure.
+        """
+
+        raise OSError("opaque-process-error-sentinel")
+
+    monkeypatch.setattr(
+        "dbctl.infrastructure.postgres.shell.create_pgpass_lease",
+        fake_lease,
+    )
+    monkeypatch.setattr(subprocess, "run", fail_to_start)
+
+    with pytest.raises(ShellExecutionError) as error_info:
+        PsqlShellAdapter({}).launch(application.settings.connections.application)
+
+    assert str(error_info.value) == "无法启动本地 PostgreSQL psql。"
+    assert isinstance(error_info.value.__cause__, ExternalDiagnosticError)
+    notes = "\n".join(safe_diagnostic_notes(error_info.value))
+    assert "临时 PGPASSFILE 清理也失败" in notes
+    assert "手工删除残留凭据文件" in notes
+    assert "opaque-process-error-sentinel" not in str(error_info.value.__cause__)
+    assert "opaque-cleanup-error-sentinel" not in notes
+
+
 @pytest.mark.parametrize(
     ("role", "expected_name"),
     (
@@ -188,11 +273,11 @@ def test_migration_transports_encoded_dsn_only_via_memory_attributes(
     )
 
 
-def test_migration_failure_never_displays_or_chains_config_dsn(
+def test_migration_failure_uses_secret_safe_diagnostic_cause(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """@brief Alembic 异常不进入显示文本或 cause chain / Alembic errors enter neither display text nor cause chains.
+    """@brief Alembic 异常链保留栈但不保留 DSN / Alembic cause chains retain frames without DSNs.
 
     @param tmp_path pytest 临时目录 / pytest temporary directory.
     @param monkeypatch pytest 替换夹具 / pytest patch fixture.
@@ -225,7 +310,11 @@ def test_migration_failure_never_displays_or_chains_config_dsn(
         )
     assert secret not in str(error_info.value)
     assert "postgresql://" not in str(error_info.value)
-    assert error_info.value.__cause__ is None
+    cause = error_info.value.__cause__
+    assert isinstance(cause, ExternalDiagnosticError)
+    assert cause.__traceback__ is not None
+    assert secret not in str(cause)
+    assert "postgresql://" not in str(cause)
 
 
 def test_composition_passes_only_migrator_and_nonsecret_blueprint_to_adapter(

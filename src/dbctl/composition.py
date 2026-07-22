@@ -9,6 +9,7 @@ from pathlib import Path
 
 from dbctl.application.migrate import MigrationService
 from dbctl.application.open_shell import OpenShellService
+from dbctl.application.progress import ProgressSink
 from dbctl.application.provision import BootstrapService
 from dbctl.application.prune_telemetry import PruneTelemetryService
 from dbctl.domain.database import DbctlSettings
@@ -43,6 +44,7 @@ def compose_dbctl(
     dbinit_path: Path | str | None = None,
     initialize_config: bool = False,
     environ: Mapping[str, str] | None = None,
+    progress: ProgressSink | None = None,
 ) -> DbctlApplication:
     """@brief 从配置装配四个独立用例 / Compose four independent use cases from configuration.
 
@@ -50,10 +52,11 @@ def compose_dbctl(
     @param dbinit_path 非秘密数据库目标状态路径 / Non-secret database target-state path.
     @param initialize_config 仅 bootstrap 可授权的凭证初始化 / Credential initialization authorized only for bootstrap.
     @param environ psql 子进程基础环境；默认当前环境 / Base psql environment; defaults to current process.
+    @param progress 可选同步操作者进度端口 / Optional synchronous operator-progress port.
     @return 不启动 subprocess/网络连接的 DbctlApplication / DbctlApplication without starting subprocesses or connections.
     """
 
-    store = DbctlConfigStore(config_path, dbinit_path)
+    store = DbctlConfigStore(config_path, dbinit_path, progress=progress)
     settings = store.initialize() if initialize_config else store.load()
     process_environment = os.environ if environ is None else environ
     telemetry_adapter = PsycopgTelemetryRetentionAdapter(
@@ -63,10 +66,13 @@ def compose_dbctl(
     )
     return DbctlApplication(
         settings=settings,
-        bootstrap=BootstrapService(LocalPsqlBootstrapRunnerFactory(environ=process_environment)),
-        migration=MigrationService(AlembicMigrationAdapter()),
-        prune=PruneTelemetryService(telemetry_adapter),
-        shell=OpenShellService(PsqlShellAdapter(process_environment)),
+        bootstrap=BootstrapService(
+            LocalPsqlBootstrapRunnerFactory(environ=process_environment),
+            progress=progress,
+        ),
+        migration=MigrationService(AlembicMigrationAdapter(), progress=progress),
+        prune=PruneTelemetryService(telemetry_adapter, progress=progress),
+        shell=OpenShellService(PsqlShellAdapter(process_environment), progress=progress),
     )
 
 

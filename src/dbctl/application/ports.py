@@ -15,6 +15,14 @@ if TYPE_CHECKING:
 class BootstrapRunner(Protocol):
     """@brief 一个 bootstrap 会话的批量执行端口 / Batch-execution port for one bootstrap session."""
 
+    @property
+    def access_mode(self) -> BootstrapAccessMode:
+        """@brief 返回已经解析的实际管理访问方式 / Return the resolved administrative-access mode.
+
+        @return sudo 或 prompt / ``sudo`` or ``prompt``.
+        """
+        ...
+
     def __enter__(self) -> Self:
         """@brief 进入受控 runner 生命周期 / Enter the controlled runner lifecycle.
 

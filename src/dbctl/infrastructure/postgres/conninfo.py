@@ -6,7 +6,7 @@ from urllib.parse import quote
 
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
-from dbctl.application.errors import DbctlConfigurationError
+from dbctl.application.errors import DbctlConfigurationError, safe_external_cause
 from dbctl.domain.database import DatabaseLogin, DatabaseTarget
 from dbctl.domain.names import DatabaseName, RoleName
 from dbctl.domain.roles import LoginRole, Secret
@@ -87,12 +87,18 @@ def parse_postgres_dsn(dsn: str) -> ParsedPostgresDsn:
         )
         user = RoleName(raw_user)
         safe_conninfo = make_conninfo(**parameters)
-    except TypeError, ValueError:
+    except (TypeError, ValueError) as error:
         raise DbctlConfigurationError(
             "PostgreSQL DSN 必须显式包含合法的 user、password、host、port 与 database。"
-        ) from None
-    except Exception:
-        raise DbctlConfigurationError("PostgreSQL DSN 格式无效。") from None
+        ) from safe_external_cause(
+            error,
+            operation="解析并验证 PostgreSQL DSN",
+        )
+    except Exception as error:
+        raise DbctlConfigurationError("PostgreSQL DSN 格式无效。") from safe_external_cause(
+            error,
+            operation="调用 libpq conninfo parser",
+        )
     return ParsedPostgresDsn(
         target=target,
         user=user,
