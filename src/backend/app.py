@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -45,9 +44,9 @@ logger = logging.getLogger(__name__)
 def config_path() -> Path:
     """@brief 解析配置路径 / Resolve the configuration path.
 
-    @return AIWS_CONFIG 或当前目录 config.jsonc / AIWS_CONFIG or current-directory config.jsonc.
+    @return 当前目录 config.jsonc / Current-directory config.jsonc.
     """
-    return Path(os.environ.get("AIWS_CONFIG", "config.jsonc"))
+    return Path("config.jsonc")
 
 
 def _identity_problem_response(request: Request, error: IdentityVerificationError) -> JSONResponse:

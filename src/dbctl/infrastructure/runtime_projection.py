@@ -9,12 +9,18 @@ from typing import Any, Final
 
 import json5
 
-from workspace_shared.jsonc import ConfigurationError, require_mapping
+from workspace_shared.jsonc import ConfigurationError, load_jsonc, require_mapping
 
 from .private_files import atomic_write_private_text
 
 _PRIVATE_DIRECTORY_MODE: Final[int] = 0o700
 """@brief 运行投影父目录的创建权限 / Creation mode for the runtime projection directory."""
+
+
+def validate_runtime_config(config_path: Path) -> None:
+    """Validate the single private runtime configuration without rewriting it."""
+
+    load_jsonc(config_path)
 
 
 def build_runtime_config(

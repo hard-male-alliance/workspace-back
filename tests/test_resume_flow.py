@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from backend.application.services import (
     ServiceDependencies,
 )
 from backend.config import BackendSettings
+from backend.domain.common import Job, JobStatus, utc_now
 from backend.domain.observability import ResourceMetadata
 from backend.infrastructure.contracts import ContractValidator
 from backend.infrastructure.embeddings import DeterministicEmbeddingProvider
@@ -30,6 +32,27 @@ from backend.infrastructure.observability.pipeline import (
 from backend.infrastructure.rendering import MockRenderer
 from conftest import PROJECT_ROOT, idempotency_headers, wait_for_json
 from workspace_shared.tenancy import ActorScope
+
+
+@pytest.mark.asyncio
+async def test_durable_job_claim_is_exclusive_and_stale_lease_is_recoverable() -> None:
+    """Only one worker claims live work, while an expired running lease can be reclaimed."""
+    repository = InMemoryWorkspaceRepository()
+    scope = ActorScope("usr_claim", "ws_claim", "usr_claim")
+    job = Job("job_claim_0001", "resume.render", utc_now(), "req_claim")
+    await repository.create_job(scope, job)
+
+    first = await repository.claim_job(scope, job.id, stale_after_seconds=900)
+    assert first is not None
+    assert first.status is JobStatus.RUNNING
+    assert await repository.claim_job(scope, job.id, stale_after_seconds=900) is None
+
+    first.started_at = utc_now() - timedelta(seconds=901)
+    recovered = await repository.claim_job(scope, job.id, stale_after_seconds=900)
+    assert recovered is first
+    assert recovered.status is JobStatus.RUNNING
+    assert recovered.started_at is not None
+    assert recovered.started_at > utc_now() - timedelta(seconds=10)
 
 
 def test_resume_version_idempotency_and_render_flow(

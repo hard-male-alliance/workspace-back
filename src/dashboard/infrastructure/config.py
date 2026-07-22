@@ -24,9 +24,6 @@ DatabaseMode = Literal["memory", "postgresql"]
 AccessMode = Literal["mock", "operator_token"]
 """@brief Dashboard 运维身份模式 / Dashboard operator-access modes."""
 
-_ENVIRONMENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-"""@brief 安全环境变量名模式 / Safe environment-variable-name pattern."""
-
 _HEADER_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
 """@brief 安全 HTTP header 名模式 / Safe HTTP-header-name pattern."""
 
@@ -101,13 +98,13 @@ class DashboardAccessSettings:
 
     @param mode mock 或 operator_token / ``mock`` or ``operator_token``.
     @param operator_id 稳定运维主体 / Stable operator principal.
-    @param token_env secret 环境变量名 / Secret environment-variable name.
+    @param token 直接来自私有 config.jsonc 的 secret / Secret read directly from private config.jsonc.
     @param token_header HTTP 凭证 header / HTTP credential header.
     """
 
     mode: AccessMode = "mock"
     operator_id: str = "workspace_dashboard"
-    token_env: str = "AIWS_DASHBOARD_OPERATOR_TOKEN"
+    token: str | None = field(default=None, repr=False)
     token_header: str = "X-Dashboard-Operator-Token"
 
 
@@ -203,10 +200,14 @@ class DashboardSettings:
             if environment in {"staging", "production"} and access_mode == "mock":
                 raise DashboardConfigurationError("staging/production 禁止 mock Dashboard 身份。")
 
-            token_env = _text(access, "token_env", "AIWS_DASHBOARD_OPERATOR_TOKEN")
+            if "token" not in access:
+                raise DashboardConfigurationError("dashboard.access.token 必须显式配置。")
+            token = _optional_text(access["token"])
             token_header = _text(access, "token_header", "X-Dashboard-Operator-Token")
-            if not _ENVIRONMENT_PATTERN.fullmatch(token_env):
-                raise DashboardConfigurationError("dashboard.access.token_env 不是安全变量名。")
+            if access_mode == "operator_token" and token is None:
+                raise DashboardConfigurationError(
+                    "dashboard.access.token 在 operator_token 模式下必须配置。"
+                )
             if not _HEADER_PATTERN.fullmatch(token_header):
                 raise DashboardConfigurationError("dashboard.access.token_header 不是安全 header。")
 
@@ -241,7 +242,7 @@ class DashboardSettings:
                 access=DashboardAccessSettings(
                     mode=access_mode,
                     operator_id=_text(access, "operator_id", "workspace_dashboard"),
-                    token_env=token_env,
+                    token=token,
                     token_header=token_header,
                 ),
                 api=DashboardApiSettings(

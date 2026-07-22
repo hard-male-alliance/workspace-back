@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import os
-from collections.abc import Mapping
 from pathlib import Path
 
 from dashboard.application.errors import DashboardConfigurationError, DashboardQueryError
@@ -117,7 +115,6 @@ def build_runtime(
     config_path: str | Path = "config.jsonc",
     settings: DashboardSettings | None = None,
     store: ObservabilityReadStore | None = None,
-    environ: Mapping[str, str] | None = None,
     clock: Clock | None = None,
 ) -> DashboardRuntime:
     """@brief 组合 Dashboard 配置、认证、读存储和查询服务 / Compose settings, authentication, read store, and query service.
@@ -125,14 +122,12 @@ def build_runtime(
     @param config_path 根配置路径 / Root configuration path.
     @param settings 可选注入配置 / Optional injected settings.
     @param store 可选注入读存储 / Optional injected read store.
-    @param environ 可选环境变量映射 / Optional environment mapping.
     @param clock 可选测试时钟 / Optional test clock.
     @return 可由 CLI、API 或 GUI 使用的运行时 / Runtime usable by CLI, API, or GUI.
     """
 
     resolved_settings = settings or DashboardSettings.from_file(config_path)
-    environment = dict(os.environ if environ is None else environ)
-    authenticator = OperatorAuthenticator(resolved_settings.access, environment)
+    authenticator = OperatorAuthenticator(resolved_settings.access)
     owns_store = store is None
     resolved_store = store or _build_store(resolved_settings)
     query_settings = resolved_settings.query

@@ -79,10 +79,11 @@
     "model": "mock-deterministic-v1",
     // 非 mock endpoint 的实际数据处理地域；每个 fallback 也必须显式声明该字段。
     "data_region": "private_deployment",
-    // fallback 必须显式拥有自己的 endpoint 和 key，避免跨服务商误用凭证。
-    // [{"provider": "openrouter", "model": "...", "api_key_env": "...", "base_url": "https://openrouter.ai/api/v1", "data_region": "global"}]
+    // fallback 必须显式拥有自己的 endpoint 和直接 key，避免跨服务商误用凭证。
+    // 私有 config.jsonc 被 Git 忽略且权限为 0600；公开模板只提供 null。
+    // [{"provider": "openrouter", "model": "...", "api_key": "...", "base_url": "https://openrouter.ai/api/v1", "data_region": "global"}]
     "fallback_providers": [],
-    "api_key_env": "AIWS_LLM_API_KEY",
+    "api_key": null,
     "base_url": null,
     "embedding_provider": "mock",
     "embedding_model": "mock-embedding-1024",
@@ -152,8 +153,8 @@
   "security": {
     // development/test 允许 development_mock；staging/production 必须为 trusted_proxy_hmac。
     "identity_mode": "development_mock",
-    // 只写变量名；生产入口代理与后端共享的密钥必须至少 32 bytes，禁止提交实际值。
-    "trusted_proxy_hmac_secret_env": "AIWS_TRUSTED_PROXY_HMAC_SECRET",
+    // 私有 config.jsonc 直接填写；生产入口代理与后端共享的密钥必须至少 32 bytes。
+    "trusted_proxy_hmac_secret": null,
     // 代理和应用服务器的签名时钟双向偏差，上限 600 秒。
     "trusted_proxy_max_clock_skew_seconds": 300
   },
@@ -174,7 +175,8 @@
       // development/test 可用 mock；staging/production 或 postgresql 模式必须设为 operator_token。
       "mode": "mock",
       "operator_id": "workspace_dashboard",
-      "token_env": "AIWS_DASHBOARD_OPERATOR_TOKEN",
+      // operator_token 模式在私有 config.jsonc 直接填写。
+      "token": null,
       "token_header": "X-Dashboard-Operator-Token"
     },
     // SLO 用于解释错误预算燃烧；HTTP duration 在 canonical 表中以秒存储，呈现层转换为毫秒。

@@ -37,6 +37,30 @@ def test_public_runtime_example_loads_in_product_applications() -> None:
     assert dashboard.database.mode == "memory"
 
 
+def test_legacy_environment_indirection_fields_are_rejected(tmp_path: Path) -> None:
+    """Old *_env fields cannot silently reintroduce a second configuration source."""
+    root = load_jsonc(PROJECT_ROOT / "example.jsonc")
+    root["ai"]["api_key_env"] = "AIWS_LLM_API_KEY"
+    root["ai"].pop("api_key")
+    path = tmp_path / "legacy-ai.jsonc"
+    path.write_text(json.dumps(root), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=r"ai\.api_key"):
+        BackendSettings.from_file(path)
+
+    root = load_jsonc(PROJECT_ROOT / "example.jsonc")
+    root["security"]["trusted_proxy_hmac_secret_env"] = "AIWS_HMAC_SECRET"
+    root["security"].pop("trusted_proxy_hmac_secret")
+    path.write_text(json.dumps(root), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="trusted_proxy_hmac_secret"):
+        BackendSettings.from_file(path)
+
+    root = load_jsonc(PROJECT_ROOT / "example.jsonc")
+    root["dashboard"]["access"]["token_env"] = "AIWS_DASHBOARD_TOKEN"
+    root["dashboard"]["access"].pop("token")
+    with pytest.raises(DashboardConfigurationError, match=r"dashboard\.access\.token"):
+        DashboardSettings.from_root_mapping(root)
+
+
 def test_dbctl_creates_private_config_and_loads_separate_dbinit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

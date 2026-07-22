@@ -208,7 +208,11 @@ def _settings(
         access=DashboardAccessSettings(
             mode=access_mode,
             operator_id="operator-klee",
-            token_env="DASHBOARD_TEST_TOKEN",
+            token=(
+                "correct-horse-battery-staple"
+                if access_mode == "operator_token"
+                else None
+            ),
         ),
         api=DashboardApiSettings(prefix="/dashboard/v1"),
         objective=ServiceLevelObjective(
@@ -236,7 +240,6 @@ def _runtime(
     runtime = build_runtime(
         settings=_settings(access_mode=access_mode, enabled=enabled),
         store=store,
-        environ={"DASHBOARD_TEST_TOKEN": "correct-horse-battery-staple"},
         clock=lambda: now,
     )
     return runtime, store, now

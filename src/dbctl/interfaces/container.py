@@ -8,18 +8,15 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
-from dbctl.infrastructure.runtime_projection import write_runtime_config
+from dbctl.infrastructure.runtime_projection import validate_runtime_config
 from workspace_shared.jsonc import ConfigurationError
 
-_DEFAULT_SOURCE_CONFIG_PATH: Final[Path] = Path("/var/lib/aiws-config/config.jsonc")
-"""@brief dbctl 持久配置默认路径 / Default path of the persistent dbctl-owned configuration."""
-
-_DEFAULT_RUNTIME_CONFIG_PATH: Final[Path] = Path("/tmp/aiws/config.jsonc")
-"""@brief 容器运行副本默认路径 / Default path of the container runtime projection."""
+_CONFIG_PATH: Final[Path] = Path("/var/lib/aiws-config/config.jsonc")
+"""Private dbctl-owned configuration mounted into every runtime service."""
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """@brief 投影配置后以目标进程替换入口 / Project configuration and replace the entrypoint process.
+    """Validate the mounted configuration and replace the entrypoint process.
 
     @param argv 待执行命令；``None`` 时读取 ``sys.argv``。
     / Command to execute; reads ``sys.argv`` when ``None``.
@@ -31,20 +28,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not command:
         print("container entrypoint requires a command", file=sys.stderr)
         return 2
-    source_config_path = Path(
-        os.environ.get("AIWS_SOURCE_CONFIG", str(_DEFAULT_SOURCE_CONFIG_PATH))
-    )
-    runtime_config_path = Path(os.environ.get("AIWS_CONFIG", str(_DEFAULT_RUNTIME_CONFIG_PATH)))
     try:
-        write_runtime_config(source_config_path, runtime_config_path, os.environ)
+        validate_runtime_config(_CONFIG_PATH)
     except ConfigurationError, OSError, ValueError:
         print(
-            "container entrypoint could not read the dbctl-generated configuration; "
-            "run dbctl bootstrap first",
+            "container entrypoint could not read /var/lib/aiws-config/config.jsonc; "
+            "run dbctl bootstrap and edit that file before starting services",
             file=sys.stderr,
         )
         return 2
-    os.execvpe(command[0], command, os.environ)
+    os.execvp(command[0], command)
     return 0
 
 

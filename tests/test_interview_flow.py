@@ -58,6 +58,45 @@ def _realtime_event(
     }
 
 
+def test_interview_scenario_and_session_collections(
+    backend_client: TestClient,
+    contract_examples: dict[str, Any],
+    contract_validator: ContractValidator,
+) -> None:
+    """Scenario discovery and scoped session recovery are available over HTTP."""
+    scenarios_response = backend_client.get("/api/v1/interview-scenarios?limit=20")
+    assert scenarios_response.status_code == 200, scenarios_response.text
+    scenarios = scenarios_response.json()
+    assert scenarios["items"]
+    scenario = scenarios["items"][0]
+    contract_validator.validate_definition("InterviewScenario", scenario)
+
+    scenario_response = backend_client.get(
+        f"/api/v1/interview-scenarios/{scenario['id']}"
+    )
+    assert scenario_response.status_code == 200, scenario_response.text
+    assert scenario_response.json() == scenario
+
+    application = cast(Any, backend_client.app)
+    container = cast(BackendContainer, application.state.container)
+    request = deepcopy(contract_examples["interview_create_request"])
+    request["workspace_id"] = container.settings.default_scope.workspace_id
+    request["scenario_id"] = scenario["id"]
+    request["resume_ref"] = None
+    created = backend_client.post(
+        "/api/v1/interview-sessions",
+        json=request,
+        headers=idempotency_headers("interview-list-create-0001"),
+    )
+    assert created.status_code == 201, created.text
+
+    collection = backend_client.get("/api/v1/interview-sessions?limit=20")
+    assert collection.status_code == 200, collection.text
+    items = collection.json()["items"]
+    assert [item["id"] for item in items] == [created.json()["id"]]
+    contract_validator.validate("InterviewSession", items[0])
+
+
 def test_interview_rest_websocket_and_report_flow(
     backend_client: TestClient,
     contract_examples: dict[str, Any],

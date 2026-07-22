@@ -17,7 +17,7 @@ from ipaddress import IPv4Network, IPv6Network, ip_address
 from typing import Final, Protocol
 
 from backend.config import SecuritySettings
-from workspace_shared.jsonc import ConfigurationError, optional_secret_from_env
+from workspace_shared.jsonc import ConfigurationError
 from workspace_shared.tenancy import ActorScope
 
 IDENTITY_SIGNATURE_VERSION: Final[str] = "v1"
@@ -301,9 +301,9 @@ def build_identity_resolver(
     if security.identity_mode == "development_mock":
         return DevelopmentMockIdentityResolver(default_scope, environment=environment)
     if security.identity_mode == "trusted_proxy_hmac":
-        secret = optional_secret_from_env(security.trusted_proxy_hmac_secret_env)
+        secret = security.trusted_proxy_hmac_secret
         if secret is None:
-            raise ConfigurationError("trusted-proxy HMAC secret environment variable is not set")
+            raise ConfigurationError("trusted-proxy HMAC secret is not configured in config.jsonc")
         return TrustedProxyHMACIdentityResolver(
             secret,
             security.trusted_proxy_max_clock_skew_seconds,

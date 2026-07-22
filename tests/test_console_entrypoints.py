@@ -36,7 +36,7 @@ def test_canonical_console_commands_are_declared_without_aliases() -> None:
     }
 
 
-def test_backend_default_config_is_runtime_relative_and_environment_overridable(
+def test_backend_default_config_is_runtime_relative(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -48,9 +48,4 @@ def test_backend_default_config_is_runtime_relative_and_environment_overridable(
     """
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("AIWS_CONFIG", raising=False)
     assert config_path().resolve() == tmp_path / "config.jsonc"
-
-    configured = tmp_path / "deployment" / "backend.jsonc"
-    monkeypatch.setenv("AIWS_CONFIG", str(configured))
-    assert config_path() == configured

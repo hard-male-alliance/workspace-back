@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import secrets
-from collections.abc import Mapping
 
 from dashboard.application.errors import DashboardAuthorizationError, DashboardConfigurationError
 from dashboard.domain.model import OperatorPrincipal
@@ -15,14 +14,12 @@ class OperatorAuthenticator:
     """@brief 将可信入口凭证解析为主体 / Resolve trusted-boundary credentials into a principal.
 
     @param settings 运维身份设置 / Operator identity settings.
-    @param environ 进程环境快照 / Process-environment snapshot.
     """
 
-    def __init__(self, settings: DashboardAccessSettings, environ: Mapping[str, str]) -> None:
+    def __init__(self, settings: DashboardAccessSettings) -> None:
         """@brief 创建认证器且不暴露 secret / Create an authenticator without exposing its secret.
 
         @param settings 身份设置 / Identity settings.
-        @param environ 环境变量 / Environment variables.
         @return 新认证器 / New authenticator.
         """
 
@@ -30,9 +27,9 @@ class OperatorAuthenticator:
         self._principal = OperatorPrincipal(settings.operator_id)
         self._token: str | None = None
         if settings.mode == "operator_token":
-            token = environ.get(settings.token_env)
+            token = settings.token
             if not isinstance(token, str) or not token:
-                raise DashboardConfigurationError("Dashboard operator token 环境变量未设置。")
+                raise DashboardConfigurationError("Dashboard operator token 未在 config.jsonc 配置。")
             self._token = token
 
     @property

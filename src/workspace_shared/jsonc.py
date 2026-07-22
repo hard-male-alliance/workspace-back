@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -46,16 +45,6 @@ def require_mapping(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ConfigurationError(f"configuration section {name!r} must be an object")
     return dict(value)
-
-
-def optional_secret_from_env(variable_name: str) -> str | None:
-    """@brief 从环境获取可选 secret / Read an optional secret from the environment.
-
-    @param variable_name 环境变量名称 / Environment variable name.
-    @return 非空 secret 或 None / Non-empty secret or None.
-    """
-    value = os.environ.get(variable_name)
-    return value if value else None
 
 
 def redact_secret(value: str | None) -> str | None:

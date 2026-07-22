@@ -28,6 +28,26 @@ from backend.domain.resume import ResumeRecord
 from workspace_shared.tenancy import ActorScope
 
 
+class WorkspaceRepository(Protocol):
+    """Read-only current-user and workspace membership projections."""
+
+    async def get_current_user(self, scope: ActorScope) -> dict[str, Any] | None:
+        """Read the authenticated actor profile within the asserted scope."""
+
+    async def list_workspaces(self, scope: ActorScope) -> list[dict[str, Any]]:
+        """List workspaces authorized by the current identity assertion."""
+
+    async def get_workspace(
+        self, scope: ActorScope, workspace_id: str
+    ) -> dict[str, Any] | None:
+        """Read one authorized workspace."""
+
+    async def list_workspace_members(
+        self, scope: ActorScope, workspace_id: str
+    ) -> list[dict[str, Any]]:
+        """List members without crossing the asserted workspace."""
+
+
 class ResumeRepository(Protocol):
     """@brief 简历 Repository 端口 / Resume repository port."""
 
@@ -59,6 +79,26 @@ class ResumeRepository(Protocol):
         @param scope workspace 范围 / Workspace scope.
         @param record 简历聚合 / Resume aggregate.
         """
+
+    async def save_resume_and_job(
+        self,
+        scope: ActorScope,
+        record: ResumeRecord,
+        job: Job,
+    ) -> None:
+        """Atomically persist a Resume revision/idempotency result and its queued render Job."""
+
+    async def commit_resume_workflow(
+        self,
+        scope: ActorScope,
+        record: ResumeRecord,
+        knowledge_source: KnowledgeSourceRecord,
+        knowledge_job: Job,
+        render_job: Job | None,
+        *,
+        create_resume: bool,
+    ) -> None:
+        """Atomically accept a Resume revision and all durable derived-work intents."""
 
 
 class ResumeProposalRepository(Protocol):
@@ -104,6 +144,22 @@ class ResumeKnowledgeBridge(Protocol):
         @note 同步可异步提交索引 Job，但不得创建新的公开 API 契约；过载必须保留为
         可观察的来源/Job 状态，而不是丢失派生意图。
         """
+
+    async def prepare_resume_synchronization(
+        self,
+        scope: ActorScope,
+        document: dict[str, Any],
+        request_id: str | None,
+    ) -> tuple[KnowledgeSourceRecord, Job]:
+        """Prepare, but do not persist or dispatch, one revision-pinned ingestion intent."""
+
+    async def dispatch_prepared_ingestion(
+        self,
+        scope: ActorScope,
+        source: KnowledgeSourceRecord,
+        job: Job,
+    ) -> None:
+        """Dispatch a previously committed ingestion intent."""
 
 
 class AgentRepository(Protocol):
@@ -188,6 +244,9 @@ class InterviewRepository(Protocol):
         @return Session 或 None / Session or None.
         """
 
+    async def list_sessions(self, scope: ActorScope) -> list[InterviewSessionRecord]:
+        """List interview sessions within the supplied scope."""
+
     async def save_session(self, scope: ActorScope, record: InterviewSessionRecord) -> None:
         """@brief 保存面试状态 / Persist interview state.
 
@@ -242,6 +301,22 @@ class KnowledgeRepository(Protocol):
         @param scope workspace 范围 / Workspace scope.
         @param record 来源聚合 / Source aggregate.
         """
+
+    async def save_source_if_revision(
+        self,
+        scope: ActorScope,
+        record: KnowledgeSourceRecord,
+        expected_revision: int,
+    ) -> bool:
+        """Compare-and-set a source update across workers."""
+
+    async def save_source_and_job(
+        self,
+        scope: ActorScope,
+        record: KnowledgeSourceRecord,
+        job: Job,
+    ) -> None:
+        """Atomically publish a knowledge-source state transition and its Job state."""
 
     async def get_embedding_space(self, scope: ActorScope) -> EmbeddingSpace | None:
         """@brief 查询范围内默认 embedding space / Read the scoped default embedding space.
@@ -325,6 +400,14 @@ class JobRepository(Protocol):
         @return Job 或 None / Job or None.
         """
 
+    async def claim_job(
+        self,
+        scope: ActorScope,
+        job_id: str,
+        stale_after_seconds: int = 900,
+    ) -> Job | None:
+        """Atomically claim queued work or reclaim a stale running lease."""
+
     async def save_job(self, scope: ActorScope, job: Job) -> None:
         """@brief 保存 Job 状态 / Persist job state.
 
@@ -350,6 +433,16 @@ class ArtifactRepository(Protocol):
         @param content 二进制内容 / Binary content.
         @param source_map 可选 source map / Optional source map.
         """
+
+    async def save_artifact_and_job(
+        self,
+        scope: ActorScope,
+        artifact: dict[str, Any],
+        content: bytes,
+        source_map: dict[str, Any] | None,
+        job: Job,
+    ) -> None:
+        """Atomically publish one immutable artifact and the successful render Job."""
 
     async def get_artifact(
         self,

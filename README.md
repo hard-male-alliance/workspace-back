@@ -38,11 +38,25 @@ uv run pytest
 ```
 
 本地默认值使用确定性的内存 repository、mock 模型和仅开发/测试允许的 `X-Mock-*` 租户头。它们不需要 PostgreSQL 或外部模型密钥，也绝不能用于 staging/production。
-`backend` 默认读取当前工作目录的 `config.jsonc`，也可用 `--config` 或 `AIWS_CONFIG` 覆盖；日志与知识库 blob 的相对路径统一以该配置文件所在目录为基准，因此 wheel 安装态不会把运行数据误写进虚拟环境。
+`backend` 默认读取当前工作目录的 `config.jsonc`，也可用显式 `--config` 指定路径；日志与知识库 blob 的相对路径统一以该配置文件所在目录为基准，因此 wheel 安装态不会把运行数据误写进虚拟环境。应用设置不接受环境变量覆盖。
+
+### Agent 检索增强生成
+
+当 `AgentRunRequest.knowledge.mode` 不是 `none` 时，Agent 会在调用模型前执行一次同租户、deny-priority 的知识检索。检索先按来源状态、生命周期、`agent_scope`、include/exclude 列表与来源可见性授权过滤，再对同一 embedding space 中的 chunk 进行向量与词法混合排序；最多 8 个结果、24,000 个字符会作为受控 `tool` 上下文发送给模型。检索文本被明确标记为不可信证据，不能覆盖系统指令。
+
+请求包含 `citations` 输出模式时，命中的正式 citation 会同时写入 assistant message，并通过 `agent.citation.added` SSE 事件发送；Run 的 `extensions.aiws.rag` 只记录命中数和 citation ID，不复制知识正文。非 mock 模型还必须同时满足运行请求的外部处理同意、模型地域，以及每个命中来源的 `allow_external_model_processing`/`allowed_model_regions` 策略，否则在模型网络请求前 fail closed。
+
+默认 `embedding_provider=mock` 使用确定性向量，只适合本地联调与契约测试；它能够验证完整 RAG 编排，但不代表生产语义检索质量。非 mock 配置会通过 OpenAI-compatible `/embeddings` adapter 调用配置模型，并校验响应顺序、维度、有限数值及 L2 归一化。provider/model/revision/维度/距离或归一化任一变化都会拒绝与旧 embedding space 混写，必须受控重建索引；外部调用还要求来源策略明确允许对应模型地域。
+
+### 简历、索引与 PDF 的事务边界
+
+一次 Resume 创建或有效 revision 编辑会在同一个短数据库事务中写入 Resume revision、操作批次幂等结果、派生 KnowledgeSource、Knowledge Ingestion Job，以及可选 Render Job。Job 行同时承担持久工作意图；事务提交后才向进程内有界执行器派发。客户端轮询 queued Job 时会再次触发派发，运行超过 15 分钟且没有完成的 claim 可被原子重新认领，因此提交后进程退出不会丢失工作意图，重复派发也只有一个 worker 能成功 claim。
+
+PDF 编译、文档解析和 embedding 计算不持有数据库事务。计算完成后，PDF artifact/blob 与 Render Job 成功状态在一个事务中发布；Knowledge source version、全部 chunk/embedding 和 Ingestion Job 成功状态也在一个事务中发布。重新索引已有来源时，当前 `ready` 版本持续可检索，只有新版本完整计算成功才切换；失败时继续保留旧版本。文件 blob 位于数据库外，采用先写后挂接并在数据库受理失败时删除的补偿策略，不能宣称为跨文件系统 ACID 事务。
 
 ## Docker 部署
 
-仓库根目录提供多阶段、非 root 的生产镜像和完整 Compose 拓扑。Docker 不复制数据库初始化逻辑：`dbctl bootstrap` 仍是创建 `config.jsonc`、database、roles、schemas 与 permissions 的唯一入口。持久配置保存在私有 `runtime_config` volume；容器入口只生成临时运行投影，不生成数据库密码或修改 PostgreSQL。
+仓库根目录提供多阶段、非 root 的生产镜像和完整 Compose 拓扑。Docker 不复制数据库初始化逻辑：`dbctl bootstrap` 仍是创建 `config.jsonc`、database、roles、schemas 与 permissions 的唯一入口。持久配置保存在私有 `runtime_config` volume；容器入口只校验并直接读取这一份文件，不生成运行副本，也不覆盖字段。
 
 ```bash
 cp .env.docker.example .env
@@ -80,10 +94,10 @@ docker compose run --rm migrate
 
 生产部署前必须至少完成这些修改：
 
-1. 替换 `.env` 中 PostgreSQL 管理密码与 Dashboard token；app、migrator、dashboard 数据库密码由 `dbctl bootstrap` 生成并保存在私有配置 volume，不在 `.env` 维护第二份状态。
-2. 设置 `AIWS_ENVIRONMENT=production`、`AIWS_IDENTITY_MODE=trusted_proxy_hmac`、至少 32 bytes 的 `AIWS_TRUSTED_PROXY_HMAC_SECRET` 与真实 `AIWS_PUBLIC_BASE_URL`。
+1. `.env` 只保留 PostgreSQL 官方镜像首次初始化所需的管理密码，以及 Compose 镜像/宿主端口控制；app、migrator、dashboard 数据库密码由 `dbctl bootstrap` 生成并保存在私有配置 volume。
+2. 在私有 `config.jsonc` 设置 `environment`、`security.identity_mode`、`security.trusted_proxy_hmac_secret` 与真实 `network.public_base_url`；容器不会投影或覆盖这些值。
 3. 在宿主 loopback 端口前部署能够认证用户、判定 workspace membership/role 并签发 HMAC 断言的 identity proxy；仓库中的 Nginx 示例本身不提供认证。
-4. 非 mock 模型需设置 `AIWS_AI_PROVIDER`、`AIWS_AI_MODEL`、HTTPS `AIWS_AI_BASE_URL`、`AIWS_AI_DATA_REGION` 和 `AIWS_LLM_API_KEY`。
+4. 非 mock 模型需直接配置 `ai.provider`、`ai.model`、HTTPS `ai.base_url`、`ai.data_region` 和 `ai.api_key`。
 5. 基础镜像不安装 TeX Live/bubblewrap，故默认 renderer 为 mock。真实 XeLaTeX 必须使用经审阅的派生镜像与可工作的 OS sandbox，不能通过赋予 backend 广泛容器权限来绕过 fail-closed。
 
 Docker 专用 `deploy/docker/dbinit.jsonc` 只把连接端点从宿主 loopback 改为 Compose 服务名 `postgres`；其 database/role/schema 声明必须与根 `dbinit.jsonc` 保持一致。不要把生产 secret 烘焙进镜像层或提交到仓库。
@@ -94,13 +108,13 @@ Docker 专用 `deploy/docker/dbinit.jsonc` 只把连接端点从宿主 loopback 
 2. 后端仅监听私有 loopback、Unix socket 或受限 Pod 网络；安全组、容器网络和防火墙必须禁止客户端绕过入口认证代理直连它。
 3. 入口认证代理必须先完成用户认证、workspace membership/role 决策，再重新签发下文定义的 HMAC 断言。Nginx 本身不生成该签名。
 4. PostgreSQL 必须启用 `pgvector`，并由 `dbctl` 显式创建最小权限角色和运行 migration。
-5. 非 mock 模型 provider 需要 HTTPS `ai.base_url` 和对应 API key 环境变量；API 不接收或回显 provider、model、base URL 或密钥。
+5. 非 mock 模型 provider 需要 HTTPS `ai.base_url` 和私有配置中的 `ai.api_key`；API 不接收或回显 provider、model、base URL 或密钥。
 6. 若启用 `resume_rendering.adapter: xelatex`，宿主机必须提供可工作的 OS sandbox；无法建立 sandbox 时实现会 fail closed，而不是退化为不受限的编译子进程。
 7. `ai.provider_rate_limit` 是每个实际 endpoint/credential 在单一 backend worker 内的并发与滑动一分钟请求预算；耗尽时返回可重试的 429。多 worker/Pod 部署必须按实例数向供应商申请配额，或在入口层另设全局限流。`ai.metering` 仅记录 UTF-8 字节除以 4 的可复算 token **估算**与整数 micro-USD 成本快照，保存在 `AgentRun.extensions.aiws.metering`；它不是 provider 账单，也不含系统提示词、隐式 tokenizer 或重试计费。
 
 ### 本地凭证与最小权限
 
-以下 DSN 必须是相互独立的凭证，不能以 application DSN 代替 dashboard 或 migrator DSN。`dbctl` 将生成的角色与密码直接组成 DSN，写入权限为 `0600`、被 Git 忽略的本地 `config.jsonc`；DSN 和 HMAC secret 均不得进入可提交文件、日志、systemd unit 命令行或 shell history。bootstrap 不接受管理员 DSN：只有明确的 loopback target 才允许 `auto` 选择 `sudo -u postgres`；远程 target、Windows 或找不到 sudo 时使用终端提示的 `bootstrap_database_user` 密码，显式要求远程 `sudo` 会 fail closed。
+以下 DSN 必须是相互独立的凭证，不能以 application DSN 代替 dashboard 或 migrator DSN。`dbctl` 将生成的角色与密码直接组成 DSN，写入权限为 `0600`、被 Git 忽略的本地 `config.jsonc`；API key、Dashboard token、DSN 和 HMAC secret 都直接存放在该私有配置，且不得进入可提交文件、日志、systemd unit 命令行或 shell history。bootstrap 不接受管理员 DSN：只有明确的 loopback target 才允许 `auto` 选择 `sudo -u postgres`；远程 target、Windows 或找不到 sudo 时使用终端提示的 `bootstrap_database_user` 密码，显式要求远程 `sudo` 会 fail closed。
 
 | 本地 `config.jsonc` 字段 | 使用者 | 应有身份/权限 |
 |---|---|---|
@@ -108,11 +122,11 @@ Docker 专用 `deploy/docker/dbinit.jsonc` 只把连接端点从宿主 loopback 
 | `database.application_dsn` | `backend` | `workspace_app`；运行时最小 DML 权限与 RLS（row-level security）上下文 |
 | `database.dashboard_dsn` | Dashboard PostgreSQL reader、`dbctl shell --role dashboard` | `workspace_dashboard`；仅 `observability.dashboard_signals` canonical 读模型权限 |
 
-| 其他 secret 环境变量 | 使用者 | 要求 |
+| 私有 `config.jsonc` 字段 | 使用者 | 要求 |
 |---|---|---|
-| `AIWS_TRUSTED_PROXY_HMAC_SECRET` | 入口认证代理与 backend | 至少 32 bytes；仅这两个私有工作负载可读取 |
-| `AIWS_DASHBOARD_OPERATOR_TOKEN` | Dashboard 私有 HTTP API（若启用） | 仅运维入口持有；不应出现在产品浏览器请求中 |
-| `AIWS_LLM_API_KEY`（或配置指定的变量） | non-mock 模型 provider | 仅 backend 进程可读取 |
+| `security.trusted_proxy_hmac_secret` | 入口认证代理与 backend | 至少 32 bytes；仅这两个私有工作负载可读取 |
+| `dashboard.access.token` | Dashboard 私有 HTTP API（若启用） | 仅运维入口持有；不应出现在产品浏览器请求中 |
+| `ai.api_key` | non-mock 模型与 embedding provider | 仅 backend 进程可读取 |
 
 `dbctl bootstrap` 管理四个互不相同的 PostgreSQL 角色：不可登录的 `workspace_owner`、可迁移的 `workspace_migrator`、运行时 `workspace_app` 与只读 `workspace_dashboard`。角色名、数据库名、schema 与权限目标来自 `dbinit.jsonc`；三个登录角色的随机密码写入本地 `config.jsonc`，owner 保持 `NOLOGIN` 且没有密码。
 

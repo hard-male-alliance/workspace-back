@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from copy import deepcopy
+from datetime import timedelta
 from typing import Any
 
 from backend.domain.agent import AgentRunRecord, ConversationRecord, MessageRecord
-from backend.domain.common import Job
+from backend.domain.common import Job, JobStatus, iso_timestamp, utc_now
 from backend.domain.interview import InterviewSessionRecord
 from backend.domain.knowledge import EmbeddingSpace, KnowledgeSourceRecord
 from backend.domain.proposal import ResumeProposalRecord
@@ -35,6 +37,55 @@ class InMemoryWorkspaceRepository:
         self._spaces: dict[tuple[str, str], EmbeddingSpace] = {}
         self._jobs: dict[str, tuple[ActorScope, Job]] = {}
         self._artifacts: dict[str, tuple[ActorScope, dict[str, Any], bytes, dict[str, Any] | None]] = {}
+        self._identity_created_at = utc_now()
+
+    async def get_current_user(self, scope: ActorScope) -> dict[str, Any] | None:
+        """Project the development identity assertion as a CurrentUser resource."""
+        return {
+            "id": scope.actor_id,
+            "display_name": "Local Demo User",
+            "email": None,
+            "locale": "zh-CN",
+            "timezone": "Asia/Shanghai",
+            "default_workspace_id": scope.workspace_id,
+            "created_at": iso_timestamp(self._identity_created_at),
+        }
+
+    async def list_workspaces(self, scope: ActorScope) -> list[dict[str, Any]]:
+        """Return the single workspace authorized by the development assertion."""
+        return [_memory_workspace(scope, self._identity_created_at)]
+
+    async def get_workspace(
+        self, scope: ActorScope, workspace_id: str
+    ) -> dict[str, Any] | None:
+        """Return the asserted workspace only."""
+        if workspace_id != scope.workspace_id:
+            return None
+        return _memory_workspace(scope, self._identity_created_at)
+
+    async def list_workspace_members(
+        self, scope: ActorScope, workspace_id: str
+    ) -> list[dict[str, Any]]:
+        """Return the actor represented by the trusted development assertion."""
+        if workspace_id != scope.workspace_id:
+            return []
+        timestamp = iso_timestamp(self._identity_created_at)
+        digest = hashlib.sha256(
+            f"{workspace_id}:{scope.actor_id}".encode()
+        ).hexdigest()[:32]
+        return [
+            {
+                "id": f"wsm_{digest}",
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "revision": 1,
+                "workspace_id": workspace_id,
+                "user_id": scope.actor_id,
+                "role": "owner" if scope.actor_id == scope.resource_owner_id else "editor",
+                "status": "active",
+                "extensions": {"aiws": {"identity_source": "development_mock"}},
+            }
+        ]
 
     async def create_resume(self, scope: ActorScope, record: ResumeRecord) -> None:
         """@brief 保存新简历 / Persist a new resume.
@@ -73,6 +124,39 @@ class InMemoryWorkspaceRepository:
         @param record 简历聚合 / Resume aggregate.
         """
         await self.create_resume(scope, record)
+
+    async def save_resume_and_job(
+        self,
+        scope: ActorScope,
+        record: ResumeRecord,
+        job: Job,
+    ) -> None:
+        """Atomically persist a Resume and queued render Job in memory."""
+        async with self._lock:
+            _assert_scope(scope, record.scope)
+            self._resumes[record.id] = record
+            self._jobs[job.id] = (scope, job)
+
+    async def commit_resume_workflow(
+        self,
+        scope: ActorScope,
+        record: ResumeRecord,
+        knowledge_source: KnowledgeSourceRecord,
+        knowledge_job: Job,
+        render_job: Job | None,
+        *,
+        create_resume: bool,
+    ) -> None:
+        """Atomically accept Resume, knowledge ingestion, and optional render work in memory."""
+        del create_resume
+        async with self._lock:
+            _assert_scope(scope, record.scope)
+            _assert_scope(scope, knowledge_source.scope)
+            self._resumes[record.id] = record
+            self._sources[knowledge_source.id] = knowledge_source
+            self._jobs[knowledge_job.id] = (scope, knowledge_job)
+            if render_job is not None:
+                self._jobs[render_job.id] = (scope, render_job)
 
     async def create_proposal(self, scope: ActorScope, record: ResumeProposalRecord) -> None:
         """Persist a tenant-scoped Resume proposal."""
@@ -213,6 +297,20 @@ class InMemoryWorkspaceRepository:
             record = self._sessions.get(session_id)
             return record if record is not None and _same_scope(scope, record.scope) else None
 
+    async def list_sessions(self, scope: ActorScope) -> list[InterviewSessionRecord]:
+        """List scoped interview sessions in newest-first order."""
+        async with self._lock:
+            records = [
+                record
+                for record in self._sessions.values()
+                if _same_scope(scope, record.scope)
+            ]
+            return sorted(
+                records,
+                key=lambda record: (record.updated_at, record.id),
+                reverse=True,
+            )
+
     async def save_session(self, scope: ActorScope, record: InterviewSessionRecord) -> None:
         """@brief 保存面试 Session / Persist an interview Session.
 
@@ -278,6 +376,37 @@ class InMemoryWorkspaceRepository:
         @param record 来源记录 / Source record.
         """
         await self.create_source(scope, record)
+
+    async def save_source_if_revision(
+        self,
+        scope: ActorScope,
+        record: KnowledgeSourceRecord,
+        expected_revision: int,
+    ) -> bool:
+        """Compare-and-set one source while holding the repository lock."""
+        async with self._lock:
+            _assert_scope(scope, record.scope)
+            current = self._sources.get(record.id)
+            if (
+                current is None
+                or not _same_scope(scope, current.scope)
+                or current.revision != expected_revision
+            ):
+                return False
+            self._sources[record.id] = record
+            return True
+
+    async def save_source_and_job(
+        self,
+        scope: ActorScope,
+        record: KnowledgeSourceRecord,
+        job: Job,
+    ) -> None:
+        """Atomically publish source and ingestion Job state in memory."""
+        async with self._lock:
+            _assert_scope(scope, record.scope)
+            self._sources[record.id] = record
+            self._jobs[job.id] = (scope, job)
 
     async def get_embedding_space(self, scope: ActorScope) -> EmbeddingSpace | None:
         """@brief 查询范围默认 embedding space / Read the scoped default embedding space.
@@ -351,6 +480,32 @@ class InMemoryWorkspaceRepository:
             item = self._jobs.get(job_id)
             return item[1] if item is not None and _same_scope(scope, item[0]) else None
 
+    async def claim_job(
+        self,
+        scope: ActorScope,
+        job_id: str,
+        stale_after_seconds: int = 900,
+    ) -> Job | None:
+        """Atomically claim one queued in-memory Job."""
+        async with self._lock:
+            item = self._jobs.get(job_id)
+            if item is None or not _same_scope(scope, item[0]):
+                return None
+            job = item[1]
+            stale = (
+                job.status is JobStatus.RUNNING
+                and job.started_at is not None
+                and job.started_at <= utc_now() - timedelta(seconds=stale_after_seconds)
+            )
+            if job.status is not JobStatus.QUEUED and not stale:
+                return None
+            if stale:
+                job.status = JobStatus.QUEUED
+                job.phase = "queued"
+                job.started_at = None
+            job.start()
+            return job
+
     async def save_job(self, scope: ActorScope, job: Job) -> None:
         """@brief 保存 Job / Persist a Job.
 
@@ -375,6 +530,24 @@ class InMemoryWorkspaceRepository:
         """
         async with self._lock:
             self._artifacts[str(artifact["id"])] = (scope, deepcopy(artifact), content, deepcopy(source_map))
+
+    async def save_artifact_and_job(
+        self,
+        scope: ActorScope,
+        artifact: dict[str, Any],
+        content: bytes,
+        source_map: dict[str, Any] | None,
+        job: Job,
+    ) -> None:
+        """Atomically publish artifact bytes and successful render Job state in memory."""
+        async with self._lock:
+            self._artifacts[str(artifact["id"])] = (
+                scope,
+                deepcopy(artifact),
+                content,
+                deepcopy(source_map),
+            )
+            self._jobs[job.id] = (scope, job)
 
     async def get_artifact(self, scope: ActorScope, artifact_id: str) -> tuple[dict[str, Any], bytes, dict[str, Any] | None] | None:
         """@brief 范围内查询渲染产物 / Read a scoped render artifact.
@@ -417,6 +590,24 @@ def _same_scope(left: ActorScope, right: ActorScope) -> bool:
     @return workspace 和 owner 同时匹配时为真 / True when workspace and owner both match.
     """
     return left.workspace_id == right.workspace_id and left.resource_owner_id == right.resource_owner_id
+
+
+def _memory_workspace(scope: ActorScope, created_at: Any) -> dict[str, Any]:
+    """Build the stable workspace view for the in-memory development adapter."""
+    timestamp = iso_timestamp(created_at)
+    digest = hashlib.sha256(scope.workspace_id.encode("utf-8")).hexdigest()[:12]
+    return {
+        "id": scope.workspace_id,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "revision": 1,
+        "name": "Local Demo Workspace",
+        "slug": f"local-{digest}",
+        "default_locale": "zh-CN",
+        "timezone": "Asia/Shanghai",
+        "plan": "free",
+        "extensions": {"aiws": {"identity_source": "development_mock"}},
+    }
 
 
 def _assert_scope(expected: ActorScope, actual: ActorScope) -> None:
