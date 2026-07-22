@@ -112,6 +112,30 @@ def test_legacy_flat_dbctl_modules_are_removed() -> None:
     assert remaining == [], "仍存在旧 dbctl 平铺模块：\n" + "\n".join(remaining)
 
 
+def test_core_packages_do_not_reexport_barrel_apis() -> None:
+    """@brief 核心层 package 仅作标记，不集中转发 API / Core packages are markers, not API barrels.
+
+    @return 无返回值 / No return value.
+    """
+
+    violations: list[str] = []
+    for layer in ("application", "domain"):
+        source = _DBCTL_ROOT / layer / "__init__.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        if any(isinstance(node, (ast.Import, ast.ImportFrom)) for node in ast.walk(tree)):
+            violations.append(str(source.relative_to(PROJECT_ROOT)))
+    assert violations == [], "核心层不得维护集中导出面：\n" + "\n".join(violations)
+
+
+def test_application_ports_are_colocated_with_their_use_cases() -> None:
+    """@brief 禁止恢复与用例割裂的集中 ports 模块 / Keep ports colocated with use cases.
+
+    @return 无返回值 / No return value.
+    """
+
+    assert not (_DBCTL_ROOT / "application" / "ports.py").exists()
+
+
 def _invalid_imports(
     *,
     layer: str,
