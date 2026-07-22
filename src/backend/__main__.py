@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=config_path(),
-        help="根 JSONC 配置路径（默认：AIWS_CONFIG 或 config.jsonc）。",
+        help="根 JSONC 配置路径（默认：config.jsonc）。",
     )
     return parser
 

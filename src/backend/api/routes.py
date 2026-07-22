@@ -29,6 +29,7 @@ from backend.api.models import (
     MockConversationCreateRequest,
     MockEndRequest,
     MockKnowledgeSourceCreateRequest,
+    MockKnowledgeSourcePatchRequest,
     MockMessageCreateRequest,
     MockResumeCreateRequest,
     MockResumeProposalCreateRequest,
@@ -58,6 +59,68 @@ _DEFAULT_PAGE_LIMIT = 20
 _MAX_PAGE_LIMIT = 100
 
 _UPLOAD_READ_SIZE = 64 * 1024
+
+
+@router.get(
+    "/me",
+    openapi_extra={"x-contract-status": "mock", "x-pending-contract": "GetCurrentUser"},
+)
+async def get_current_user(request: Request) -> dict[str, Any]:
+    """Return the user represented by the already-verified identity assertion."""
+    payload = await _container(request).workspace.current_user(_scope_from_headers(request))
+    _container(request).contracts.validate_declared("CurrentUser", payload)
+    return payload
+
+
+@router.get(
+    "/workspaces",
+    openapi_extra={"x-contract-status": "mock", "x-pending-contract": "ListWorkspacesResponse"},
+)
+async def list_workspaces(
+    request: Request,
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_LIMIT)] = _DEFAULT_PAGE_LIMIT,
+) -> dict[str, Any]:
+    """List workspaces authorized by the current identity assertion."""
+    items = await _container(request).workspace.list_workspaces(_scope_from_headers(request))
+    for item in items:
+        _container(request).contracts.validate_definition("Workspace", item)
+    return _paginate(items, limit, cursor)
+
+
+@router.get(
+    "/workspaces/{workspace_id}",
+    openapi_extra={"x-contract-status": "mock", "x-pending-contract": "GetWorkspace"},
+)
+async def get_workspace(request: Request, workspace_id: str) -> dict[str, Any]:
+    """Get one workspace after membership authorization."""
+    payload = await _container(request).workspace.get_workspace(
+        _scope_from_headers(request), workspace_id
+    )
+    _container(request).contracts.validate_definition("Workspace", payload)
+    return payload
+
+
+@router.get(
+    "/workspaces/{workspace_id}/members",
+    openapi_extra={
+        "x-contract-status": "mock",
+        "x-pending-contract": "ListWorkspaceMembersResponse",
+    },
+)
+async def list_workspace_members(
+    request: Request,
+    workspace_id: str,
+    cursor: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_LIMIT)] = _DEFAULT_PAGE_LIMIT,
+) -> dict[str, Any]:
+    """List scoped workspace memberships."""
+    items = await _container(request).workspace.list_members(
+        _scope_from_headers(request), workspace_id
+    )
+    for item in items:
+        _container(request).contracts.validate_definition("WorkspaceMember", item)
+    return _paginate(items, limit, cursor)
 
 
 async def _read_bounded_upload(upload: UploadFile, maximum_bytes: int) -> bytes:
@@ -820,10 +883,12 @@ async def upload_knowledge_source(
         Header(alias="Idempotency-Key", min_length=1, max_length=_MAX_IDEMPOTENCY_KEY_LENGTH),
     ],
     name: Annotated[str | None, Form(max_length=300)] = None,
+    visibility: Annotated[str | None, Form(max_length=20000)] = None,
 ) -> JSONResponse:
-    """Create and enqueue a bounded TXT, Markdown, PDF, or DOCX source."""
+    """Create and enqueue a bounded file with an explicit optional visibility policy."""
     del idempotency_key
     scope = _scope_from_headers(request)
+    visibility_policy = _multipart_visibility_policy(request, visibility)
     content = await _read_bounded_upload(
         file,
         _container(request).settings.knowledge.max_upload_bytes,
@@ -834,6 +899,7 @@ async def upload_knowledge_source(
         "filename": filename,
         "content_type": content_type,
         "name": name,
+        "visibility": visibility_policy,
         "size_bytes": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
     }
@@ -845,6 +911,7 @@ async def upload_knowledge_source(
             content_type=content_type,
             content=content,
             name=name,
+            visibility=visibility_policy,
             request_id=_request_id(request),
         )
         return {"source": source.as_dict(), "ingestion_job": job}
@@ -857,6 +924,35 @@ async def upload_knowledge_source(
         202,
         operation,
     )
+
+
+def _multipart_visibility_policy(
+    request: Request,
+    serialized: str | None,
+) -> dict[str, Any] | None:
+    """Parse and validate an optional multipart KnowledgeVisibilityPolicy JSON value."""
+    if serialized is None:
+        return None
+    try:
+        candidate = json.loads(serialized)
+    except json.JSONDecodeError as error:
+        raise DomainError(
+            Problem(
+                "knowledge.visibility_invalid",
+                422,
+                "Knowledge visibility must be valid JSON",
+            )
+        ) from error
+    if not isinstance(candidate, dict):
+        raise DomainError(
+            Problem(
+                "knowledge.visibility_invalid",
+                422,
+                "Knowledge visibility must be a JSON object",
+            )
+        )
+    _container(request).contracts.validate_definition("KnowledgeVisibilityPolicy", candidate)
+    return cast(dict[str, Any], candidate)
 
 
 @router.post(
@@ -932,14 +1028,47 @@ async def list_knowledge_sources(
 
 
 @router.get("/knowledge-sources/{source_id}")
-async def get_knowledge_source(request: Request, source_id: str) -> dict[str, Any]:
+async def get_knowledge_source(request: Request, source_id: str) -> Response:
     """@brief 获取知识来源 / Get a knowledge source.
 
     @param request HTTP 请求 / HTTP request.
     @param source_id 来源 ID / Source ID.
     @return KnowledgeSource / KnowledgeSource.
     """
-    return (await _container(request).knowledge.get_source(_scope_from_headers(request), source_id)).as_dict()
+    source = await _container(request).knowledge.get_source(
+        _scope_from_headers(request), source_id
+    )
+    return JSONResponse(source.as_dict(), headers={"ETag": source.etag()})
+
+
+@router.patch(
+    "/knowledge-sources/{source_id}",
+    openapi_extra={
+        "x-contract-status": "mock",
+        "x-pending-contract": "KnowledgeSourcePatchRequest",
+    },
+)
+async def patch_knowledge_source(
+    request: Request,
+    source_id: str,
+    body: MockKnowledgeSourcePatchRequest,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> Response:
+    """Update source visibility under a strong ETag precondition."""
+    payload = body.model_dump(mode="json")
+    _container(request).contracts.validate_definition(
+        "KnowledgeVisibilityPolicy",
+        payload["visibility"],
+    )
+    source = await _container(request).knowledge.update_source_visibility(
+        _scope_from_headers(request),
+        source_id,
+        cast(dict[str, Any], payload["visibility"]),
+        if_match,
+    )
+    public = source.as_dict()
+    _container(request).contracts.validate_declared("KnowledgeSource", public)
+    return JSONResponse(public, headers={"ETag": source.etag()})
 
 
 @router.post("/knowledge-sources/{source_id}/ingestion-jobs", status_code=202, openapi_extra={"x-contract-status": "mock", "x-pending-contract": "KnowledgeIngestionJobCreateRequest"})
@@ -983,6 +1112,64 @@ async def search_knowledge(request: Request) -> dict[str, Any]:
     """
     body = await _formal_payload(request, "KnowledgeSearchRequest")
     return {"items": await _container(request).knowledge.search(_scope_from_headers(request), body)}
+
+
+@router.get(
+    "/interview-scenarios",
+    openapi_extra={
+        "x-contract-status": "mock",
+        "x-pending-contract": "ListInterviewScenariosResponse",
+    },
+)
+async def list_interview_scenarios(
+    request: Request,
+    cursor: str | None = None,
+    limit: PageLimit = _DEFAULT_PAGE_LIMIT,
+) -> dict[str, Any]:
+    """List the stable built-in scenario catalog for the current workspace."""
+    scenarios = await _container(request).interview.list_scenarios(_scope_from_headers(request))
+    for scenario in scenarios:
+        _container(request).contracts.validate_definition("InterviewScenario", scenario)
+    return _paginate(scenarios, limit, cursor)
+
+
+@router.get(
+    "/interview-scenarios/{scenario_id}",
+    openapi_extra={
+        "x-contract-status": "mock",
+        "x-pending-contract": "GetInterviewScenarioResponse",
+    },
+)
+async def get_interview_scenario(request: Request, scenario_id: str) -> dict[str, Any]:
+    """Get one scenario from the scoped built-in catalog."""
+    scenario = await _container(request).interview.get_scenario(
+        _scope_from_headers(request), scenario_id
+    )
+    _container(request).contracts.validate_definition("InterviewScenario", scenario)
+    return scenario
+
+
+@router.get(
+    "/interview-sessions",
+    openapi_extra={
+        "x-contract-status": "mock",
+        "x-pending-contract": "ListInterviewSessionsResponse",
+    },
+)
+async def list_interview_sessions(
+    request: Request,
+    status: str | None = None,
+    cursor: str | None = None,
+    limit: PageLimit = _DEFAULT_PAGE_LIMIT,
+) -> dict[str, Any]:
+    """List interview sessions within the verified workspace scope."""
+    records = await _container(request).interview.list_sessions(_scope_from_headers(request))
+    items = [record.as_dict() for record in records]
+    if status is not None:
+        items = [item for item in items if item["status"] == status]
+    for item in items:
+        _container(request).contracts.validate_declared("InterviewSession", item)
+    return _paginate(items, limit, cursor)
 
 
 @router.post("/interview-sessions", status_code=201)

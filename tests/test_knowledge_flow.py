@@ -5,8 +5,10 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, cast
 
+import pytest
 from fastapi.testclient import TestClient
 
+from backend.domain.common import DomainError
 from backend.infrastructure.contracts import ContractValidator
 from conftest import idempotency_headers, wait_for_json
 
@@ -165,6 +167,77 @@ def test_knowledge_deny_priority_ingestion_and_search(
     assert results[0]["citation"]["quote"] is not None
     assert "kubernetes" in results[0]["text"].lower()
 
+    portal = backend_client.portal
+    assert portal is not None
+    container = backend_client.app.state.container
+
+    async def externally_processed_search() -> list[dict[str, Any]]:
+        return await container.knowledge.search_for_agent(
+            container.settings.default_scope,
+            request,
+            external_processing=True,
+            data_region="cn",
+        )
+
+    with pytest.raises(DomainError) as raised:
+        portal.call(externally_processed_search)
+    assert raised.value.problem.code == "knowledge.external_model_processing_not_allowed"
+
+
+def test_knowledge_detail_etag_and_visibility_patch_are_concurrency_safe(
+    backend_client: TestClient,
+) -> None:
+    """Knowledge visibility writes require the latest strong ETag."""
+    created = backend_client.post(
+        "/api/v1/knowledge-sources",
+        json={
+            "name": "ETag visibility source",
+            "source_type": "manual_note",
+            "content": "concurrency evidence",
+            "visibility": _visibility_with_effect("allow"),
+        },
+        headers=idempotency_headers("knowledge-etag-create-0001"),
+    )
+    assert created.status_code == 201, created.text
+    source_id = created.json()["id"]
+
+    detail = backend_client.get(f"/api/v1/knowledge-sources/{source_id}")
+    assert detail.status_code == 200, detail.text
+    first_etag = detail.headers.get("etag")
+    assert first_etag and first_etag.startswith('"knowledge-source-1-')
+
+    visibility = _visibility_with_effect("allow")
+    visibility.update(
+        {
+            "allow_external_model_processing": True,
+            "allowed_model_regions": ["global"],
+        }
+    )
+    updated = backend_client.patch(
+        f"/api/v1/knowledge-sources/{source_id}",
+        json={"visibility": visibility},
+        headers={"If-Match": first_etag},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["revision"] == 2
+    second_etag = updated.headers.get("etag")
+    assert second_etag and second_etag != first_etag
+    assert updated.json()["visibility"]["allowed_model_regions"] == ["global"]
+
+    stale = backend_client.patch(
+        f"/api/v1/knowledge-sources/{source_id}",
+        json={"visibility": _visibility_with_effect("deny")},
+        headers={"If-Match": first_etag},
+    )
+    assert stale.status_code == 412, stale.text
+    assert stale.json()["code"] == "knowledge.revision_conflict"
+
+    missing = backend_client.patch(
+        f"/api/v1/knowledge-sources/{source_id}",
+        json={"visibility": visibility},
+    )
+    assert missing.status_code == 412, missing.text
+
 
 def test_resume_is_automatically_derived_reindexed_and_tenant_scoped(
     backend_client: TestClient,
@@ -248,9 +321,7 @@ def test_resume_is_automatically_derived_reindexed_and_tenant_scoped(
     rust_search["query"] = "rust"
     rust_response = backend_client.post("/api/v1/knowledge-searches", json=rust_search)
     assert rust_response.status_code == 200, rust_response.text
-    assert any(
-        item["citation"]["source_id"] == source_id for item in rust_response.json()["items"]
-    )
+    assert any(item["citation"]["source_id"] == source_id for item in rust_response.json()["items"])
 
     other_scope_headers = {
         "X-Mock-Actor-Id": "usr_other",

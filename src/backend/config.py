@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from ipaddress import IPv4Network, IPv6Network, ip_network
 from pathlib import Path
@@ -23,12 +22,6 @@ _DEVELOPMENT_IDENTITY_ENVIRONMENTS = frozenset({"development", "test"})
 
 _SUPPORTED_ENVIRONMENTS = frozenset({"development", "test", "staging", "production"})
 """@brief 唯一允许的部署环境标签 / Only supported deployment-environment labels."""
-
-_DEFAULT_TRUSTED_PROXY_HMAC_SECRET_ENV = "AIWS_TRUSTED_PROXY_HMAC_SECRET"
-"""@brief 默认可信代理 HMAC 密钥环境变量 / Default trusted-proxy HMAC secret environment variable."""
-
-_DEFAULT_TRUSTED_PROXY_MAX_CLOCK_SKEW_SECONDS = 300
-"""@brief 默认身份断言时钟偏差 / Default identity-assertion clock skew in seconds."""
 
 _MAX_TRUSTED_PROXY_CLOCK_SKEW_SECONDS = 600
 """@brief 允许的最大身份断言时钟偏差 / Maximum permitted identity-assertion clock skew in seconds."""
@@ -111,7 +104,7 @@ class AISettings:
 
     provider: str
     model: str
-    api_key_env: str
+    api_key: str | None = field(repr=False)
     base_url: str | None
     data_region: str
     fallback_providers: tuple[AIProviderEndpoint, ...]
@@ -159,14 +152,14 @@ class AIProviderEndpoint:
 
     @param provider 稳定 provider 标签（例如 openrouter）/ Stable provider label.
     @param model 服务端模型标识 / Server-side model identifier.
-    @param api_key_env 密钥所在环境变量名 / Environment variable containing the API key.
+    @param api_key 直接来自私有 config.jsonc 的 API key / API key read directly from private config.jsonc.
     @param base_url OpenAI-compatible API base URL / OpenAI-compatible API base URL.
     @param data_region 此端点实际处理数据的地域 / Region where this endpoint processes data.
     """
 
     provider: str
     model: str
-    api_key_env: str
+    api_key: str = field(repr=False)
     base_url: str
     data_region: str
 
@@ -238,12 +231,12 @@ class LoggingSettings:
 class SecuritySettings:
     """@brief 身份边界安全设置 / Identity-boundary security settings.
 
-    @note ``trusted_proxy_hmac_secret_env`` 只保存环境变量名称，永不保存或输出实际
-    HMAC（Hash-based Message Authentication Code）密钥。
+    @note HMAC（Hash-based Message Authentication Code）密钥直接来自被 Git 忽略且
+    权限受限的 config.jsonc；dataclass repr 不输出该值。
     """
 
     identity_mode: IdentityMode
-    trusted_proxy_hmac_secret_env: str
+    trusted_proxy_hmac_secret: str | None = field(repr=False)
     trusted_proxy_max_clock_skew_seconds: int
 
 
@@ -319,6 +312,13 @@ class BackendSettings:
             )
         if not isinstance(fallback_providers, list):
             raise ConfigurationError("ai.fallback_providers must be an array")
+        ai_provider = _require_string(ai, "provider")
+        embedding_provider = _require_string(ai, "embedding_provider")
+        api_key = _direct_optional_secret(ai, "api_key", "ai.api_key")
+        if (ai_provider != "mock" or embedding_provider != "mock") and api_key is None:
+            raise ConfigurationError(
+                "ai.api_key is required when a model or embedding provider is not mock"
+            )
         return cls(
             environment=environment,
             default_scope=ActorScope(
@@ -383,9 +383,9 @@ class BackendSettings:
                 artifact_directory=Path(_require_string(renderer, "artifact_directory")),
             ),
             ai=AISettings(
-                provider=_require_string(ai, "provider"),
+                provider=ai_provider,
                 model=_require_string(ai, "model"),
-                api_key_env=_require_string(ai, "api_key_env"),
+                api_key=api_key,
                 base_url=_optional_string(ai.get("base_url")),
                 data_region=_require_choice(
                     ai, "data_region", {"cn", "global", "private_deployment"}
@@ -393,7 +393,7 @@ class BackendSettings:
                 fallback_providers=tuple(
                     _provider_endpoint(item, index) for index, item in enumerate(fallback_providers)
                 ),
-                embedding_provider=_require_string(ai, "embedding_provider"),
+                embedding_provider=embedding_provider,
                 embedding_model=_require_string(ai, "embedding_model"),
                 embedding_model_revision=_require_string(ai, "embedding_model_revision"),
                 embedding_dimension=_require_positive_int(ai, "embedding_dimension"),
@@ -836,31 +836,26 @@ def _security_settings(value: object, environment: str) -> SecuritySettings:
     @param value ``security`` 配置节或缺失值 / ``security`` configuration section or missing value.
     @param environment 当前部署环境标签 / Current deployment environment label.
     @return 已校验的身份安全设置 / Validated identity security settings.
-    @raise ConfigurationError 非开发环境缺失安全节，或 mock 身份被用于非开发环境时抛出 /
-        Raised when security is missing outside development or mock identity is used outside development.
+    @raise ConfigurationError 安全节缺失、直接密钥无效，或 mock 身份被用于非开发环境时抛出 /
+        Raised when security is missing, a direct secret is invalid, or mock identity is used
+        outside development.
 
-    @note 为兼容历史本地配置，只有 ``development``/``test`` 缺失该节时才补出受限
-    mock 默认值；任何其它环境都必须显式选择可验证的 HMAC 模式。
+    @note 身份模式和直接密钥字段始终必须在唯一配置文件中显式出现。
     """
-    if value is None:
-        if environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS:
-            raise ConfigurationError("security section is required outside development/test")
-        return SecuritySettings(
-            identity_mode="development_mock",
-            trusted_proxy_hmac_secret_env=_DEFAULT_TRUSTED_PROXY_HMAC_SECRET_ENV,
-            trusted_proxy_max_clock_skew_seconds=_DEFAULT_TRUSTED_PROXY_MAX_CLOCK_SKEW_SECONDS,
-        )
-
     mapping = require_mapping(value, "security")
     identity_mode = cast(
         IdentityMode,
         _require_choice(mapping, "identity_mode", {"development_mock", "trusted_proxy_hmac"}),
     )
-    secret_env = _require_string(mapping, "trusted_proxy_hmac_secret_env")
+    secret = _direct_optional_secret(
+        mapping,
+        "trusted_proxy_hmac_secret",
+        "security.trusted_proxy_hmac_secret",
+    )
     max_clock_skew_seconds = _require_positive_int(mapping, "trusted_proxy_max_clock_skew_seconds")
-    if not _ENVIRONMENT_VARIABLE_PATTERN.fullmatch(secret_env):
+    if identity_mode == "trusted_proxy_hmac" and secret is None:
         raise ConfigurationError(
-            "security.trusted_proxy_hmac_secret_env must be an environment variable name"
+            "security.trusted_proxy_hmac_secret is required for trusted_proxy_hmac"
         )
     if max_clock_skew_seconds > _MAX_TRUSTED_PROXY_CLOCK_SKEW_SECONDS:
         raise ConfigurationError(
@@ -876,13 +871,9 @@ def _security_settings(value: object, environment: str) -> SecuritySettings:
         )
     return SecuritySettings(
         identity_mode=identity_mode,
-        trusted_proxy_hmac_secret_env=secret_env,
+        trusted_proxy_hmac_secret=secret,
         trusted_proxy_max_clock_skew_seconds=max_clock_skew_seconds,
     )
-
-
-_ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-"""@brief secret 环境变量名称模式 / Environment variable name pattern for secrets."""
 
 
 def _provider_endpoint(value: object, index: int) -> AIProviderEndpoint:
@@ -891,7 +882,7 @@ def _provider_endpoint(value: object, index: int) -> AIProviderEndpoint:
     @param value ``ai.fallback_providers`` 中的候选对象。
     @param index 当前数组下标，仅用于安全的配置诊断。
     @return 已校验的 AIProviderEndpoint。
-    @raise ConfigurationError fallback 端点形状或环境变量名非法时抛出。
+    @raise ConfigurationError fallback 端点形状或直接密钥非法时抛出。
 
     @note fallback 不从主 provider 隐式继承密钥或 URL，避免配置改动时将 API key
     静默发送到错误的服务商。
@@ -900,12 +891,28 @@ def _provider_endpoint(value: object, index: int) -> AIProviderEndpoint:
     endpoint = AIProviderEndpoint(
         provider=_require_string(mapping, "provider"),
         model=_require_string(mapping, "model"),
-        api_key_env=_require_string(mapping, "api_key_env"),
+        api_key=_require_string(mapping, "api_key"),
         base_url=_require_string(mapping, "base_url"),
         data_region=_require_choice(mapping, "data_region", {"cn", "global", "private_deployment"}),
     )
-    if not _ENVIRONMENT_VARIABLE_PATTERN.fullmatch(endpoint.api_key_env):
-        raise ConfigurationError(
-            f"ai.fallback_providers[{index}].api_key_env must be an environment variable name"
-        )
     return endpoint
+
+
+def _optional_secret(value: object, name: str) -> str | None:
+    """Read a direct secret value without including it in validation errors."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ConfigurationError(f"{name} must be a non-empty string or null")
+    return value
+
+
+def _direct_optional_secret(
+    mapping: dict[str, Any],
+    key: str,
+    name: str,
+) -> str | None:
+    """Require a direct secret field while allowing an explicit null for mock modes."""
+    if key not in mapping:
+        raise ConfigurationError(f"configuration key {name!r} is required")
+    return _optional_secret(mapping[key], name)

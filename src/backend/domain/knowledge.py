@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -180,6 +182,17 @@ class KnowledgeSourceRecord:
     source_metadata: dict[str, Any] = field(default_factory=dict)
     private_metadata: dict[str, Any] = field(default_factory=dict)
     document_parts: list[KnowledgeDocumentPart] = field(default_factory=list)
+
+    def etag(self) -> str:
+        """Return a strong validator for the current public source revision."""
+        payload = json.dumps(
+            self.as_dict(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest = hashlib.sha256(payload).hexdigest()[:24]
+        return f'"knowledge-source-{self.revision}-{digest}"'
 
     def as_dict(self) -> dict[str, Any]:
         """@brief 转换为公开 KnowledgeSource / Convert to public KnowledgeSource.

@@ -40,6 +40,38 @@ def test_development_cors_allows_only_configured_frontend_origin(
     assert "access-control-allow-origin" not in rejected.headers
 
 
+def test_knowledge_patch_preflight_and_new_collection_routes_are_discoverable(
+    backend_client: TestClient,
+) -> None:
+    """The browser-facing additions must be present in both CORS and OpenAPI."""
+    preflight = backend_client.options(
+        "/api/v1/knowledge-sources/src_example",
+        headers={
+            "Origin": "http://127.0.0.1:5173",
+            "Access-Control-Request-Method": "PATCH",
+            "Access-Control-Request-Headers": "Content-Type,If-Match",
+        },
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+    assert "patch" in preflight.headers["access-control-allow-methods"].lower()
+    assert "if-match" in preflight.headers["access-control-allow-headers"].lower()
+
+    paths = backend_client.get("/openapi.json").json()["paths"]
+    expected_methods = {
+        "/api/v1/me": "get",
+        "/api/v1/workspaces": "get",
+        "/api/v1/workspaces/{workspace_id}": "get",
+        "/api/v1/workspaces/{workspace_id}/members": "get",
+        "/api/v1/knowledge-sources/{source_id}": "patch",
+        "/api/v1/interview-scenarios": "get",
+        "/api/v1/interview-scenarios/{scenario_id}": "get",
+        "/api/v1/interview-sessions": "get",
+    }
+    for path, method in expected_methods.items():
+        assert method in paths[path]
+
+
 def test_template_catalog_and_resume_cursor_pagination(
     backend_client: TestClient,
     contract_validator: ContractValidator,
@@ -194,3 +226,132 @@ def test_proposal_and_artifact_discovery_survive_page_navigation(
     )
     assert artifacts.status_code == 200, artifacts.text
     assert artifacts.json()["items"][0]["id"] == render_job["artifacts"][0]["id"]
+
+
+def test_current_web_gateway_payloads_complete_resume_and_knowledge_flow(
+    backend_client: TestClient,
+) -> None:
+    """The current Web gateway payloads remain executable without DTO adaptation."""
+    created_response = backend_client.post(
+        "/api/v1/resumes",
+        json={
+            "title": "Frontend gateway integration",
+            "locale": "zh-CN",
+            "template_id": "tpl_default_v1",
+            "template_version": "1.0",
+        },
+        headers=idempotency_headers("frontend-gateway-resume-create-0001"),
+    )
+    assert created_response.status_code == 201, created_response.text
+    resume = created_response.json()
+
+    resume_source = wait_for_json(
+        backend_client,
+        f"/api/v1/knowledge-sources/{resume['knowledge_source_id']}",
+        lambda payload: payload["ingestion"]["status"] in {"ready", "failed"},
+    )
+    assert resume_source["ingestion"]["status"] == "ready"
+
+    proposal_response = backend_client.post(
+        f"/api/v1/resumes/{resume['id']}/proposals",
+        json={
+            "draft_text": None,
+            "field_path": ["summary"],
+            "instruction": "Improve the professional summary",
+            "render_hint": "preview",
+            "source_ids": [],
+            "target": {"entity_type": "profile"},
+            "title": None,
+        },
+        headers=idempotency_headers("frontend-gateway-proposal-create-0001"),
+    )
+    assert proposal_response.status_code == 201, proposal_response.text
+    proposal = proposal_response.json()
+
+    decision_response = backend_client.post(
+        f"/api/v1/resume-proposals/{proposal['id']}/decisions",
+        json={
+            "comment": None,
+            "conflict_strategy": "reject",
+            "decision": "accept_all",
+            "operation_ids": [],
+        },
+        headers=idempotency_headers("frontend-gateway-proposal-decision-0001"),
+    )
+    assert decision_response.status_code == 200, decision_response.text
+    assert decision_response.json()["status"] == "accepted"
+
+    latest_response = backend_client.get(f"/api/v1/resumes/{resume['id']}")
+    assert latest_response.status_code == 200, latest_response.text
+    latest = latest_response.json()
+    assert latest["revision"] == 2
+
+    render_response = backend_client.post(
+        f"/api/v1/resumes/{resume['id']}/render-jobs",
+        json={
+            "formats": ["pdf"],
+            "include_accessibility_tree": False,
+            "include_source_map": True,
+            "locale": None,
+            "mode": "preview",
+            "page_range": None,
+            "resume_revision": latest["revision"],
+        },
+        headers=idempotency_headers("frontend-gateway-render-create-0001"),
+    )
+    assert render_response.status_code == 202, render_response.text
+    render_job = wait_for_json(
+        backend_client,
+        f"/api/v1/resume-render-jobs/{render_response.json()['id']}",
+        lambda payload: payload["status"] in {"succeeded", "failed", "cancelled"},
+    )
+    assert render_job["status"] == "succeeded"
+    artifact = render_job["artifacts"][0]
+    content_response = backend_client.get(
+        f"/api/v1/render-artifacts/{artifact['id']}/content"
+    )
+    assert content_response.status_code == 200, content_response.text
+    assert content_response.content.startswith(b"%PDF-")
+
+    upload_response = backend_client.post(
+        "/api/v1/knowledge-sources/uploads",
+        files={
+            "file": (
+                "integration.md",
+                b"# Backend Skill\n\nPostgreSQL pgvector integration evidence.",
+                "text/markdown",
+            )
+        },
+        data={"name": "Frontend Integration Knowledge"},
+        headers=idempotency_headers("frontend-gateway-upload-create-0001"),
+    )
+    assert upload_response.status_code == 202, upload_response.text
+    upload = upload_response.json()
+    source_id = upload["source"]["id"]
+    ingestion_job = wait_for_json(
+        backend_client,
+        f"/api/v1/knowledge-ingestion-jobs/{upload['ingestion_job']['id']}",
+        lambda payload: payload["status"] in {"succeeded", "failed", "cancelled"},
+    )
+    assert ingestion_job["status"] == "succeeded"
+
+    search_response = backend_client.post(
+        "/api/v1/knowledge-searches",
+        json={
+            "filters": {},
+            "include_quotes": True,
+            "query": "pgvector",
+            "selection": {
+                "agent_scope": "general_chat",
+                "exclude_source_ids": [],
+                "include_source_ids": [source_id],
+                "mode": "explicit",
+                "pinned_versions": [],
+            },
+            "top_k": 20,
+        },
+    )
+    assert search_response.status_code == 200, search_response.text
+    search_items = search_response.json()["items"]
+    assert search_items
+    assert search_items[0]["citation"]["source_id"] == source_id

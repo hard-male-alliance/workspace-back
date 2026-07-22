@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 import socket
 import sys
 from collections.abc import AsyncIterator
@@ -23,21 +22,27 @@ from backend.application.services import (
     ResumeProposalApplicationService,
     ScopedKeyLocks,
     ServiceDependencies,
+    WorkspaceApplicationService,
 )
 from backend.config import AIProviderEndpoint, BackendSettings
 from backend.domain.observability import ResourceMetadata
 from backend.domain.ports import (
     AgentRepository,
     ArtifactRepository,
+    EmbeddingProvider,
     InterviewRepository,
     JobRepository,
     KnowledgeRepository,
     ResumeProposalRepository,
     ResumeRepository,
     TelemetryWriter,
+    WorkspaceRepository,
 )
 from backend.infrastructure.contracts import ContractValidator
-from backend.infrastructure.embeddings import DeterministicEmbeddingProvider
+from backend.infrastructure.embeddings import (
+    DeterministicEmbeddingProvider,
+    OpenAICompatibleEmbeddingProvider,
+)
 from backend.infrastructure.idempotency import IdempotencyRegistry
 from backend.infrastructure.identity import IdentityResolver, build_identity_resolver
 from backend.infrastructure.knowledge_parsing import LocalKnowledgeFileParser
@@ -70,6 +75,7 @@ logger = logging.getLogger(__name__)
 
 
 class WorkspaceRuntimeRepository(
+    WorkspaceRepository,
     ResumeRepository,
     AgentRepository,
     InterviewRepository,
@@ -94,6 +100,7 @@ class BackendContainer:
     identity: IdentityResolver
     contracts: ContractValidator
     idempotency: IdempotencyRegistry | PostgresIdempotencyRegistry
+    workspace: WorkspaceApplicationService
     resume: ResumeApplicationService
     proposals: ResumeProposalApplicationService
     agent: AgentApplicationService
@@ -244,7 +251,7 @@ async def build_container(
             blob_root = runtime_root / blob_root
         blob_storage = LocalKnowledgeBlobStorage(blob_root)
         file_parser = LocalKnowledgeFileParser(settings.knowledge.max_extracted_characters)
-        embedding_provider = DeterministicEmbeddingProvider(settings.ai.embedding_dimension)
+        embedding_provider = _embedding_provider_for(settings)
         async with supervisor:
             knowledge = KnowledgeApplicationService(
                 storage,
@@ -264,15 +271,23 @@ async def build_container(
                 dependencies,
                 locks,
             )
-            proposals = ResumeProposalApplicationService(storage, resume, knowledge, locks)
+            proposals = ResumeProposalApplicationService(
+                storage,
+                resume,
+                knowledge,
+                locks,
+                provider,
+                settings.ai,
+            )
             container = BackendContainer(
                 settings=settings,
                 identity=identity,
                 contracts=ContractValidator.from_json(read_contract_schema_text()),
                 idempotency=idempotency,
+                workspace=WorkspaceApplicationService(storage),
                 resume=resume,
                 proposals=proposals,
-                agent=AgentApplicationService(storage, provider, dependencies, locks),
+                agent=AgentApplicationService(storage, provider, knowledge, dependencies, locks),
                 interview=InterviewApplicationService(storage, storage, dependencies, locks),
                 knowledge=knowledge,
                 model_provider=provider,
@@ -372,7 +387,7 @@ async def _provider_for(settings: BackendSettings) -> AgentModelProvider:
         AIProviderEndpoint(
             provider=settings.ai.provider,
             model=settings.ai.model,
-            api_key_env=settings.ai.api_key_env,
+            api_key=settings.ai.api_key or "",
             base_url=_required_provider_base_url(settings.ai.base_url),
             data_region=settings.ai.data_region,
         ),
@@ -380,19 +395,16 @@ async def _provider_for(settings: BackendSettings) -> AgentModelProvider:
     )
     credentials: list[tuple[AIProviderEndpoint, str]] = []
     for endpoint in endpoints:
-        api_key = os.environ.get(endpoint.api_key_env)
+        api_key = endpoint.api_key
         if not api_key:
-            raise RuntimeError(
-                "model provider API key environment variable is not configured: "
-                f"{endpoint.api_key_env}"
-            )
+            raise RuntimeError("model provider API key is not configured in config.jsonc")
         credentials.append((endpoint, api_key))
 
     created: list[AgentModelProvider] = []
     rate_limiters: dict[tuple[str, str, str], ProviderRateLimiter] = {}
     try:
         for endpoint, api_key in credentials:
-            endpoint_key = (endpoint.provider, endpoint.base_url, endpoint.api_key_env)
+            endpoint_key = (endpoint.provider, endpoint.base_url, endpoint.api_key)
             rate_limiter = rate_limiters.get(endpoint_key)
             if rate_limiter is None:
                 rate_limiter = ProviderRateLimiter(
@@ -419,6 +431,24 @@ async def _provider_for(settings: BackendSettings) -> AgentModelProvider:
             await _close_provider(candidate)
         raise
     return created[0] if len(created) == 1 else FallbackModelProvider(created)
+
+
+def _embedding_provider_for(settings: BackendSettings) -> EmbeddingProvider:
+    """Build the configured embedding adapter from the private root config."""
+    if settings.ai.embedding_provider == "mock":
+        return DeterministicEmbeddingProvider(settings.ai.embedding_dimension)
+    api_key = settings.ai.api_key
+    if not api_key:
+        raise RuntimeError("embedding provider API key is not configured in config.jsonc")
+    return OpenAICompatibleEmbeddingProvider(
+        base_url=_required_provider_base_url(settings.ai.base_url),
+        api_key=api_key,
+        model=settings.ai.embedding_model,
+        dimension=settings.ai.embedding_dimension,
+        connect_timeout_ms=settings.network.connect_timeout_ms,
+        read_timeout_ms=settings.network.read_timeout_ms,
+        outbound_proxy_url=settings.network.outbound_proxy_url,
+    )
 
 
 def _required_provider_base_url(base_url: str | None) -> str:

@@ -43,6 +43,20 @@ uv run pytest
 本地默认值使用确定性的内存 repository、mock 模型和仅开发/测试允许的 `X-Mock-*` 租户头。它们不需要 PostgreSQL 或外部模型密钥，也绝不能用于 staging/production。
 `backend` 默认读取当前工作目录的 `config.jsonc`，也可用 `--config` 或 `AIWS_CONFIG` 覆盖；日志与知识库 blob 的相对路径统一以该配置文件所在目录为基准，因此 wheel 安装态不会把运行数据误写进虚拟环境。
 
+### Agent 检索增强生成
+
+当 `AgentRunRequest.knowledge.mode` 不是 `none` 时，Agent 会在调用模型前执行一次同租户、deny-priority 的知识检索。检索先按来源状态、生命周期、`agent_scope`、include/exclude 列表与来源可见性授权过滤，再对同一 embedding space 中的 chunk 进行向量与词法混合排序；最多 8 个结果、24,000 个字符会作为受控 `tool` 上下文发送给模型。检索文本被明确标记为不可信证据，不能覆盖系统指令。
+
+请求包含 `citations` 输出模式时，命中的正式 citation 会同时写入 assistant message，并通过 `agent.citation.added` SSE 事件发送；Run 的 `extensions.aiws.rag` 只记录命中数和 citation ID，不复制知识正文。非 mock 模型还必须同时满足运行请求的外部处理同意、模型地域，以及每个命中来源的 `allow_external_model_processing`/`allowed_model_regions` 策略，否则在模型网络请求前 fail closed。
+
+默认 `embedding_provider=mock` 使用确定性向量，只适合本地联调与契约测试；它能够验证完整 RAG 编排，但不代表生产语义检索质量。非 mock 配置会通过 OpenAI-compatible `/embeddings` adapter 调用配置模型，并校验响应顺序、维度、有限数值及 L2 归一化。provider/model/revision/维度/距离或归一化任一变化都会拒绝与旧 embedding space 混写，必须受控重建索引；外部调用还要求来源策略明确允许对应模型地域。
+
+### 简历、索引与 PDF 的事务边界
+
+一次 Resume 创建或有效 revision 编辑会在同一个短数据库事务中写入 Resume revision、操作批次幂等结果、派生 KnowledgeSource、Knowledge Ingestion Job，以及可选 Render Job。Job 行同时承担持久工作意图；事务提交后才向进程内有界执行器派发。客户端轮询 queued Job 时会再次触发派发，运行超过 15 分钟且没有完成的 claim 可被原子重新认领，因此提交后进程退出不会丢失工作意图，重复派发也只有一个 worker 能成功 claim。
+
+PDF 编译、文档解析和 embedding 计算不持有数据库事务。计算完成后，PDF artifact/blob 与 Render Job 成功状态在一个事务中发布；Knowledge source version、全部 chunk/embedding 和 Ingestion Job 成功状态也在一个事务中发布。重新索引已有来源时，当前 `ready` 版本持续可检索，只有新版本完整计算成功才切换；失败时继续保留旧版本。文件 blob 位于数据库外，采用先写后挂接并在数据库受理失败时删除的补偿策略，不能宣称为跨文件系统 ACID 事务。
+
 ## Docker 部署
 
 仓库根目录提供多阶段、非 root 的生产镜像和完整 Compose 拓扑。Docker 不复制数据库初始化逻辑：`dbctl bootstrap` 仍是创建 `config.jsonc`、database、roles、schemas 与 permissions 的唯一入口。持久配置保存在私有 `runtime_config` volume；容器入口只生成临时运行投影，不生成数据库密码或修改 PostgreSQL。

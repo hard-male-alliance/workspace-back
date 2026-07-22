@@ -62,6 +62,12 @@ class MockKnowledgeSourceCreateRequest(MockContractAdapter):
     visibility: dict[str, Any] | None = None
 
 
+class MockKnowledgeSourcePatchRequest(MockContractAdapter):
+    """Temporary visibility-only KnowledgeSource patch request."""
+
+    visibility: dict[str, Any]
+
+
 class MockEndRequest(MockContractAdapter):
     """@brief 面试结束命令 mock 请求 / Mock request for an interview end command."""
 

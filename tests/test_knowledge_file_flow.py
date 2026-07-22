@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -31,17 +32,60 @@ def _upload_markdown(
     key: str,
     content: str,
     path: str = "/api/v1/knowledge-sources/uploads",
+    visibility: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    form = {"name": "职业证据"}
+    if visibility is not None:
+        form["visibility"] = json.dumps(visibility)
     response = client.post(
         path,
         files={"file": ("career.md", content.encode(), "text/markdown")},
-        data={"name": "职业证据"},
+        data=form,
         headers=idempotency_headers(key),
     )
     assert response.status_code == 202, response.text
     payload = response.json()
     assert isinstance(payload, dict)
     return payload
+
+
+def test_upload_persists_explicit_external_embedding_consent(
+    backend_client: TestClient,
+) -> None:
+    visibility = {
+        "policy_version": 1,
+        "default_effect": "deny",
+        "sensitivity": "confidential",
+        "agent_grants": [
+            {
+                "agent_scope": "general_chat",
+                "effect": "allow",
+                "allowed_operations": ["retrieve"],
+            }
+        ],
+        "session_override_allowed": True,
+        "allow_external_model_processing": True,
+        "allowed_model_regions": ["global"],
+        "retention_days": None,
+    }
+    payload = _upload_markdown(
+        backend_client,
+        key="knowledge-file-consent-0001",
+        content="Explicit external embedding consent",
+        visibility=visibility,
+    )
+    assert payload["source"]["visibility"] == visibility
+
+
+def test_upload_rejects_invalid_visibility_json(backend_client: TestClient) -> None:
+    response = backend_client.post(
+        "/api/v1/knowledge-sources/uploads",
+        files={"file": ("career.md", b"invalid visibility", "text/markdown")},
+        data={"visibility": "not-json"},
+        headers=idempotency_headers("knowledge-file-invalid-visibility-0001"),
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["code"] == "knowledge.visibility_invalid"
 
 
 def test_markdown_upload_is_private_indexed_and_cited(

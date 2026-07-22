@@ -38,6 +38,8 @@ def _container_environment() -> dict[str, str]:
         "AIWS_IDENTITY_MODE": "trusted_proxy_hmac",
         "AIWS_TRUSTED_PROXY_HMAC_SECRET": "test-only-hmac-secret-with-at-least-32-bytes",
         "AIWS_TRUSTED_PROXY_CIDRS": '["172.30.0.0/24"]',
+        "AIWS_DASHBOARD_OPERATOR_TOKEN": "test-only-dashboard-token",
+        "AIWS_LLM_API_KEY": "test-only-model-key",
     }
 
 
@@ -98,9 +100,14 @@ def test_runtime_projection_preserves_dbctl_credentials(tmp_path: Path) -> None:
     assert backend.database.mode == "postgresql"
     assert backend.network.bind_host == "0.0.0.0"
     assert backend.security.identity_mode == "trusted_proxy_hmac"
+    assert backend.security.trusted_proxy_hmac_secret == (
+        "test-only-hmac-secret-with-at-least-32-bytes"
+    )
+    assert backend.ai.api_key == "test-only-model-key"
     assert dashboard.database.mode == "postgresql"
     assert dashboard.api.host == "0.0.0.0"
     assert dashboard.access.mode == "operator_token"
+    assert dashboard.access.token == "test-only-dashboard-token"
     assert stat.S_IMODE(source_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(runtime_path.stat().st_mode) == 0o600
 

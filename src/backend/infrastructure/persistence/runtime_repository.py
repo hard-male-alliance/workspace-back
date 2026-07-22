@@ -139,6 +139,7 @@ from backend.infrastructure.persistence.models import (
 )
 from backend.infrastructure.persistence.models import (
     UserRecord,
+    WorkspaceMemberRecord,
     WorkspaceRecord,
 )
 from backend.infrastructure.persistence.repositories import scoped_select
@@ -352,6 +353,28 @@ async def _ensure_scope_identities(session: AsyncSession, scope: ActorScope) -> 
         )
         .on_conflict_do_nothing(index_elements=[WorkspaceRecord.id])
     )
+    if scope.actor_id == scope.resource_owner_id:
+        member_digest = hashlib.sha256(
+            f"{scope.workspace_id}:{scope.actor_id}".encode()
+        ).hexdigest()[:32]
+        await session.execute(
+            insert(WorkspaceMemberRecord)
+            .values(
+                id=f"wsm_{member_digest}",
+                workspace_id=scope.workspace_id,
+                resource_owner_id=scope.resource_owner_id,
+                user_id=scope.actor_id,
+                role="owner",
+                status="active",
+                joined_at=func.now(),
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    WorkspaceMemberRecord.workspace_id,
+                    WorkspaceMemberRecord.user_id,
+                ]
+            )
+        )
 
 
 async def _scoped_one(
@@ -426,6 +449,44 @@ def _resume_state(
     return operation_ids, batch_hashes, batch_results, changed_targets
 
 
+def _timestamp_text(value: datetime) -> str:
+    """Serialize one database timestamp as canonical UTC text."""
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _workspace_payload(row: WorkspaceRecord) -> dict[str, Any]:
+    """Map the normalized workspace row to the shared resource shape."""
+    digest = hashlib.sha256(str(row.id).encode("utf-8")).hexdigest()[:12]
+    return {
+        "id": str(row.id),
+        "created_at": _timestamp_text(row.created_at),
+        "updated_at": _timestamp_text(row.updated_at),
+        "revision": int(row.revision),
+        "name": str(row.name),
+        "slug": f"workspace-{digest}",
+        "default_locale": str(row.default_locale),
+        "timezone": "Asia/Shanghai",
+        "plan": "free",
+        "extensions": {},
+    }
+
+
+def _workspace_member_payload(row: WorkspaceMemberRecord) -> dict[str, Any]:
+    """Map one membership row without exposing internal invitation metadata."""
+    status = "suspended" if str(row.status) == "disabled" else str(row.status)
+    return {
+        "id": str(row.id),
+        "created_at": _timestamp_text(row.created_at),
+        "updated_at": _timestamp_text(row.updated_at),
+        "revision": int(row.revision),
+        "workspace_id": str(row.workspace_id),
+        "user_id": str(row.user_id),
+        "role": str(row.role),
+        "status": status,
+        "extensions": {},
+    }
+
+
 class PostgresWorkspaceRepository:
     """@brief 五个领域共享的 PostgreSQL Repository / PostgreSQL repository shared by five domains.
 
@@ -442,6 +503,65 @@ class PostgresWorkspaceRepository:
         @param database 生命周期由 composition root 管理的数据库 / Database owned by the composition root.
         """
         self._database = database
+
+    async def get_current_user(self, scope: ActorScope) -> dict[str, Any] | None:
+        """Read the current actor only when the asserted workspace is authorized."""
+        if not await self.list_workspaces(scope):
+            return None
+        async with self._database.read_session(scope) as session:
+            user = await session.get(UserRecord, scope.actor_id)
+            if user is None or user.deleted_at is not None:
+                return None
+            return {
+                "id": str(user.id),
+                "display_name": str(user.display_name or "Workspace User"),
+                "email": user.email,
+                "locale": str(user.locale),
+                "timezone": "Asia/Shanghai",
+                "default_workspace_id": scope.workspace_id,
+                "created_at": _timestamp_text(user.created_at),
+            }
+
+    async def list_workspaces(self, scope: ActorScope) -> list[dict[str, Any]]:
+        """List only the workspace carried by the verified identity assertion."""
+        async with self._database.read_session(scope) as session:
+            workspace = await session.get(WorkspaceRecord, scope.workspace_id)
+            if workspace is None or workspace.deleted_at is not None:
+                return []
+            member = (
+                await session.scalars(
+                    scoped_select(WorkspaceMemberRecord, scope).where(
+                        WorkspaceMemberRecord.workspace_id == scope.workspace_id,
+                        WorkspaceMemberRecord.user_id == scope.actor_id,
+                        WorkspaceMemberRecord.status == "active",
+                    )
+                )
+            ).first()
+            if scope.actor_id != workspace.resource_owner_id and member is None:
+                return []
+            return [_workspace_payload(workspace)]
+
+    async def get_workspace(
+        self, scope: ActorScope, workspace_id: str
+    ) -> dict[str, Any] | None:
+        """Read the asserted workspace after membership authorization."""
+        if workspace_id != scope.workspace_id:
+            return None
+        workspaces = await self.list_workspaces(scope)
+        return workspaces[0] if workspaces else None
+
+    async def list_workspace_members(
+        self, scope: ActorScope, workspace_id: str
+    ) -> list[dict[str, Any]]:
+        """List active members of the asserted workspace."""
+        if await self.get_workspace(scope, workspace_id) is None:
+            return []
+        async with self._database.read_session(scope) as session:
+            statement = scoped_select(WorkspaceMemberRecord, scope).where(
+                WorkspaceMemberRecord.workspace_id == workspace_id
+            ).order_by(WorkspaceMemberRecord.created_at.asc(), WorkspaceMemberRecord.id.asc())
+            rows = (await session.scalars(statement)).all()
+            return [_workspace_member_payload(row) for row in rows]
 
     async def create_resume(self, scope: ActorScope, record: ResumeRecord) -> None:
         """@brief 创建简历及不可变初始 revision / Create a resume and immutable initial revisions.
@@ -497,6 +617,71 @@ class PostgresWorkspaceRepository:
             if row is None:
                 raise RuntimeError("cannot save a resume that does not exist in this scope")
             await self._save_resume_locked(session, scope, record, row)
+
+    async def save_resume_and_job(
+        self,
+        scope: ActorScope,
+        record: ResumeRecord,
+        job: Job,
+    ) -> None:
+        """Atomically persist a Resume revision/idempotency result and queued render Job."""
+        _assert_record_scope(scope, record.scope)
+        async with self._database.transaction(scope) as session:
+            row = await _scoped_one(session, ResumeDocumentOrmRecord, scope, record.id, lock=True)
+            if row is None:
+                raise RuntimeError("cannot save a resume that does not exist in this scope")
+            await self._save_resume_locked(session, scope, record, row)
+            await self._save_job_locked(session, scope, job, allow_create=True)
+
+    async def commit_resume_workflow(
+        self,
+        scope: ActorScope,
+        record: ResumeRecord,
+        knowledge_source: DomainKnowledgeSourceRecord,
+        knowledge_job: Job,
+        render_job: Job | None,
+        *,
+        create_resume: bool,
+    ) -> None:
+        """Atomically accept a Resume revision and its knowledge/render work intents."""
+        _assert_record_scope(scope, record.scope)
+        _assert_record_scope(scope, knowledge_source.scope)
+        async with self._database.transaction(scope) as session:
+            await _ensure_scope_identities(session, scope)
+            resume_row = await _scoped_one(
+                session, ResumeDocumentOrmRecord, scope, record.id, lock=True
+            )
+            if resume_row is None:
+                if not create_resume:
+                    raise RuntimeError("cannot save a resume that does not exist in this scope")
+                await self._insert_resume(session, scope, record)
+            else:
+                await self._save_resume_locked(session, scope, record, resume_row)
+
+            source_row = await _scoped_one(
+                session, KnowledgeSourceOrmRecord, scope, knowledge_source.id, lock=True
+            )
+            if source_row is None:
+                source_row = KnowledgeSourceOrmRecord(
+                    id=knowledge_source.id,
+                    workspace_id=scope.workspace_id,
+                    resource_owner_id=scope.resource_owner_id,
+                    source_type=self._storage_source_type(knowledge_source.source_type),
+                    title=knowledge_source.name,
+                    config=deepcopy(knowledge_source.config),
+                    revision_mode="latest",
+                    ingestion_state="new",
+                    created_at=knowledge_source.created_at,
+                    updated_at=knowledge_source.updated_at,
+                    revision=knowledge_source.revision,
+                    extensions={},
+                )
+                session.add(source_row)
+                await session.flush()
+            await self._write_source_locked(session, scope, source_row, knowledge_source)
+            await self._save_job_locked(session, scope, knowledge_job, allow_create=True)
+            if render_job is not None:
+                await self._save_job_locked(session, scope, render_job, allow_create=True)
 
     async def _insert_resume(
         self, session: AsyncSession, scope: ActorScope, record: ResumeRecord
@@ -1429,6 +1614,22 @@ class PostgresWorkspaceRepository:
                 else None
             )
 
+    async def list_sessions(
+        self,
+        scope: ActorScope,
+    ) -> list[DomainInterviewSessionRecord]:
+        """List scoped interview sessions in stable newest-first order."""
+        async with self._database.read_session(scope) as session:
+            statement = scoped_select(InterviewSessionOrmRecord, scope).order_by(
+                InterviewSessionOrmRecord.updated_at.desc(),
+                InterviewSessionOrmRecord.id.desc(),
+            )
+            rows = (await session.scalars(statement)).all()
+            return [
+                await self._interview_session_from_row(session, scope, row)
+                for row in rows
+            ]
+
     async def save_session(self, scope: ActorScope, record: DomainInterviewSessionRecord) -> None:
         """@brief 保存面试状态机与事件历史 / Save interview state machine and event history.
 
@@ -1769,6 +1970,60 @@ class PostgresWorkspaceRepository:
             if row is None:
                 raise RuntimeError("cannot save a knowledge source outside the supplied scope")
             await self._write_source_locked(session, scope, row, record)
+
+    async def save_source_if_revision(
+        self,
+        scope: ActorScope,
+        record: DomainKnowledgeSourceRecord,
+        expected_revision: int,
+    ) -> bool:
+        """Compare-and-set a source revision inside one PostgreSQL transaction."""
+        _assert_record_scope(scope, record.scope)
+        async with self._database.transaction(scope) as session:
+            row = await _scoped_one(
+                session,
+                KnowledgeSourceOrmRecord,
+                scope,
+                record.id,
+                lock=True,
+            )
+            if row is None or int(row.revision) != expected_revision:
+                return False
+            await self._write_source_locked(session, scope, row, record)
+            return True
+
+    async def save_source_and_job(
+        self,
+        scope: ActorScope,
+        record: DomainKnowledgeSourceRecord,
+        job: Job,
+    ) -> None:
+        """Atomically publish source/chunks/embeddings and the ingestion Job state."""
+        _assert_record_scope(scope, record.scope)
+        async with self._database.transaction(scope) as session:
+            await _ensure_scope_identities(session, scope)
+            source_row = await _scoped_one(
+                session, KnowledgeSourceOrmRecord, scope, record.id, lock=True
+            )
+            if source_row is None:
+                source_row = KnowledgeSourceOrmRecord(
+                    id=record.id,
+                    workspace_id=scope.workspace_id,
+                    resource_owner_id=scope.resource_owner_id,
+                    source_type=self._storage_source_type(record.source_type),
+                    title=record.name,
+                    config=deepcopy(record.config),
+                    revision_mode="latest",
+                    ingestion_state="new",
+                    created_at=record.created_at,
+                    updated_at=record.updated_at,
+                    revision=record.revision,
+                    extensions={},
+                )
+                session.add(source_row)
+                await session.flush()
+            await self._write_source_locked(session, scope, source_row, record)
+            await self._save_job_locked(session, scope, job, allow_create=True)
 
     async def get_embedding_space(self, scope: ActorScope) -> EmbeddingSpace | None:
         """@brief 读取当前 workspace/owner 的默认 embedding 空间 / Read the scoped default embedding space.
@@ -2283,29 +2538,7 @@ class PostgresWorkspaceRepository:
         """
         async with self._database.transaction(scope) as session:
             await _ensure_scope_identities(session, scope)
-            row = await _scoped_one(session, JobOrmRecord, scope, job.id, lock=True)
-            if row is None:
-                row = JobOrmRecord(
-                    id=job.id,
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    job_type=job.job_type,
-                    status=job.status.value,
-                    phase=job.phase,
-                    completed_units=job.completed_units,
-                    total_units=job.total_units,
-                    percent=job.percent,
-                    request_id=job.request_id,
-                    created_at=job.created_at,
-                    updated_at=job.created_at,
-                    revision=1,
-                    extensions={},
-                )
-                session.add(row)
-            self._write_job_row(row, job)
-            if job.job_type == "resume.render":
-                await session.flush()
-                await self._sync_resume_render_job(session, scope, job)
+            await self._save_job_locked(session, scope, job, allow_create=True)
 
     async def get_job(self, scope: ActorScope, job_id: str) -> Job | None:
         """@brief 读取范围内 Job / Read a scoped Job.
@@ -2318,6 +2551,36 @@ class PostgresWorkspaceRepository:
             row = await _scoped_one(session, JobOrmRecord, scope, job_id)
             return self._job_from_row(row) if row is not None else None
 
+    async def claim_job(
+        self,
+        scope: ActorScope,
+        job_id: str,
+        stale_after_seconds: int = 900,
+    ) -> Job | None:
+        """Atomically claim one queued Job across workers using a row lock."""
+        async with self._database.transaction(scope) as session:
+            row = await _scoped_one(session, JobOrmRecord, scope, job_id, lock=True)
+            if row is None:
+                return None
+            job = self._job_from_row(row)
+            stale = (
+                job.status is JobStatus.RUNNING
+                and job.started_at is not None
+                and job.started_at
+                <= datetime.now(UTC) - timedelta(seconds=stale_after_seconds)
+            )
+            if job.status is not JobStatus.QUEUED and not stale:
+                return None
+            if stale:
+                job.status = JobStatus.QUEUED
+                job.phase = "queued"
+                job.started_at = None
+            job.start()
+            self._write_job_row(row, job)
+            if job.job_type == "resume.render":
+                await self._sync_resume_render_job(session, scope, job)
+            return job
+
     async def save_job(self, scope: ActorScope, job: Job) -> None:
         """@brief 保存 Job 生命周期与结果状态 / Save Job lifecycle and result state.
 
@@ -2325,12 +2588,42 @@ class PostgresWorkspaceRepository:
         @param job Job 领域实体 / Domain Job entity.
         """
         async with self._database.transaction(scope) as session:
-            row = await _scoped_one(session, JobOrmRecord, scope, job.id, lock=True)
-            if row is None:
+            await self._save_job_locked(session, scope, job, allow_create=False)
+
+    async def _save_job_locked(
+        self,
+        session: AsyncSession,
+        scope: ActorScope,
+        job: Job,
+        *,
+        allow_create: bool,
+    ) -> None:
+        """Upsert a Job inside an existing tenant transaction."""
+        row = await _scoped_one(session, JobOrmRecord, scope, job.id, lock=True)
+        if row is None:
+            if not allow_create:
                 raise RuntimeError("cannot save a job outside the supplied scope")
-            self._write_job_row(row, job)
-            if job.job_type == "resume.render":
-                await self._sync_resume_render_job(session, scope, job)
+            row = JobOrmRecord(
+                id=job.id,
+                workspace_id=scope.workspace_id,
+                resource_owner_id=scope.resource_owner_id,
+                job_type=job.job_type,
+                status=job.status.value,
+                phase=job.phase,
+                completed_units=job.completed_units,
+                total_units=job.total_units,
+                percent=job.percent,
+                request_id=job.request_id,
+                created_at=job.created_at,
+                updated_at=job.created_at,
+                revision=1,
+                extensions={},
+            )
+            session.add(row)
+        self._write_job_row(row, job)
+        if job.job_type == "resume.render":
+            await session.flush()
+            await self._sync_resume_render_job(session, scope, job)
 
     async def _sync_resume_render_job(
         self,
@@ -2537,51 +2830,86 @@ class PostgresWorkspaceRepository:
         ):
             raise ValueError("render artifact metadata requires id, resume_id, and resume_revision")
         async with self._database.transaction(scope) as session:
-            resume = await _scoped_one(session, ResumeDocumentOrmRecord, scope, resume_id)
-            revision_statement = scoped_select(ResumeRevisionOrmRecord, scope).where(
-                ResumeRevisionOrmRecord.resume_id == resume_id,
-                ResumeRevisionOrmRecord.revision_no == resume_revision,
+            await self._save_artifact_locked(session, scope, artifact, content, source_map)
+
+    async def save_artifact_and_job(
+        self,
+        scope: ActorScope,
+        artifact: dict[str, Any],
+        content: bytes,
+        source_map: dict[str, Any] | None,
+        job: Job,
+    ) -> None:
+        """Atomically publish artifact metadata/bytes and the successful render Job."""
+        async with self._database.transaction(scope) as session:
+            await self._save_artifact_locked(session, scope, artifact, content, source_map)
+            await self._save_job_locked(session, scope, job, allow_create=False)
+
+    async def _save_artifact_locked(
+        self,
+        session: AsyncSession,
+        scope: ActorScope,
+        artifact: dict[str, Any],
+        content: bytes,
+        source_map: dict[str, Any] | None,
+    ) -> None:
+        """Persist one render artifact inside an existing tenant transaction."""
+        artifact_id = artifact.get("id")
+        resume_id = artifact.get("resume_id")
+        resume_revision = artifact.get("resume_revision")
+        if (
+            not isinstance(artifact_id, str)
+            or not isinstance(resume_id, str)
+            or isinstance(resume_revision, bool)
+            or not isinstance(resume_revision, int)
+        ):
+            raise ValueError("render artifact metadata requires id, resume_id, and resume_revision")
+        resume = await _scoped_one(session, ResumeDocumentOrmRecord, scope, resume_id)
+        revision_statement = scoped_select(ResumeRevisionOrmRecord, scope).where(
+            ResumeRevisionOrmRecord.resume_id == resume_id,
+            ResumeRevisionOrmRecord.revision_no == resume_revision,
+        )
+        revision_row = (await session.scalars(revision_statement)).first()
+        if resume is None or revision_row is None:
+            raise ValueError("render artifact references an unknown scoped resume revision")
+        row = await _scoped_one(session, RenderArtifactOrmRecord, scope, artifact_id, lock=True)
+        created_at = _as_datetime(artifact.get("created_at"), datetime.now(UTC))
+        updated_at = _as_datetime(artifact.get("updated_at"), created_at)
+        if row is None:
+            row = RenderArtifactOrmRecord(
+                id=artifact_id,
+                workspace_id=scope.workspace_id,
+                resource_owner_id=scope.resource_owner_id,
+                resume_id=resume_id,
+                resume_revision_id=str(revision_row.id),
+                artifact_kind=str(artifact.get("artifact_kind", "rendered_resume")),
+                format=str(artifact.get("format", "pdf")),
+                storage_key=f"database://resume-artifacts/{artifact_id}",
+                content_sha256=str(artifact.get("sha256", _bytes_hash(content))),
+                content_bytes=len(content),
+                created_at=created_at,
+                updated_at=updated_at,
+                revision=int(artifact.get("revision", 1)),
+                extensions={},
             )
-            revision_row = (await session.scalars(revision_statement)).first()
-            if resume is None or revision_row is None:
-                raise ValueError("render artifact references an unknown scoped resume revision")
-            row = await _scoped_one(session, RenderArtifactOrmRecord, scope, artifact_id, lock=True)
-            created_at = _as_datetime(artifact.get("created_at"), datetime.now(UTC))
-            updated_at = _as_datetime(artifact.get("updated_at"), created_at)
-            if row is None:
-                row = RenderArtifactOrmRecord(
-                    id=artifact_id,
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    resume_id=resume_id,
-                    resume_revision_id=str(revision_row.id),
-                    artifact_kind=str(artifact.get("artifact_kind", "rendered_resume")),
-                    format=str(artifact.get("format", "pdf")),
-                    storage_key=f"database://resume-artifacts/{artifact_id}",
-                    content_sha256=str(artifact.get("sha256", _bytes_hash(content))),
-                    content_bytes=len(content),
-                    created_at=created_at,
-                    updated_at=updated_at,
-                    revision=int(artifact.get("revision", 1)),
-                    extensions={},
-                )
-                session.add(row)
-                await session.flush()
-            row.resume_id = resume_id
-            row.resume_revision_id = str(revision_row.id)
-            row.artifact_kind = str(artifact.get("artifact_kind", row.artifact_kind))
-            row.format = str(artifact.get("format", row.format))
-            row.content_sha256 = str(artifact.get("sha256", _bytes_hash(content)))
-            row.content_bytes = len(content)
-            row.updated_at = updated_at
-            row.revision = int(artifact.get("revision", row.revision))
-            row.extensions = _with_runtime(row.extensions, {"public_metadata": deepcopy(artifact)})
-            blob_statement = scoped_select(RenderArtifactBlobOrmRecord, scope).where(
-                RenderArtifactBlobOrmRecord.artifact_id == artifact_id
-            )
-            blob = (await session.scalars(blob_statement)).first()
-            if blob is None:
-                blob = RenderArtifactBlobOrmRecord(
+            session.add(row)
+            await session.flush()
+        row.resume_id = resume_id
+        row.resume_revision_id = str(revision_row.id)
+        row.artifact_kind = str(artifact.get("artifact_kind", row.artifact_kind))
+        row.format = str(artifact.get("format", row.format))
+        row.content_sha256 = str(artifact.get("sha256", _bytes_hash(content)))
+        row.content_bytes = len(content)
+        row.updated_at = updated_at
+        row.revision = int(artifact.get("revision", row.revision))
+        row.extensions = _with_runtime(row.extensions, {"public_metadata": deepcopy(artifact)})
+        blob_statement = scoped_select(RenderArtifactBlobOrmRecord, scope).where(
+            RenderArtifactBlobOrmRecord.artifact_id == artifact_id
+        )
+        blob = (await session.scalars(blob_statement)).first()
+        if blob is None:
+            session.add(
+                RenderArtifactBlobOrmRecord(
                     id=_stable_id("artblob", artifact_id),
                     workspace_id=scope.workspace_id,
                     resource_owner_id=scope.resource_owner_id,
@@ -2593,12 +2921,12 @@ class PostgresWorkspaceRepository:
                     revision=1,
                     extensions={},
                 )
-                session.add(blob)
-                return
-            blob.content = content
-            blob.source_map = deepcopy(source_map)
-            blob.updated_at = updated_at
-            blob.revision = int(blob.revision) + 1
+            )
+            return
+        blob.content = content
+        blob.source_map = deepcopy(source_map)
+        blob.updated_at = updated_at
+        blob.revision = int(blob.revision) + 1
 
     async def get_artifact(
         self,

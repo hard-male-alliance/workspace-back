@@ -106,16 +106,11 @@ def _write_settings(
     return path
 
 
-def test_development_can_use_legacy_mock_default_but_staging_cannot(tmp_path: Path) -> None:
-    """@brief 缺失安全节只在 development/test 回退 mock / Missing security falls back to mock only in development/test."""
-    development_settings = BackendSettings.from_file(
-        _write_settings(tmp_path, environment="development", security=None)
-    )
-    assert development_settings.security.identity_mode == "development_mock"
-
-    staging_path = _write_settings(tmp_path, environment="staging", security=None)
-    with pytest.raises(ConfigurationError, match="security section is required"):
-        BackendSettings.from_file(staging_path)
+def test_security_section_is_always_explicit(tmp_path: Path) -> None:
+    """@brief 所有环境都必须从唯一配置显式读取身份设置 / Every environment requires explicit identity settings."""
+    path = _write_settings(tmp_path, environment="development", security=None)
+    with pytest.raises(ConfigurationError, match="security"):
+        BackendSettings.from_file(path)
 
 
 def test_production_rejects_development_mock_identity_mode(tmp_path: Path) -> None:
@@ -125,7 +120,7 @@ def test_production_rejects_development_mock_identity_mode(tmp_path: Path) -> No
         environment="production",
         security={
             "identity_mode": "development_mock",
-            "trusted_proxy_hmac_secret_env": "AIWS_TRUSTED_PROXY_HMAC_SECRET",
+            "trusted_proxy_hmac_secret": None,
             "trusted_proxy_max_clock_skew_seconds": 60,
         },
     )
@@ -140,7 +135,7 @@ def test_production_requires_postgresql_even_with_trusted_identity(tmp_path: Pat
         environment="production",
         security={
             "identity_mode": "trusted_proxy_hmac",
-            "trusted_proxy_hmac_secret_env": "AIWS_TRUSTED_PROXY_HMAC_SECRET",
+            "trusted_proxy_hmac_secret": _TEST_SECRET,
             "trusted_proxy_max_clock_skew_seconds": 60,
         },
     )
@@ -150,7 +145,15 @@ def test_production_requires_postgresql_even_with_trusted_identity(tmp_path: Pat
 
 def test_configuration_rejects_unsafe_outbound_proxy_url(tmp_path: Path) -> None:
     """@brief 出站 proxy 必须是受限的 HTTP(S) URL / Outbound proxy must be a constrained HTTP(S) URL."""
-    path = _write_settings(tmp_path, environment="development", security=None)
+    path = _write_settings(
+        tmp_path,
+        environment="development",
+        security={
+            "identity_mode": "development_mock",
+            "trusted_proxy_hmac_secret": None,
+            "trusted_proxy_max_clock_skew_seconds": 300,
+        },
+    )
     payload = json5.loads(path.read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
     network = payload.get("network")
@@ -199,7 +202,17 @@ def test_hmac_identity_rejects_forged_or_expired_assertions() -> None:
 
 def test_trusted_proxy_source_accepts_only_configured_ip_networks(tmp_path: Path) -> None:
     """@brief 可信 HMAC 还必须来自已配置对端 CIDR / Trusted HMAC must also originate from a configured peer CIDR."""
-    settings = BackendSettings.from_file(_write_settings(tmp_path, environment="development", security=None))
+    settings = BackendSettings.from_file(
+        _write_settings(
+            tmp_path,
+            environment="development",
+            security={
+                "identity_mode": "development_mock",
+                "trusted_proxy_hmac_secret": None,
+                "trusted_proxy_max_clock_skew_seconds": 300,
+            },
+        )
+    )
     networks = settings.network.trusted_proxy_cidrs
     assert peer_is_trusted_proxy("127.0.0.1", networks)
     assert not peer_is_trusted_proxy("198.51.100.10", networks)
@@ -220,30 +233,21 @@ def test_mock_resolver_cannot_be_constructed_for_production() -> None:
     ) == ActorScope("usr_test", "ws_local", "usr_local")
 
 
-def test_identity_factory_requires_secret_without_exposing_it(monkeypatch: pytest.MonkeyPatch) -> None:
-    """@brief HMAC factory 只从环境取密钥，且缺失时不泄漏变量值 / HMAC factory reads only env secrets and leaks no value when absent."""
+def test_identity_factory_reads_direct_secret_without_exposing_it() -> None:
+    """@brief HMAC factory 只读直接配置且 repr 不泄密 / HMAC factory reads direct config without repr leakage."""
     security = SecuritySettings(
         identity_mode="trusted_proxy_hmac",
-        trusted_proxy_hmac_secret_env="AIWS_TEST_IDENTITY_SECRET",
+        trusted_proxy_hmac_secret=_TEST_SECRET,
         trusted_proxy_max_clock_skew_seconds=60,
     )
     default_scope = ActorScope("usr_local", "ws_local", "usr_local")
-    monkeypatch.delenv("AIWS_TEST_IDENTITY_SECRET", raising=False)
-    with pytest.raises(ConfigurationError, match="secret environment variable is not set") as absent_error:
-        build_identity_resolver(
-            environment="production",
-            default_scope=default_scope,
-            security=security,
-        )
-    assert "AIWS_TEST_IDENTITY_SECRET" not in str(absent_error.value)
-
-    monkeypatch.setenv("AIWS_TEST_IDENTITY_SECRET", _TEST_SECRET)
     resolver = build_identity_resolver(
         environment="production",
         default_scope=default_scope,
         security=security,
     )
     assert isinstance(resolver, TrustedProxyHMACIdentityResolver)
+    assert _TEST_SECRET not in repr(security)
 
 
 def test_http_middleware_rejects_unsigned_scope_headers_and_accepts_signed_scope(
@@ -251,14 +255,13 @@ def test_http_middleware_rejects_unsigned_scope_headers_and_accepts_signed_scope
     tmp_path: Path,
 ) -> None:
     """@brief HTTP 中间件只能接受经可信代理签名的生产身份 / HTTP middleware accepts production identity only when proxy-signed."""
-    monkeypatch.setenv("AIWS_TRUSTED_PROXY_HMAC_SECRET", _TEST_SECRET)
     settings = BackendSettings.from_file(
         _write_settings(
             tmp_path,
             environment="development",
             security={
                 "identity_mode": "trusted_proxy_hmac",
-                "trusted_proxy_hmac_secret_env": "AIWS_TRUSTED_PROXY_HMAC_SECRET",
+                "trusted_proxy_hmac_secret": _TEST_SECRET,
                 "trusted_proxy_max_clock_skew_seconds": 300,
             },
         )
