@@ -10,16 +10,23 @@ from pathlib import Path
 from typing import TextIO
 
 from dbctl.application.errors import ApplicationError
-from dbctl.application.migrate import MigrationRevision
+from dbctl.application.migrate import MigrationRevision, MigrationService
+from dbctl.application.open_shell import OpenShellService
 from dbctl.application.progress import (
     OperationName,
     ProgressState,
     ProgressUpdate,
     publish_progress,
 )
-from dbctl.application.provision import BootstrapAccessMode, build_bootstrap_plan
-from dbctl.application.prune_telemetry import PruneMode, PruneRequest
-from dbctl.composition import DbctlApplication, compose_dbctl
+from dbctl.application.provision import BootstrapAccessMode, BootstrapService, build_bootstrap_plan
+from dbctl.application.prune_telemetry import PruneMode, PruneRequest, PruneTelemetryService
+from dbctl.composition import (
+    compose_bootstrap,
+    compose_migration,
+    compose_prune_telemetry,
+    compose_shell,
+)
+from dbctl.domain.database import DbctlSettings
 from dbctl.domain.errors import DomainError
 from dbctl.domain.retention import (
     DEFAULT_LOCK_TIMEOUT_MS,
@@ -253,20 +260,45 @@ def run(
         dbinit_path=arguments.dbinit,
     )
     try:
-        application = compose_dbctl(
-            arguments.config,
-            dbinit_path=arguments.dbinit,
-            initialize_config=command == "bootstrap",
-            progress=console,
-        )
         if command == "bootstrap":
-            return _run_bootstrap(arguments, application, console, stdout)
+            bootstrap_settings, bootstrap_service = compose_bootstrap(
+                arguments.config,
+                dbinit_path=arguments.dbinit,
+                progress=console,
+            )
+            return _run_bootstrap(
+                arguments,
+                bootstrap_settings,
+                bootstrap_service,
+                console,
+                stdout,
+            )
         if command == "migrate":
-            return _run_migration(arguments, application, stdout)
+            migration_settings, migration_service = compose_migration(
+                arguments.config,
+                dbinit_path=arguments.dbinit,
+                progress=console,
+            )
+            return _run_migration(
+                arguments,
+                migration_settings,
+                migration_service,
+                stdout,
+            )
         if command == "prune-telemetry":
-            return _run_prune(arguments, application, stdout)
+            prune_settings, prune_service = compose_prune_telemetry(
+                arguments.config,
+                dbinit_path=arguments.dbinit,
+                progress=console,
+            )
+            return _run_prune(arguments, prune_settings, prune_service, stdout)
         if command == "shell":
-            return _run_shell(arguments, application)
+            shell_settings, shell_service = compose_shell(
+                arguments.config,
+                dbinit_path=arguments.dbinit,
+                progress=console,
+            )
+            return _run_shell(arguments, shell_settings, shell_service)
         parser.error("未知 dbctl 子命令。")
     except KeyboardInterrupt:
         console.cancelled(command)
@@ -285,14 +317,16 @@ def run(
 
 def _run_bootstrap(
     arguments: argparse.Namespace,
-    application: DbctlApplication,
+    settings: DbctlSettings,
+    service: BootstrapService,
     console: OperatorConsole,
     stdout: TextIO,
 ) -> int:
     """@brief 预览或执行 bootstrap 计划 / Preview or execute the bootstrap plan.
 
     @param arguments 已解析参数 / Parsed arguments.
-    @param application 已装配应用 / Composed application.
+    @param settings 已验证领域设置 / Validated domain settings.
+    @param service 仅 bootstrap 用例 / Bootstrap-only use case.
     @param console 操作者进度终端 / Operator progress console.
     @param stdout 主结果流 / Primary-result stream.
     @return 成功状态 0 / Success status zero.
@@ -307,7 +341,7 @@ def _run_bootstrap(
             detail="仅使用已验证领域设置；尚未连接 PostgreSQL",
         )
     )
-    plan = build_bootstrap_plan(application.settings)
+    plan = build_bootstrap_plan(settings)
     statement_count = sum(len(stage.statements) for stage in plan.stages)
     publish_progress(
         console,
@@ -321,7 +355,7 @@ def _run_bootstrap(
     if arguments.dry_run:
         _write_result(stdout, render_bootstrap_plan(plan))
         return 0
-    result = application.bootstrap.execute(
+    result = service.execute(
         plan,
         access_mode=BootstrapAccessMode(arguments.access_mode),
     )
@@ -331,40 +365,44 @@ def _run_bootstrap(
 
 def _run_migration(
     arguments: argparse.Namespace,
-    application: DbctlApplication,
+    settings: DbctlSettings,
+    service: MigrationService,
     stdout: TextIO,
 ) -> int:
     """@brief 执行一次显式 Alembic upgrade / Execute one explicit Alembic upgrade.
 
     @param arguments 已解析参数 / Parsed arguments.
-    @param application 已装配应用 / Composed application.
+    @param settings 已验证领域设置 / Validated domain settings.
+    @param service 仅 migration 用例 / Migration-only use case.
     @param stdout 主结果流 / Primary-result stream.
     @return 成功状态 0 / Success status zero.
     """
 
     revision = MigrationRevision(arguments.revision)
-    login = application.settings.connections.migrator
-    application.migration.execute(login, revision, application.settings)
+    login = settings.connections.migrator
+    service.execute(login, revision, settings)
     _write_result(stdout, render_migration_result(revision, login))
     return 0
 
 
 def _run_prune(
     arguments: argparse.Namespace,
-    application: DbctlApplication,
+    settings: DbctlSettings,
+    service: PruneTelemetryService,
     stdout: TextIO,
 ) -> int:
     """@brief 预览或执行一次有界遥测清理 / Preview or apply one bounded telemetry prune.
 
     @param arguments 已解析参数 / Parsed arguments.
-    @param application 已装配应用 / Composed application.
+    @param settings 已验证领域设置 / Validated domain settings.
+    @param service 仅遥测清理用例 / Telemetry-pruning-only use case.
     @param stdout 主结果流 / Primary-result stream.
     @return 成功状态 0 / Success status zero.
     """
 
-    outcome = application.prune.execute(
+    outcome = service.execute(
         PruneRequest(
-            policy=application.settings.retention,
+            policy=settings.retention,
             limits=PruneLimits(
                 batch_size=arguments.batch_size,
                 max_batches=arguments.max_batches,
@@ -378,16 +416,21 @@ def _run_prune(
     return 0
 
 
-def _run_shell(arguments: argparse.Namespace, application: DbctlApplication) -> int:
+def _run_shell(
+    arguments: argparse.Namespace,
+    settings: DbctlSettings,
+    service: OpenShellService,
+) -> int:
     """@brief 以选定登录身份启动 psql / Launch psql with the selected login identity.
 
     @param arguments 已解析参数 / Parsed arguments.
-    @param application 已装配应用 / Composed application.
+    @param settings 已验证领域设置 / Validated domain settings.
+    @param service 仅 shell 用例 / Shell-only use case.
     @return 规范化的 psql 状态 / Normalized psql status.
     """
 
-    login = application.settings.connections.login_for(LoginRole(arguments.role))
-    return application.shell.execute(login)
+    login = settings.connections.login_for(LoginRole(arguments.role))
+    return service.execute(login)
 
 
 def _add_global_options(parser: argparse.ArgumentParser) -> None:

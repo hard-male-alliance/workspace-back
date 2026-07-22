@@ -449,7 +449,7 @@ def test_unexpected_failure_keeps_type_and_frames_but_hides_message(
         failure.add_note(untrusted_note)
         raise failure
 
-    monkeypatch.setattr(cli_module, "compose_dbctl", fail_composition)
+    monkeypatch.setattr(cli_module, "compose_prune_telemetry", fail_composition)
     stdout = StringIO()
     stderr = StringIO()
     exit_code = run(

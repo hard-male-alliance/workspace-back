@@ -19,7 +19,7 @@ from dbctl.application.errors import (
     safe_diagnostic_notes,
 )
 from dbctl.application.migrate import MigrationRevision
-from dbctl.composition import compose_dbctl
+from dbctl.composition import compose_migration, compose_shell
 from dbctl.domain.database import LoginDatabase
 from dbctl.domain.roles import LoginRole
 from dbctl.infrastructure.alembic import AlembicMigrationAdapter
@@ -102,12 +102,12 @@ def test_shell_uses_exact_config_pgpass_without_prompt(
         "PGHOST": "attacker.example",
         "PATH": os.environ.get("PATH", ""),
     }
-    application = compose_dbctl(
+    settings, shell = compose_shell(
         config_path,
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
         environ=inherited,
     )
-    login = application.settings.connections.application
+    login = settings.connections.application
     observed_password_file: Path | None = None
 
     def fake_run(command: tuple[str, ...], **keywords: Any) -> subprocess.CompletedProcess[str]:
@@ -135,7 +135,7 @@ def test_shell_uses_exact_config_pgpass_without_prompt(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert secret not in repr(login)
-    assert application.shell.execute(login) == 37
+    assert shell.execute(login) == 37
     assert observed_password_file is not None
     assert not observed_password_file.exists()
     assert inherited["PGPASSWORD"] == "must-not-win"
@@ -153,7 +153,7 @@ def test_shell_reports_secondary_pgpass_cleanup_risk_without_masking_primary(
     @return 无返回值 / No return value.
     """
 
-    application = compose_dbctl(
+    settings, _shell = compose_shell(
         _initialized_config(tmp_path),
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
     )
@@ -186,7 +186,7 @@ def test_shell_reports_secondary_pgpass_cleanup_risk_without_masking_primary(
     monkeypatch.setattr(subprocess, "run", fail_to_start)
 
     with pytest.raises(ShellExecutionError) as error_info:
-        PsqlShellAdapter({}).launch(application.settings.connections.application)
+        PsqlShellAdapter({}).launch(settings.connections.application)
 
     assert str(error_info.value) == "无法启动本地 PostgreSQL psql。"
     assert isinstance(error_info.value.__cause__, ExternalDiagnosticError)
@@ -218,17 +218,17 @@ def test_shell_role_selection_resolves_complete_typed_login(
     @return 无返回值 / No return value.
     """
 
-    application = compose_dbctl(
+    settings, _shell = compose_shell(
         _initialized_config(tmp_path),
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
     )
-    login = application.settings.connections.login_for(role)
+    login = settings.connections.login_for(role)
 
     assert login.role is role
     assert login.role_name.value == expected_name
     assert login.password.reveal()
     assert login.password.reveal() not in repr(login)
-    assert login.target == application.settings.connections.target
+    assert login.target == settings.connections.target
 
 
 def test_migration_transports_encoded_dsn_only_via_memory_attributes(
@@ -243,11 +243,11 @@ def test_migration_transports_encoded_dsn_only_via_memory_attributes(
     """
 
     secret = "migrator:@/%雪"
-    application = compose_dbctl(
+    settings, _migration = compose_migration(
         _initialized_config(tmp_path, migrator_password=secret),
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
     )
-    login = application.settings.connections.migrator
+    login = settings.connections.migrator
 
     def fake_upgrade(configuration: Any, revision: str) -> None:
         """@brief 验证 Alembic 内存配置 / Verify Alembic in-memory configuration.
@@ -269,7 +269,7 @@ def test_migration_transports_encoded_dsn_only_via_memory_attributes(
     AlembicMigrationAdapter().upgrade(
         login,
         MigrationRevision(),
-        application.settings.blueprint,
+        settings.blueprint,
     )
 
 
@@ -285,11 +285,11 @@ def test_migration_failure_uses_secret_safe_diagnostic_cause(
     """
 
     secret = "migration-secret:@/%雪"
-    application = compose_dbctl(
+    settings, _migration = compose_migration(
         _initialized_config(tmp_path, migrator_password=secret),
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
     )
-    login = application.settings.connections.migrator
+    login = settings.connections.migrator
 
     def fail_with_dsn(_configuration: Any, _revision: str) -> None:
         """@brief 模拟回显 DSN 的底层失败 / Simulate a lower-level DSN-bearing failure.
@@ -306,7 +306,7 @@ def test_migration_failure_uses_secret_safe_diagnostic_cause(
         AlembicMigrationAdapter().upgrade(
             login,
             MigrationRevision(),
-            application.settings.blueprint,
+            settings.blueprint,
         )
     assert secret not in str(error_info.value)
     assert "postgresql://" not in str(error_info.value)
@@ -329,7 +329,30 @@ def test_composition_passes_only_migrator_and_nonsecret_blueprint_to_adapter(
     """
 
     secret = "migrator-config:@/%雪"
-    application = compose_dbctl(
+    def reject_unrelated_adapter(*_arguments: object, **_keywords: object) -> object:
+        """@brief 禁止 migration 组合构造无关 adapter / Reject unrelated adapter construction.
+
+        @param _arguments 未使用位置参数 / Unused positional arguments.
+        @param _keywords 未使用关键字参数 / Unused keyword arguments.
+        @return 永不返回 / Never returns.
+        @raise AssertionError 若组合根越过命令边界 / If composition crosses the command boundary.
+        """
+
+        raise AssertionError("migration composition constructed an unrelated adapter")
+
+    monkeypatch.setattr(
+        "dbctl.composition.LocalPsqlBootstrapRunnerFactory",
+        reject_unrelated_adapter,
+    )
+    monkeypatch.setattr(
+        "dbctl.composition.PsycopgTelemetryRetentionAdapter",
+        reject_unrelated_adapter,
+    )
+    monkeypatch.setattr(
+        "dbctl.composition.PsqlShellAdapter",
+        reject_unrelated_adapter,
+    )
+    settings, migration = compose_migration(
         _initialized_config(tmp_path, migrator_password=secret),
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
     )
@@ -354,13 +377,13 @@ def test_composition_passes_only_migrator_and_nonsecret_blueprint_to_adapter(
         observed.append((login, blueprint))
 
     monkeypatch.setattr(AlembicMigrationAdapter, "upgrade", fake_upgrade)
-    application.migration.execute(
-        application.settings.connections.migrator,
+    migration.execute(
+        settings.connections.migrator,
         MigrationRevision(),
-        application.settings,
+        settings,
     )
 
-    assert observed == [(application.settings.connections.migrator, application.settings.blueprint)]
+    assert observed == [(settings.connections.migrator, settings.blueprint)]
     assert observed[0][0].password.reveal() == secret
 
 

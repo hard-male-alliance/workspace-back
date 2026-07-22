@@ -26,7 +26,7 @@ from dbctl.application.provision import (
     TransactionMode,
     build_bootstrap_plan,
 )
-from dbctl.composition import compose_dbctl
+from dbctl.composition import compose_bootstrap
 from dbctl.domain.names import DatabaseName
 from dbctl.domain.roles import Secret
 from dbctl.infrastructure.postgres.psql import LocalPsqlBootstrapRunnerFactory
@@ -120,14 +120,14 @@ def _plan_and_secret(config_path: Path) -> tuple[BootstrapPlan, str]:
     @return bootstrap plan 与 app 密码 / Bootstrap plan and app password.
     """
 
-    application = compose_dbctl(
+    settings, _bootstrap = compose_bootstrap(
         config_path,
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
         environ={},
     )
     return (
-        build_bootstrap_plan(application.settings),
-        application.settings.connections.application.password.reveal(),
+        build_bootstrap_plan(settings),
+        settings.connections.application.password.reveal(),
     )
 
 
