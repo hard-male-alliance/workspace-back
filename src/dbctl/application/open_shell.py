@@ -1,9 +1,10 @@
 """@brief 交互式 PostgreSQL shell 用例 / Interactive PostgreSQL shell use case."""
 
+from typing import Protocol
+
 from dbctl.domain.database import DatabaseLogin, LoginDatabase
 
 from .errors import ShellExecutionError, add_safe_diagnostic_note
-from .ports import ShellPort
 from .progress import (
     OperationName,
     ProgressSink,
@@ -11,6 +12,18 @@ from .progress import (
     ProgressUpdate,
     publish_progress,
 )
+
+
+class ShellPort(Protocol):
+    """@brief 交互式 PostgreSQL shell 启动端口 / Interactive PostgreSQL shell launch port."""
+
+    def launch(self, login: LoginDatabase) -> int:
+        """@brief 直接使用强类型登录启动 shell / Launch a shell directly with a typed login.
+
+        @param login config 中验证过的登录身份 / Login identity validated from configuration.
+        @return subprocess 风格退出状态 / Subprocess-style exit status.
+        """
+        ...
 
 
 class OpenShellService:

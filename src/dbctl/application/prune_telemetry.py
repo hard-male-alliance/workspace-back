@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, Protocol
 
 from dbctl.domain.retention import PruneLimits, RetentionPolicy
 
@@ -13,7 +13,6 @@ from .errors import (
     add_safe_diagnostic_note,
     safe_external_cause,
 )
-from .ports import TelemetryRetentionPort
 from .progress import (
     OperationName,
     ProgressSink,
@@ -96,6 +95,26 @@ class StaleTelemetryProbe:
         _require_aware_datetime(self.cutoff, label="probe cutoff")
         if not isinstance(self.limits, PruneLimits):
             raise RetentionExecutionError("probe limits 必须是 PruneLimits。")
+
+
+class TelemetryRetentionPort(Protocol):
+    """@brief 短事务遥测删除端口 / Short-transaction telemetry-deletion port."""
+
+    def delete_batch(self, command: DeleteTelemetryBatch) -> int:
+        """@brief 删除一个有界批次 / Delete one bounded batch.
+
+        @param command UTC cutoff 与资源护栏 / UTC cutoff and resource guardrails.
+        @return 当前短事务提交的删除数 / Rows deleted and committed in this short transaction.
+        """
+        ...
+
+    def has_stale(self, probe: StaleTelemetryProbe) -> bool:
+        """@brief 探测是否仍有过期记录 / Probe whether stale records remain.
+
+        @param probe UTC cutoff 与查询护栏 / UTC cutoff and query guardrails.
+        @return 至少一条过期记录存在时为真 / True when at least one stale record remains.
+        """
+        ...
 
 
 @dataclass(frozen=True, slots=True)

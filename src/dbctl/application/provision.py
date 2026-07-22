@@ -2,7 +2,8 @@
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Final
+from types import TracebackType
+from typing import Final, Protocol, Self
 
 from dbctl.domain.database import (
     IDENTITY_SCHEMA,
@@ -19,7 +20,6 @@ from .errors import (
     DatabaseAlreadyExistsError,
     add_safe_diagnostic_note,
 )
-from .ports import BootstrapRunnerFactory
 from .progress import (
     OperationName,
     ProgressSink,
@@ -226,6 +226,73 @@ class BootstrapResult:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise BootstrapExecutionError(f"{label} 必须是非负整数。")
+
+
+class BootstrapRunner(Protocol):
+    """@brief 一个 bootstrap 会话的批量执行端口 / Batch-execution port for one bootstrap session."""
+
+    @property
+    def access_mode(self) -> BootstrapAccessMode:
+        """@brief 返回已经解析的实际管理访问方式 / Return the resolved administrative-access mode.
+
+        @return sudo 或 prompt / ``sudo`` or ``prompt``.
+        """
+        ...
+
+    def __enter__(self) -> Self:
+        """@brief 进入受控 runner 生命周期 / Enter the controlled runner lifecycle.
+
+        @return 当前 runner / Current runner.
+        """
+        ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """@brief 关闭 runner 并清理临时凭证 / Close the runner and clean temporary credentials.
+
+        @param exc_type 退出时的异常类型 / Exception type at exit.
+        @param exc_value 退出时的异常对象 / Exception instance at exit.
+        @param traceback 退出时的 traceback / Traceback at exit.
+        @return 无返回值 / No return value.
+        """
+        ...
+
+    def database_exists(self, database: DatabaseName) -> bool:
+        """@brief 判断项目数据库是否存在 / Determine whether the project database exists.
+
+        @param database 强类型数据库名 / Strongly typed database name.
+        @return 数据库存在时为真 / True when the database exists.
+        """
+        ...
+
+    def execute_stage(self, stage: BootstrapStage) -> None:
+        """@brief 按 stage 契约批量执行 SQL / Execute SQL as one batch under the stage contract.
+
+        @param stage 已验证的连接目标、事务模式与 SQL 批次 / Validated target, transaction mode, and batch.
+        @return 无返回值 / No return value.
+        """
+        ...
+
+
+class BootstrapRunnerFactory(Protocol):
+    """@brief 按计划与访问模式打开 bootstrap runner / Open a runner for a plan and access mode."""
+
+    def open(
+        self,
+        plan: BootstrapPlan,
+        access_mode: BootstrapAccessMode,
+    ) -> BootstrapRunner:
+        """@brief 创建尚未进入上下文的 runner / Create a runner not yet entered.
+
+        @param plan 含 maintenance 与项目目标的自足计划 / Self-contained plan with both targets.
+        @param access_mode 显式管理权限模式 / Explicit administrative-access mode.
+        @return 由应用服务管理生命周期的 BootstrapRunner / Runner lifecycle-owned by application.
+        """
+        ...
 
 
 class BootstrapService:
