@@ -8,8 +8,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
-from dbctl.infrastructure.runtime_projection import write_runtime_config
-from workspace_shared.jsonc import ConfigurationError
+from dbctl.application.container_startup import ContainerLaunchError, ContainerProjectionError
+from dbctl.composition import compose_container
+from dbctl.interfaces.console import OperatorConsole
 
 _DEFAULT_SOURCE_CONFIG_PATH: Final[Path] = Path("/var/lib/aiws-config/config.jsonc")
 """@brief dbctl 持久配置默认路径 / Default path of the persistent dbctl-owned configuration."""
@@ -19,32 +20,46 @@ _DEFAULT_RUNTIME_CONFIG_PATH: Final[Path] = Path("/tmp/aiws/config.jsonc")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """@brief 投影配置后以目标进程替换入口 / Project configuration and replace the entrypoint process.
+    """@brief 呈现容器启动用例并保持入口退出码 / Present startup and preserve entrypoint statuses.
 
     @param argv 待执行命令；``None`` 时读取 ``sys.argv``。
     / Command to execute; reads ``sys.argv`` when ``None``.
-    @return 仅参数或配置错误时返回 ``2``；成功路径由目标进程替换且不返回。
-    / Returns ``2`` only for argument or configuration errors; successful execution replaces the process.
+    @return 参数或预期投影错误返回 ``2``；启动或未知错误返回 ``1``；测试替身成功返回 ``0``。
+    / Returns ``2`` for arguments or expected projection failures, ``1`` for launch or unknown
+    failures, and ``0`` when a successful test double returns.
     """
 
     command = tuple(sys.argv[1:] if argv is None else argv)
     if not command:
         print("container entrypoint requires a command", file=sys.stderr)
         return 2
+
+    console = OperatorConsole(sys.stderr)
+    source_overridden = "AIWS_SOURCE_CONFIG" in os.environ
+    runtime_overridden = "AIWS_CONFIG" in os.environ
     source_config_path = Path(
         os.environ.get("AIWS_SOURCE_CONFIG", str(_DEFAULT_SOURCE_CONFIG_PATH))
     )
     runtime_config_path = Path(os.environ.get("AIWS_CONFIG", str(_DEFAULT_RUNTIME_CONFIG_PATH)))
     try:
-        write_runtime_config(source_config_path, runtime_config_path, os.environ)
-    except ConfigurationError, OSError, ValueError:
-        print(
-            "container entrypoint could not read the dbctl-generated configuration; "
-            "run dbctl bootstrap first",
-            file=sys.stderr,
+        service = compose_container(progress=console)
+        service.execute(
+            source_config_path,
+            runtime_config_path,
+            command,
+            os.environ,
+            source_overridden=source_overridden,
+            runtime_overridden=runtime_overridden,
         )
+    except ContainerProjectionError as error:
+        console.failure("container-entrypoint", error, exit_code=2)
         return 2
-    os.execvpe(command[0], command, os.environ)
+    except ContainerLaunchError as error:
+        console.failure("container-entrypoint", error, exit_code=1)
+        return 1
+    except Exception as error:
+        console.failure("container-entrypoint", error, exit_code=1)
+        return 1
     return 0
 
 

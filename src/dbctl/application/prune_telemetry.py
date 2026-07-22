@@ -283,8 +283,24 @@ class PruneTelemetryService:
                 )
             )
             return PrunePreview(policy=request.policy, limits=request.limits, cutoff=cutoff)
-        if self._port is None:
+        port = self._port
+        if port is None:
             raise RetentionExecutionError("apply 模式缺少 TelemetryRetentionPort。")
+        return self._execute_apply(request, cutoff, port)
+
+    def _execute_apply(
+        self,
+        request: PruneRequest,
+        cutoff: datetime,
+        port: TelemetryRetentionPort,
+    ) -> PruneApplied:
+        """@brief 使用固定 cutoff 执行有界短事务清理 / Apply bounded short transactions at one cutoff.
+
+        @param request 已验证 apply 请求 / Validated apply request.
+        @param cutoff 本轮唯一固定 UTC 边界 / Sole fixed UTC boundary for this run.
+        @param port 非空遥测清理端口 / Non-null telemetry-retention port.
+        @return 已提交批次、删除数与剩余状态 / Committed batches, deletion count, and remaining state.
+        """
 
         batch_count = 0
         deleted_count = 0
@@ -312,7 +328,7 @@ class PruneTelemetryService:
                 )
             )
             try:
-                deleted_in_batch = self._port.delete_batch(command)
+                deleted_in_batch = port.delete_batch(command)
                 if (
                     not isinstance(deleted_in_batch, int)
                     or isinstance(deleted_in_batch, bool)
@@ -326,7 +342,7 @@ class PruneTelemetryService:
                 )
                 add_safe_diagnostic_note(
                     error,
-                    f"dbctl prune-telemetry 批次 {batch_number}/{request.limits.max_batches}。"
+                    f"dbctl prune-telemetry 批次 {batch_number}/{request.limits.max_batches}。",
                 )
                 add_safe_diagnostic_note(
                     error,
@@ -367,9 +383,7 @@ class PruneTelemetryService:
             )
         )
         try:
-            has_more = self._port.has_stale(
-                StaleTelemetryProbe(cutoff=cutoff, limits=request.limits)
-            )
+            has_more = port.has_stale(StaleTelemetryProbe(cutoff=cutoff, limits=request.limits))
             if not isinstance(has_more, bool):
                 raise RetentionExecutionError("遥测删除端口返回了无效剩余状态。")
         except Exception as error:

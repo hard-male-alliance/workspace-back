@@ -329,6 +329,7 @@ def test_composition_passes_only_migrator_and_nonsecret_blueprint_to_adapter(
     """
 
     secret = "migrator-config:@/%雪"
+
     def reject_unrelated_adapter(*_arguments: object, **_keywords: object) -> object:
         """@brief 禁止 migration 组合构造无关 adapter / Reject unrelated adapter construction.
 
