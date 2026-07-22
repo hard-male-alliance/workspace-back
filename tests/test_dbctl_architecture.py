@@ -100,6 +100,38 @@ def test_core_layers_never_import_infrastructure_or_interfaces() -> None:
     assert violations == [], "核心层发生依赖倒置：\n" + "\n".join(violations)
 
 
+def test_interfaces_never_import_infrastructure_adapters() -> None:
+    """@brief 接口层必须经 composition 使用 adapter / Interfaces reach adapters through composition.
+
+    @return 无返回值 / No return value.
+    @note 该护栏防止容器等进程入口重新承担基础设施编排职责。
+    / This guard prevents process entrypoints such as the container interface from reclaiming
+    infrastructure orchestration responsibilities.
+    """
+
+    violations: list[str] = []
+    for source in _python_sources("interfaces"):
+        for imported in _resolved_imports(source):
+            if imported == "dbctl.infrastructure" or imported.startswith("dbctl.infrastructure."):
+                violations.append(f"{source.relative_to(PROJECT_ROOT)} -> {imported}")
+    assert violations == [], "interfaces 不得直接导入 infrastructure：\n" + "\n".join(violations)
+
+
+def test_infrastructure_never_imports_interfaces_or_composition_root() -> None:
+    """@brief 基础设施不得依赖呈现层或组合根 / Infrastructure cannot depend on presentation or composition.
+
+    @return 无返回值 / No return value.
+    """
+
+    forbidden = ("dbctl.interfaces", "dbctl.composition")
+    violations: list[str] = []
+    for source in _python_sources("infrastructure"):
+        for imported in _resolved_imports(source):
+            if any(imported == prefix or imported.startswith(f"{prefix}.") for prefix in forbidden):
+                violations.append(f"{source.relative_to(PROJECT_ROOT)} -> {imported}")
+    assert violations == [], "infrastructure 发生向外依赖：\n" + "\n".join(violations)
+
+
 def test_legacy_flat_dbctl_modules_are_removed() -> None:
     """@brief 分层实现不得与旧平铺实现并存 / Layered and legacy flat implementations must not coexist.
 

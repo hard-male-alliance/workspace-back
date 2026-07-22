@@ -10,6 +10,7 @@ class OperationName(StrEnum):
 
     CONFIGURATION = "configuration"
     BOOTSTRAP = "bootstrap"
+    CONTAINER = "container"
     MIGRATION = "migration"
     PRUNE_TELEMETRY = "prune-telemetry"
     SHELL = "shell"

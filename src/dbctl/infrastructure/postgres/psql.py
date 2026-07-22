@@ -14,9 +14,9 @@ from dbctl.application.errors import (
     BootstrapExecutionError,
     DatabaseAlreadyExistsError,
     DbctlConfigurationError,
-    ExternalDiagnosticError,
     add_safe_diagnostic_note,
     safe_external_cause,
+    safe_process_exit_cause,
 )
 from dbctl.application.provision import (
     BootstrapAccessMode,
@@ -315,7 +315,7 @@ class LocalPsqlBootstrapRunner:
                 env=child_environment,
             )
         except OSError as error:
-            program = os.path.basename(command[0]) or command[0]
+            program = "sudo" if self._access_mode is BootstrapAccessMode.SUDO else "psql"
             raise BootstrapExecutionError(
                 f"无法启动本地程序 {program}；bootstrap 阶段未执行。"
             ) from safe_external_cause(
@@ -323,10 +323,12 @@ class LocalPsqlBootstrapRunner:
                 operation=f"启动 {program} 子进程",
             )
         if completed.returncode != 0:
-            cause_message = f"psql 退出码={completed.returncode}"
             raise BootstrapExecutionError(
                 f"本地 psql 执行 bootstrap SQL 失败（退出码 {completed.returncode}）。"
-            ) from ExternalDiagnosticError(cause_message)
+            ) from safe_process_exit_cause(
+                program="psql",
+                exit_code=completed.returncode,
+            )
         return completed
 
     def _password_lease(self, database: DatabaseName) -> PgpassLease:

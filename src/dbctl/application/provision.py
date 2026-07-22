@@ -19,6 +19,7 @@ from .errors import (
     BootstrapExecutionError,
     DatabaseAlreadyExistsError,
     add_safe_diagnostic_note,
+    safe_exception_matches,
 )
 from .progress import (
     OperationName,
@@ -228,6 +229,43 @@ class BootstrapResult:
                 raise BootstrapExecutionError(f"{label} 必须是非负整数。")
 
 
+@dataclass(slots=True)
+class _BootstrapExecutionState:
+    """@brief bootstrap 生命周期的内部可变状态 / Internal mutable bootstrap lifecycle state.
+
+    @param database_created 本次是否完成条件创建 / Whether conditional creation completed.
+    @param executed_stage_count 已确认完成阶段数 / Confirmed completed stages.
+    @param skipped_stage_count 已确认跳过阶段数 / Confirmed skipped stages.
+    @param executed_statement_count 已确认发送的计划 SQL 数 / Confirmed planned SQL count sent.
+    @param context_entered runner 是否已成功进入 / Whether the runner context was entered.
+    @param plan_processed 全部阶段是否已经处理 / Whether every stage was processed.
+    @param body_failure 交给 ``__exit__`` 的主体异常 / Body failure passed to ``__exit__``.
+    @param stage_failure 已单独报告的阶段异常 / Separately reported stage failure.
+    """
+
+    database_created: bool = False
+    executed_stage_count: int = 0
+    skipped_stage_count: int = 0
+    executed_statement_count: int = 0
+    context_entered: bool = False
+    plan_processed: bool = False
+    body_failure: BaseException | None = None
+    stage_failure: BaseException | None = None
+
+    def to_result(self) -> BootstrapResult:
+        """@brief 冻结已确认计数为公开结果 / Freeze confirmed counters into the public result.
+
+        @return 不含秘密的 bootstrap 摘要 / Secret-free bootstrap summary.
+        """
+
+        return BootstrapResult(
+            database_created=self.database_created,
+            executed_stage_count=self.executed_stage_count,
+            skipped_stage_count=self.skipped_stage_count,
+            executed_statement_count=self.executed_statement_count,
+        )
+
+
 class BootstrapRunner(Protocol):
     """@brief 一个 bootstrap 会话的批量执行端口 / Batch-execution port for one bootstrap session."""
 
@@ -331,10 +369,7 @@ class BootstrapService:
         if not isinstance(access_mode, BootstrapAccessMode):
             raise BootstrapExecutionError("bootstrap access mode 无效。")
 
-        executed_stage_count = 0
-        skipped_stage_count = 0
-        executed_statement_count = 0
-        database_created = False
+        state = _BootstrapExecutionState()
         self._publish(
             ProgressUpdate(
                 operation=OperationName.BOOTSTRAP,
@@ -343,108 +378,413 @@ class BootstrapService:
                 detail=f"请求模式={access_mode.value}",
             )
         )
-        runner_resource = self._runner_factory.open(plan, access_mode)
+        runner_resource = self._open_runner(plan, access_mode)
+        resolved_access_mode = self._resolve_access_mode(runner_resource)
         self._publish(
             ProgressUpdate(
                 operation=OperationName.BOOTSTRAP,
                 state=ProgressState.SUCCEEDED,
                 message="PostgreSQL 管理访问方式已确定",
-                detail=f"实际模式={runner_resource.access_mode.value}",
+                detail=f"实际模式={resolved_access_mode.value}",
             )
         )
-        with runner_resource as runner:
-            total_stages = len(plan.stages)
-            for stage_number, stage in enumerate(plan.stages, start=1):
-                stage_detail = (
-                    f"目标={stage.target.value}；事务={stage.transaction_mode.value}；"
-                    f"SQL={len(stage.statements)} 条"
+        self._run_runner_lifecycle(plan, runner_resource, state)
+        return state.to_result()
+
+    def _open_runner(
+        self,
+        plan: BootstrapPlan,
+        access_mode: BootstrapAccessMode,
+    ) -> BootstrapRunner:
+        """@brief 创建 runner 并报告进入前故障 / Create a runner and report pre-entry failures.
+
+        @param plan 已验证 bootstrap 计划 / Validated bootstrap plan.
+        @param access_mode 操作者请求的访问模式 / Operator-requested access mode.
+        @return 尚未进入上下文的 runner / Runner not yet entered.
+        """
+
+        try:
+            return self._runner_factory.open(plan, access_mode)
+        except (Exception, KeyboardInterrupt) as error:
+            self._report_lifecycle_failure(
+                error,
+                message="创建 PostgreSQL bootstrap runner 失败",
+                impact=self._no_stage_impact(),
+            )
+            raise
+
+    def _resolve_access_mode(
+        self,
+        runner_resource: BootstrapRunner,
+    ) -> BootstrapAccessMode:
+        """@brief 读取并验证 runner 已解析访问模式 / Read and validate resolved runner access.
+
+        @param runner_resource 尚未进入的 runner / Runner not yet entered.
+        @return sudo 或 prompt / ``sudo`` or ``prompt``.
+        """
+
+        try:
+            resolved_access_mode = runner_resource.access_mode
+            if resolved_access_mode is not BootstrapAccessMode.SUDO and (
+                resolved_access_mode is not BootstrapAccessMode.PROMPT
+            ):
+                raise BootstrapExecutionError("bootstrap runner 返回了无效访问模式。")
+        except (Exception, KeyboardInterrupt) as error:
+            self._report_lifecycle_failure(
+                error,
+                message="读取 PostgreSQL 管理访问方式失败",
+                impact=self._no_stage_impact(),
+            )
+            raise
+        return resolved_access_mode
+
+    def _run_runner_lifecycle(
+        self,
+        plan: BootstrapPlan,
+        runner_resource: BootstrapRunner,
+        state: _BootstrapExecutionState,
+    ) -> None:
+        """@brief 在可验证上下文内运行计划 / Run the plan inside a verified context lifecycle.
+
+        @param plan 已验证有序计划 / Validated ordered plan.
+        @param runner_resource 待进入 runner / Runner resource to enter.
+        @param state 本轮内部执行状态 / Internal state for this execution.
+        @return 无返回值 / No return value.
+        """
+
+        try:
+            with runner_resource as runner:
+                state.context_entered = True
+                self._run_context_body(plan, runner, state)
+            self._reject_suppressed_body_failure(state)
+        except (Exception, KeyboardInterrupt) as error:
+            if error is state.body_failure:
+                raise
+            message, impact = self._lifecycle_failure_context(state)
+            self._report_lifecycle_failure(error, message=message, impact=impact)
+            raise
+
+    def _run_context_body(
+        self,
+        plan: BootstrapPlan,
+        runner: BootstrapRunner,
+        state: _BootstrapExecutionState,
+    ) -> None:
+        """@brief 记录交给 ``__exit__`` 的任意受控故障 / Record any controlled body failure.
+
+        @param plan 已验证有序计划 / Validated ordered plan.
+        @param runner 已进入的执行端口 / Entered execution port.
+        @param state 本轮内部执行状态 / Internal execution state.
+        @return 无返回值 / No return value.
+        """
+
+        total_stages = len(plan.stages)
+        try:
+            self._execute_stages(plan, runner, state, total_stages)
+            state.plan_processed = True
+        except (Exception, KeyboardInterrupt) as error:
+            state.body_failure = error
+            if error is not state.stage_failure:
+                self._report_plan_body_failure(error, state)
+            raise
+
+    def _execute_stages(
+        self,
+        plan: BootstrapPlan,
+        runner: BootstrapRunner,
+        state: _BootstrapExecutionState,
+        total_stages: int,
+    ) -> None:
+        """@brief 依次执行并确认每个阶段 / Execute and confirm every stage in order.
+
+        @param plan 已验证计划 / Validated plan.
+        @param runner 已进入的执行端口 / Entered execution port.
+        @param state 本轮内部执行状态 / Internal execution state.
+        @param total_stages 进度输出中的固定阶段总数 / Fixed stage total for progress.
+        @return 无返回值 / No return value.
+        """
+
+        for stage_number, stage in enumerate(plan.stages, start=1):
+            self._publish_stage_started(stage, stage_number, total_stages)
+            try:
+                skip_reason = self._execute_one_stage(plan, runner, stage)
+            except (Exception, KeyboardInterrupt) as error:
+                state.stage_failure = error
+                self._report_stage_failure(
+                    error,
+                    stage,
+                    stage_number,
+                    total_stages,
+                    state,
                 )
-                self._publish(
-                    ProgressUpdate(
-                        operation=OperationName.BOOTSTRAP,
-                        state=ProgressState.STARTED,
-                        message=stage.label,
-                        detail=stage_detail,
-                        current=stage_number,
-                        total=total_stages,
-                    )
+                raise
+            if skip_reason is not None:
+                state.skipped_stage_count += 1
+                self._publish_stage_skipped(
+                    stage,
+                    stage_number,
+                    total_stages,
+                    skip_reason,
                 )
-                try:
-                    if stage.condition is StageCondition.DATABASE_ABSENT:
-                        if runner.database_exists(plan.database):
-                            skipped_stage_count += 1
-                            self._publish(
-                                ProgressUpdate(
-                                    operation=OperationName.BOOTSTRAP,
-                                    state=ProgressState.SKIPPED,
-                                    message=stage.label,
-                                    detail="目标数据库已存在；未执行 CREATE DATABASE",
-                                    current=stage_number,
-                                    total=total_stages,
-                                )
-                            )
-                            continue
-                        try:
-                            runner.execute_stage(stage)
-                        except DatabaseAlreadyExistsError:
-                            skipped_stage_count += 1
-                            self._publish(
-                                ProgressUpdate(
-                                    operation=OperationName.BOOTSTRAP,
-                                    state=ProgressState.SKIPPED,
-                                    message=stage.label,
-                                    detail="并发 bootstrap 已创建目标数据库；安全跳过",
-                                    current=stage_number,
-                                    total=total_stages,
-                                )
-                            )
-                            continue
-                        database_created = True
-                    else:
-                        runner.execute_stage(stage)
-                except Exception as error:
-                    impact = (
-                        f"此前已完成 {executed_stage_count} 个阶段、"
-                        f"执行 {executed_statement_count} 条计划 SQL；"
-                        "当前阶段未计入完成结果，后续阶段未执行"
-                    )
-                    add_safe_diagnostic_note(
-                        error,
-                        f"dbctl bootstrap 阶段 {stage_number}/{total_stages}：{stage.label}。"
-                    )
-                    add_safe_diagnostic_note(error, f"运维影响：{impact}。")
-                    self._publish(
-                        ProgressUpdate(
-                            operation=OperationName.BOOTSTRAP,
-                            state=ProgressState.FAILED,
-                            message=stage.label,
-                            detail=impact,
-                            current=stage_number,
-                            total=total_stages,
-                        )
-                    )
-                    raise
-                executed_stage_count += 1
-                executed_statement_count += len(stage.statements)
-                self._publish(
-                    ProgressUpdate(
-                        operation=OperationName.BOOTSTRAP,
-                        state=ProgressState.SUCCEEDED,
-                        message=stage.label,
-                        detail=(
-                            f"本阶段已提交 {len(stage.statements)} 条计划 SQL；"
-                            f"累计完成 {executed_stage_count} 个阶段"
-                        ),
-                        current=stage_number,
-                        total=total_stages,
-                    )
-                )
-        return BootstrapResult(
-            database_created=database_created,
-            executed_stage_count=executed_stage_count,
-            skipped_stage_count=skipped_stage_count,
-            executed_statement_count=executed_statement_count,
+                continue
+            if stage.condition is StageCondition.DATABASE_ABSENT:
+                state.database_created = True
+            state.executed_stage_count += 1
+            state.executed_statement_count += len(stage.statements)
+            self._publish_stage_succeeded(stage, stage_number, total_stages, state)
+
+    @staticmethod
+    def _execute_one_stage(
+        plan: BootstrapPlan,
+        runner: BootstrapRunner,
+        stage: BootstrapStage,
+    ) -> str | None:
+        """@brief 执行一个阶段并返回可选跳过原因 / Execute one stage and return an optional skip reason.
+
+        @param plan 提供条件创建目标的计划 / Plan providing the conditional-create target.
+        @param runner 已进入的执行端口 / Entered execution port.
+        @param stage 当前阶段 / Current stage.
+        @return 跳过原因，实际执行时为 None / Skip reason, or ``None`` when executed.
+        """
+
+        if stage.condition is not StageCondition.DATABASE_ABSENT:
+            runner.execute_stage(stage)
+            return None
+        if runner.database_exists(plan.database):
+            return "目标数据库已存在；未执行 CREATE DATABASE"
+        try:
+            runner.execute_stage(stage)
+        except DatabaseAlreadyExistsError:
+            return "并发 bootstrap 已创建目标数据库；安全跳过"
+        return None
+
+    def _publish_stage_started(
+        self,
+        stage: BootstrapStage,
+        stage_number: int,
+        total_stages: int,
+    ) -> None:
+        """@brief 发布阶段开始记录 / Publish a stage-start record.
+
+        @param stage 当前阶段 / Current stage.
+        @param stage_number 从一开始的阶段序号 / One-based stage number.
+        @param total_stages 阶段总数 / Total stage count.
+        @return 无返回值 / No return value.
+        """
+
+        detail = (
+            f"目标={stage.target.value}；事务={stage.transaction_mode.value}；"
+            f"SQL={len(stage.statements)} 条"
         )
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.BOOTSTRAP,
+                state=ProgressState.STARTED,
+                message=stage.label,
+                detail=detail,
+                current=stage_number,
+                total=total_stages,
+            )
+        )
+
+    def _publish_stage_skipped(
+        self,
+        stage: BootstrapStage,
+        stage_number: int,
+        total_stages: int,
+        reason: str,
+    ) -> None:
+        """@brief 发布阶段跳过记录 / Publish a stage-skip record.
+
+        @param stage 当前阶段 / Current stage.
+        @param stage_number 从一开始的阶段序号 / One-based stage number.
+        @param total_stages 阶段总数 / Total stage count.
+        @param reason 固定非秘密跳过原因 / Fixed secret-free skip reason.
+        @return 无返回值 / No return value.
+        """
+
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.BOOTSTRAP,
+                state=ProgressState.SKIPPED,
+                message=stage.label,
+                detail=reason,
+                current=stage_number,
+                total=total_stages,
+            )
+        )
+
+    def _publish_stage_succeeded(
+        self,
+        stage: BootstrapStage,
+        stage_number: int,
+        total_stages: int,
+        state: _BootstrapExecutionState,
+    ) -> None:
+        """@brief 发布已计入结果的阶段完成记录 / Publish a stage completion already counted.
+
+        @param stage 当前阶段 / Current stage.
+        @param stage_number 从一开始的阶段序号 / One-based stage number.
+        @param total_stages 阶段总数 / Total stage count.
+        @param state 已更新计数的执行状态 / Execution state with updated counters.
+        @return 无返回值 / No return value.
+        """
+
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.BOOTSTRAP,
+                state=ProgressState.SUCCEEDED,
+                message=stage.label,
+                detail=(
+                    f"本阶段已提交 {len(stage.statements)} 条计划 SQL；"
+                    f"累计完成 {state.executed_stage_count} 个阶段"
+                ),
+                current=stage_number,
+                total=total_stages,
+            )
+        )
+
+    def _report_stage_failure(
+        self,
+        error: BaseException,
+        stage: BootstrapStage,
+        stage_number: int,
+        total_stages: int,
+        state: _BootstrapExecutionState,
+    ) -> None:
+        """@brief 报告阶段故障及保守的已提交影响 / Report a stage failure and conservative impact.
+
+        @param error 将继续传播的故障 / Failure that will keep propagating.
+        @param stage 当前阶段 / Current stage.
+        @param stage_number 从一开始的阶段序号 / One-based stage number.
+        @param total_stages 阶段总数 / Total stage count.
+        @param state 仅含此前已确认计数的状态 / State containing prior confirmed counters only.
+        @return 无返回值 / No return value.
+        """
+
+        current_impact = (
+            "当前阶段完成状态未知，后续阶段未执行"
+            if safe_exception_matches(error, KeyboardInterrupt)
+            else "当前阶段未计入完成结果，后续阶段未执行"
+        )
+        impact = (
+            f"此前已完成 {state.executed_stage_count} 个阶段、"
+            f"执行 {state.executed_statement_count} 条计划 SQL；{current_impact}"
+        )
+        add_safe_diagnostic_note(
+            error,
+            f"dbctl bootstrap 阶段 {stage_number}/{total_stages}：{stage.label}。",
+        )
+        add_safe_diagnostic_note(error, f"运维影响：{impact}。")
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.BOOTSTRAP,
+                state=ProgressState.FAILED,
+                message=stage.label,
+                detail=impact,
+                current=stage_number,
+                total=total_stages,
+            )
+        )
+
+    def _report_plan_body_failure(
+        self,
+        error: BaseException,
+        state: _BootstrapExecutionState,
+    ) -> None:
+        """@brief 报告阶段边界之外的计划主体中断 / Report a plan-body failure outside stage calls.
+
+        @param error 将继续传播的主体故障 / Body failure that will keep propagating.
+        @param state 已确认执行计数 / Confirmed execution counters.
+        @return 无返回值 / No return value.
+        """
+
+        impact = (
+            f"已确认完成 {state.executed_stage_count} 个阶段、"
+            f"执行 {state.executed_statement_count} 条计划 SQL，"
+            f"跳过 {state.skipped_stage_count} 个阶段；"
+            "中断点所在阶段及后续阶段的执行范围未确认"
+        )
+        self._report_lifecycle_failure(
+            error,
+            message="执行 PostgreSQL bootstrap 计划主体失败",
+            impact=impact,
+        )
+
+    def _reject_suppressed_body_failure(self, state: _BootstrapExecutionState) -> None:
+        """@brief 恢复被违约 runner 抑制的主体异常 / Restore a body failure suppressed by a runner.
+
+        @param state 包含主体异常与已确认计数的状态 / State with body failure and confirmed counts.
+        @return 无返回值 / No return value.
+        """
+
+        failure = state.body_failure
+        if failure is None:
+            return
+        stage_was_reported = failure is state.stage_failure
+        subject = "阶段失败" if stage_was_reported else "计划主体失败"
+        message = (
+            "PostgreSQL bootstrap runner 错误抑制了阶段失败"
+            if stage_was_reported
+            else "PostgreSQL bootstrap runner 错误抑制了计划主体失败"
+        )
+        suppressed_failure = "阶段异常" if stage_was_reported else "主体异常"
+        impact = (
+            f"{subject}已经单独报告；此前已完成 {state.executed_stage_count} 个阶段、"
+            f"执行 {state.executed_statement_count} 条计划 SQL；"
+            f"runner 违反端口契约并抑制了{suppressed_failure}"
+        )
+        self._report_lifecycle_failure(failure, message=message, impact=impact)
+        raise failure
+
+    @staticmethod
+    def _lifecycle_failure_context(
+        state: _BootstrapExecutionState,
+    ) -> tuple[str, str]:
+        """@brief 按显式状态分类 runner 生命周期故障 / Classify lifecycle failure from explicit state.
+
+        @param state 故障时执行状态 / Execution state at failure.
+        @return 失败动作及运维影响 / Failure action and operational impact.
+        """
+
+        if not state.context_entered:
+            return "进入 PostgreSQL bootstrap runner 失败", BootstrapService._no_stage_impact()
+        if state.plan_processed:
+            return (
+                "退出 PostgreSQL bootstrap runner 失败",
+                (
+                    f"计划阶段已处理完毕：已提交 {state.executed_stage_count} 个阶段、"
+                    f"执行 {state.executed_statement_count} 条计划 SQL，"
+                    f"跳过 {state.skipped_stage_count} 个阶段；"
+                    "所有需执行阶段均已报告提交，但 runner 清理状态未确认"
+                ),
+            )
+        if state.stage_failure is not None:
+            return (
+                "传播阶段失败时退出 PostgreSQL bootstrap runner 又失败",
+                (
+                    f"阶段失败已经单独报告；此前已完成 {state.executed_stage_count} 个阶段、"
+                    f"执行 {state.executed_statement_count} 条计划 SQL；"
+                    "runner 清理状态未确认"
+                ),
+            )
+        return (
+            "传播计划主体失败时退出 PostgreSQL bootstrap runner 又失败",
+            (
+                f"计划主体失败已经单独报告；此前已完成 {state.executed_stage_count} 个阶段、"
+                f"执行 {state.executed_statement_count} 条计划 SQL；"
+                "runner 清理状态未确认"
+            ),
+        )
+
+    @staticmethod
+    def _no_stage_impact() -> str:
+        """@brief 返回进入前故障的固定影响 / Return the fixed pre-entry impact.
+
+        @return 明确零阶段提交的安全文本 / Safe text declaring zero reported stage commits.
+        """
+
+        return "尚未调用任何计划阶段；未有数据库阶段被本用例报告为已提交"
 
     def _publish(self, update: ProgressUpdate) -> None:
         """@brief 向可选输出端口同步发布进度 / Publish progress synchronously to the optional output port.
@@ -454,6 +794,34 @@ class BootstrapService:
         """
 
         publish_progress(self._progress, update)
+
+    def _report_lifecycle_failure(
+        self,
+        error: BaseException,
+        *,
+        message: str,
+        impact: str,
+    ) -> None:
+        """@brief 报告 runner 生命周期故障而不替换原异常 / Report lifecycle failure without replacing it.
+
+        @param error 将继续传播的原始异常 / Original exception that will keep propagating.
+        @param message 不含 secret 的失败阶段 / Secret-free failed lifecycle phase.
+        @param impact 仅由已提交计数构造的运维影响 / Operational impact built from committed counts only.
+        @return 无返回值 / No return value.
+        @note 不读取异常正文或 Python notes；进度输出仍为 best effort。
+        / The exception message and Python notes are never read; progress remains best effort.
+        """
+
+        add_safe_diagnostic_note(error, f"dbctl bootstrap 生命周期：{message}。")
+        add_safe_diagnostic_note(error, f"运维影响：{impact}。")
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.BOOTSTRAP,
+                state=ProgressState.FAILED,
+                message=message,
+                detail=impact,
+            )
+        )
 
 
 def build_bootstrap_plan(settings: DbctlSettings) -> BootstrapPlan:

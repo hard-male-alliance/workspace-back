@@ -6,6 +6,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
+from dbctl.application.container_startup import ContainerStartupService
 from dbctl.application.migrate import MigrationService
 from dbctl.application.open_shell import OpenShellService
 from dbctl.application.progress import ProgressSink
@@ -14,9 +15,20 @@ from dbctl.application.prune_telemetry import PruneTelemetryService
 from dbctl.domain.database import DbctlSettings
 from dbctl.infrastructure.alembic import AlembicMigrationAdapter
 from dbctl.infrastructure.configuration import DbctlConfigStore
+from dbctl.infrastructure.container_runtime import ContainerRuntimeAdapter
 from dbctl.infrastructure.postgres.psql import LocalPsqlBootstrapRunnerFactory
 from dbctl.infrastructure.postgres.shell import PsqlShellAdapter
 from dbctl.infrastructure.postgres.telemetry import PsycopgTelemetryRetentionAdapter
+
+
+def compose_container(*, progress: ProgressSink | None = None) -> ContainerStartupService:
+    """@brief 只装配容器启动用例 / Compose only the container-startup use case.
+
+    @param progress 可选同步操作者进度端口 / Optional synchronous operator-progress port.
+    @return 容器配置投影与进程替换用例 / Container projection and process-replacement use case.
+    """
+
+    return ContainerStartupService(ContainerRuntimeAdapter(), progress=progress)
 
 
 def compose_bootstrap(
@@ -130,6 +142,7 @@ def _load_settings(
 
 __all__ = [
     "compose_bootstrap",
+    "compose_container",
     "compose_migration",
     "compose_prune_telemetry",
     "compose_shell",

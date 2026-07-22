@@ -300,8 +300,8 @@ def run(
             )
             return _run_shell(arguments, shell_settings, shell_service)
         parser.error("未知 dbctl 子命令。")
-    except KeyboardInterrupt:
-        console.cancelled(command)
+    except KeyboardInterrupt as error:
+        console.cancelled(command, error)
         return 130
     except (ApplicationError, DomainError) as error:
         console.failure(command, error, exit_code=2)
@@ -339,7 +339,7 @@ def _run_bootstrap(
             state=ProgressState.STARTED,
             message="构建幂等最小权限计划",
             detail="仅使用已验证领域设置；尚未连接 PostgreSQL",
-        )
+        ),
     )
     plan = build_bootstrap_plan(settings)
     statement_count = sum(len(stage.statements) for stage in plan.stages)
@@ -350,7 +350,7 @@ def _run_bootstrap(
             state=ProgressState.SUCCEEDED,
             message="幂等最小权限计划已构建",
             detail=f"阶段={len(plan.stages)}；计划 SQL={statement_count} 条",
-        )
+        ),
     )
     if arguments.dry_run:
         _write_result(stdout, render_bootstrap_plan(plan))
@@ -359,7 +359,7 @@ def _run_bootstrap(
         plan,
         access_mode=BootstrapAccessMode(arguments.access_mode),
     )
-    _write_result(stdout, render_bootstrap_result(result, plan))
+    _write_result(stdout, render_bootstrap_result(result))
     return 0
 
 
@@ -381,7 +381,7 @@ def _run_migration(
     revision = MigrationRevision(arguments.revision)
     login = settings.connections.migrator
     service.execute(login, revision, settings)
-    _write_result(stdout, render_migration_result(revision, login))
+    _write_result(stdout, render_migration_result(revision))
     return 0
 
 

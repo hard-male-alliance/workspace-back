@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import errno
+import os
 import stat
+from collections.abc import Mapping
 from contextlib import chdir
 from pathlib import Path
 from typing import Any
@@ -12,7 +15,10 @@ import pytest
 
 from backend.config import BackendSettings
 from dashboard.infrastructure.config import DashboardSettings
+from dbctl.application.container_startup import ContainerLaunchError, ContainerStartupService
+from dbctl.infrastructure.container_runtime import ContainerRuntimeAdapter
 from dbctl.infrastructure.runtime_projection import build_runtime_config, write_runtime_config
+from dbctl.interfaces import container as container_entrypoint
 from dbctl.interfaces.cli import main as dbctl_main
 from workspace_shared.jsonc import ConfigurationError
 
@@ -109,6 +115,476 @@ def test_container_entrypoint_requires_dbctl_bootstrap(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError, match="dbctl bootstrap"):
         build_runtime_config(missing_path, _container_environment())
     assert not missing_path.exists()
+
+
+def test_container_entrypoint_without_command_preserves_exact_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@brief 空命令保持既有精确错误与状态 2 / Empty command preserves the exact error and status two.
+
+    @param capsys pytest 标准流捕获器 / Pytest standard-stream capture.
+    @return 无返回值 / No return value.
+    """
+
+    assert container_entrypoint.main([]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "container entrypoint requires a command\n"
+
+
+def test_container_use_case_rejects_empty_command_before_projection(tmp_path: Path) -> None:
+    """@brief 应用层空 argv 在任何投影前失败 / Application rejects empty argv before projection.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @return 无返回值 / No return value.
+    """
+
+    class ForbiddenRuntimePort:
+        """@brief 任何外部调用都表示不变量检查过晚 / Any external call means validation was late."""
+
+        def project(
+            self,
+            _source: Path,
+            _runtime: Path,
+            _environ: Mapping[str, str],
+        ) -> None:
+            """@brief 拒绝空命令触发配置投影 / Reject projection for an empty command.
+
+            @param _source 未使用持久路径 / Unused persistent path.
+            @param _runtime 未使用运行路径 / Unused runtime path.
+            @param _environ 未使用环境 / Unused environment.
+            @return 永不返回 / Never returns.
+            """
+
+            pytest.fail("空命令不得投影运行配置")
+
+        def replace(
+            self,
+            _command: tuple[str, ...],
+            _environ: Mapping[str, str],
+        ) -> None:
+            """@brief 拒绝空命令触发进程替换 / Reject replacement for an empty command.
+
+            @param _command 未使用 argv / Unused argv.
+            @param _environ 未使用环境 / Unused environment.
+            @return 永不返回 / Never returns.
+            """
+
+            pytest.fail("空命令不得替换进程")
+
+    service = ContainerStartupService(ForbiddenRuntimePort())
+
+    with pytest.raises(ContainerLaunchError, match="运行配置未投影"):
+        service.execute(
+            tmp_path / "source.jsonc",
+            tmp_path / "runtime.jsonc",
+            (),
+            {},
+            source_overridden=False,
+            runtime_overridden=False,
+        )
+
+
+def test_container_entrypoint_projects_before_successful_exec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@brief 入口必须先明示投影，再原样 exec 目标命令 / Entrypoint explicitly projects before execing the target unchanged.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @param monkeypatch pytest 故障注入器 / Pytest fault injector.
+    @param capsys pytest 标准流捕获器 / Pytest standard-stream capture.
+    @return 无返回值 / No return value.
+    """
+
+    source_path = tmp_path / "persistent/config.jsonc"
+    runtime_path = tmp_path / "runtime/config.jsonc"
+    command = ("backend-server", "--serve")
+    calls: list[str] = []
+
+    def fake_write_runtime_config(
+        _adapter: ContainerRuntimeAdapter,
+        source: Path,
+        runtime: Path,
+        environ: Mapping[str, str],
+    ) -> None:
+        """@brief 记录投影参数 / Record projection parameters.
+
+        @param _adapter 未使用的运行时适配器 / Unused runtime adapter.
+        @param source 持久配置路径 / Persistent-configuration path.
+        @param runtime 运行投影路径 / Runtime-projection path.
+        @param environ 容器环境 / Container environment.
+        @return 无返回值 / No return value.
+        """
+
+        calls.append("project")
+        assert source == source_path
+        assert runtime == runtime_path
+        assert environ is os.environ
+
+    def fake_execvpe(
+        _adapter: ContainerRuntimeAdapter,
+        arguments: tuple[str, ...],
+        environ: Mapping[str, str],
+    ) -> None:
+        """@brief 记录保持原样的 exec 边界 / Record the unchanged exec boundary.
+
+        @param _adapter 未使用的运行时适配器 / Unused runtime adapter.
+        @param arguments 未改写的 argv / Unmodified argv.
+        @param environ 容器环境 / Container environment.
+        @return 无返回值 / No return value.
+        """
+
+        calls.append("exec")
+        assert arguments == command
+        assert environ is os.environ
+
+    monkeypatch.setenv("AIWS_SOURCE_CONFIG", str(source_path))
+    monkeypatch.setenv("AIWS_CONFIG", str(runtime_path))
+    monkeypatch.setattr(ContainerRuntimeAdapter, "project", fake_write_runtime_config)
+    monkeypatch.setattr(ContainerRuntimeAdapter, "replace", fake_execvpe)
+
+    assert container_entrypoint.main(command) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert calls == ["project", "exec"]
+    assert "投影容器运行配置" in captured.err
+    assert "容器运行配置已原子投影" in captured.err
+    assert "以 exec 替换容器入口进程" in captured.err
+    assert "argv=2 项" in captured.err
+    assert "命令与参数内容不回显" in captured.err
+    assert str(source_path) not in captured.err
+    assert str(runtime_path) not in captured.err
+
+
+def test_container_runtime_adapter_execvpe_preserves_argv_and_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief 运行时适配器保持 executable、argv 与环境身份 / Runtime adapter preserves executable, argv, and environment identity.
+
+    @param monkeypatch pytest 故障注入器 / Pytest fault injector.
+    @return 无返回值 / No return value.
+    """
+
+    command = ("backend-server", "--serve", "--workers=2")
+    environment = {"AIWS_ENVIRONMENT": "production"}
+    calls: list[tuple[str, tuple[str, ...], Mapping[str, str]]] = []
+
+    def fake_execvpe(
+        executable: str,
+        arguments: tuple[str, ...],
+        environ: Mapping[str, str],
+    ) -> None:
+        """@brief 记录原生 execvpe 调用 / Record the native execvpe call.
+
+        @param executable 目标可执行文件 / Target executable.
+        @param arguments 保持原样的 argv / Unmodified argv.
+        @param environ 保持原样的环境 / Unmodified environment.
+        @return 无返回值 / No return value.
+        """
+
+        calls.append((executable, arguments, environ))
+
+    monkeypatch.setattr(os, "execvpe", fake_execvpe)
+
+    ContainerRuntimeAdapter().replace(command, environment)
+
+    assert calls == [(command[0], command, environment)]
+    assert calls[0][2] is environment
+
+
+def test_container_entrypoint_missing_config_has_safe_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@brief 缺失持久配置时返回 2 并给出可行动的安全栈 / Missing persistent config returns two with an actionable safe stack.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @param monkeypatch pytest 故障注入器 / Pytest fault injector.
+    @param capsys pytest 标准流捕获器 / Pytest standard-stream capture.
+    @return 无返回值 / No return value.
+    """
+
+    missing_path = tmp_path / "missing-config.jsonc"
+    runtime_path = tmp_path / "runtime/config.jsonc"
+
+    def forbidden_execvpe(
+        _adapter: ContainerRuntimeAdapter,
+        _arguments: tuple[str, ...],
+        _environ: Mapping[str, str],
+    ) -> None:
+        """@brief 拒绝在投影失败后启动进程 / Reject process launch after projection failure.
+
+        @param _adapter 未使用的运行时适配器 / Unused runtime adapter.
+        @param _arguments 未使用 argv / Unused argv.
+        @param _environ 未使用环境 / Unused environment.
+        @return 永不返回 / Never returns.
+        """
+
+        pytest.fail("缺失配置时不得调用 execvpe")
+
+    monkeypatch.setenv("AIWS_SOURCE_CONFIG", str(missing_path))
+    monkeypatch.setenv("AIWS_CONFIG", str(runtime_path))
+    monkeypatch.setattr(ContainerRuntimeAdapter, "replace", forbidden_execvpe)
+
+    assert container_entrypoint.main(["backend-server"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "容器运行配置投影失败" in captured.err
+    assert "目标进程尚未启动" in captured.err
+    assert "Traceback（已脱敏" in captured.err
+    assert "ContainerProjectionError" in captured.err
+    assert "ExternalDiagnosticError" in captured.err
+    assert "底层异常类别=builtins.ValueError" in captured.err
+    assert "workspace_shared.jsonc.ConfigurationError" not in captured.err
+    assert "run dbctl bootstrap before starting container services" not in captured.err
+    assert "请先运行 `dbctl bootstrap`" in captured.err
+    assert str(missing_path) not in captured.err
+
+
+def test_container_entrypoint_exec_failure_is_safe_and_preserves_runtime_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@brief exec 失败必须保留状态 1 且隐藏 secret、notes 与控制字符 / Exec failure preserves status one and hides secrets, notes, and controls.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @param monkeypatch pytest 故障注入器 / Pytest fault injector.
+    @param capsys pytest 标准流捕获器 / Pytest standard-stream capture.
+    @return 无返回值 / No return value.
+    """
+
+    opaque_secret = "opaque-container-secret"
+    forged_line = "FORGED-SUCCESS-LINE"
+    source_path = tmp_path / f"source-{opaque_secret}\x1b[31m.jsonc"
+    runtime_path = tmp_path / f"runtime-{opaque_secret}\x1b[2J.jsonc"
+    raw_error = FileNotFoundError(
+        errno.ENOENT,
+        f"{opaque_secret}\x1b[31m{forged_line}",
+    )
+    raw_error.add_note(
+        f"postgresql://operator:{opaque_secret}@db.example.test:5432/aiws\n{forged_line}"
+    )
+
+    def fake_write_runtime_config(
+        _adapter: ContainerRuntimeAdapter,
+        _source: Path,
+        _runtime: Path,
+        _environ: Mapping[str, str],
+    ) -> None:
+        """@brief 模拟已完成的原子投影 / Simulate a completed atomic projection.
+
+        @param _adapter 未使用的运行时适配器 / Unused runtime adapter.
+        @param _source 未使用持久路径 / Unused persistent path.
+        @param _runtime 未使用运行路径 / Unused runtime path.
+        @param _environ 未使用环境 / Unused environment.
+        @return 无返回值 / No return value.
+        """
+
+    def failing_execvpe(
+        _adapter: ContainerRuntimeAdapter,
+        _arguments: tuple[str, ...],
+        _environ: Mapping[str, str],
+    ) -> None:
+        """@brief 注入含敏感消息与伪造 notes 的 exec 失败 / Inject exec failure with sensitive text and forged notes.
+
+        @param _adapter 未使用的运行时适配器 / Unused runtime adapter.
+        @param _arguments 未使用 argv / Unused argv.
+        @param _environ 未使用环境 / Unused environment.
+        @return 永不返回 / Never returns.
+        @raise FileNotFoundError 固定含敏感内容的启动失败 / Fixed launch failure with sensitive content.
+        """
+
+        raise raw_error
+
+    monkeypatch.setenv("AIWS_SOURCE_CONFIG", str(source_path))
+    monkeypatch.setenv("AIWS_CONFIG", str(runtime_path))
+    monkeypatch.setattr(ContainerRuntimeAdapter, "project", fake_write_runtime_config)
+    monkeypatch.setattr(ContainerRuntimeAdapter, "replace", failing_execvpe)
+
+    assert (
+        container_entrypoint.main(
+            ["backend-server", f"--token={opaque_secret}", f"\x1b[32m{forged_line}"]
+        )
+        == 1
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "容器运行配置已原子投影" in captured.err
+    assert "容器目标进程启动失败" in captured.err
+    assert "运行配置已投影" in captured.err
+    assert "目标进程未启动" in captured.err
+    assert "ExternalDiagnosticError" in captured.err
+    assert "builtins.FileNotFoundError" in captured.err
+    assert "errno=2" in captured.err
+    assert "命令是否存在及容器用户执行权限" in captured.err
+    assert opaque_secret not in captured.err
+    assert forged_line not in captured.err
+    assert "postgresql://" not in captured.err
+    assert "\x1b" not in captured.err
+
+
+def test_container_entrypoint_unknown_projection_failure_hides_untrusted_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@brief 未知投影故障保留栈和部分状态但隐藏任意文本 / Unknown projection failure preserves stack and partial state while hiding arbitrary text.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @param monkeypatch pytest 故障注入器 / Pytest fault injector.
+    @param capsys pytest 标准流捕获器 / Pytest standard-stream capture.
+    @return 无返回值 / No return value.
+    """
+
+    opaque_secret = "unknown-projection-secret"
+    forged_line = "FORGED-PROJECTION-SUCCESS"
+    raw_error = RuntimeError(f"{opaque_secret}\x1b[2J{forged_line}")
+    raw_error.add_note(
+        f"postgresql://operator:{opaque_secret}@db.example.test:5432/aiws\n{forged_line}"
+    )
+    calls: list[str] = []
+
+    def failing_project(
+        _adapter: ContainerRuntimeAdapter,
+        _source: Path,
+        _runtime: Path,
+        _environ: Mapping[str, str],
+    ) -> None:
+        """@brief 注入含任意文本的未知投影故障 / Inject an unknown projection failure with arbitrary text.
+
+        @param _adapter 未使用的运行时适配器 / Unused runtime adapter.
+        @param _source 未使用持久路径 / Unused persistent path.
+        @param _runtime 未使用运行路径 / Unused runtime path.
+        @param _environ 未使用环境 / Unused environment.
+        @return 永不返回 / Never returns.
+        @raise RuntimeError 固定未知故障 / Fixed unknown failure.
+        """
+
+        calls.append("project")
+        raise raw_error
+
+    def forbidden_replace(
+        _adapter: ContainerRuntimeAdapter,
+        _arguments: tuple[str, ...],
+        _environ: Mapping[str, str],
+    ) -> None:
+        """@brief 拒绝在未知投影故障后替换进程 / Reject replacement after unknown projection failure.
+
+        @param _adapter 未使用的运行时适配器 / Unused runtime adapter.
+        @param _arguments 未使用 argv / Unused argv.
+        @param _environ 未使用环境 / Unused environment.
+        @return 永不返回 / Never returns.
+        """
+
+        pytest.fail("投影失败后不得替换进程")
+
+    source_path = tmp_path / f"source-{opaque_secret}\x1b[31m.jsonc"
+    runtime_path = tmp_path / f"runtime-{opaque_secret}\x1b[2J.jsonc"
+    monkeypatch.setenv("AIWS_SOURCE_CONFIG", str(source_path))
+    monkeypatch.setenv("AIWS_CONFIG", str(runtime_path))
+    monkeypatch.setattr(ContainerRuntimeAdapter, "project", failing_project)
+    monkeypatch.setattr(ContainerRuntimeAdapter, "replace", forbidden_replace)
+
+    assert container_entrypoint.main(["backend-server", f"--token={opaque_secret}"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert calls == ["project"]
+    assert "容器运行配置投影失败" in captured.err
+    assert "运行配置投影未报告完成" in captured.err
+    assert "目标进程尚未启动" in captured.err
+    assert "未预期的 builtins.RuntimeError" in captured.err
+    assert "builtins.RuntimeError" in captured.err
+    assert "容器运行配置已原子投影" not in captured.err
+    assert opaque_secret not in captured.err
+    assert forged_line not in captured.err
+    assert "postgresql://" not in captured.err
+    assert "\x1b" not in captured.err
+
+
+def test_container_entrypoint_unknown_launch_failure_reports_completed_projection_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@brief 未知 exec 故障隐藏任意文本并明确投影已完成 / Unknown exec failure hides arbitrary text and states projection completion.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @param monkeypatch pytest 故障注入器 / Pytest fault injector.
+    @param capsys pytest 标准流捕获器 / Pytest standard-stream capture.
+    @return 无返回值 / No return value.
+    """
+
+    opaque_secret = "unknown-launch-secret"
+    forged_line = "FORGED-LAUNCH-SUCCESS"
+    raw_error = RuntimeError(f"{opaque_secret}\x1b]2;{forged_line}\x07")
+    raw_error.add_note(f"password={opaque_secret}\n{forged_line}\x1b[32m")
+    calls: list[str] = []
+
+    def successful_project(
+        _adapter: ContainerRuntimeAdapter,
+        _source: Path,
+        _runtime: Path,
+        environ: Mapping[str, str],
+    ) -> None:
+        """@brief 记录成功投影 / Record a successful projection.
+
+        @param _adapter 未使用的运行时适配器 / Unused runtime adapter.
+        @param _source 未使用持久路径 / Unused persistent path.
+        @param _runtime 未使用运行路径 / Unused runtime path.
+        @param environ 保持原样的环境 / Unmodified environment.
+        @return 无返回值 / No return value.
+        """
+
+        calls.append("project")
+        assert environ is os.environ
+
+    def failing_replace(
+        _adapter: ContainerRuntimeAdapter,
+        arguments: tuple[str, ...],
+        environ: Mapping[str, str],
+    ) -> None:
+        """@brief 注入含任意文本的未知 exec 故障 / Inject an unknown exec failure with arbitrary text.
+
+        @param _adapter 未使用的运行时适配器 / Unused runtime adapter.
+        @param arguments 保持原样的 argv / Unmodified argv.
+        @param environ 保持原样的环境 / Unmodified environment.
+        @return 永不返回 / Never returns.
+        @raise RuntimeError 固定未知故障 / Fixed unknown failure.
+        """
+
+        calls.append("exec")
+        assert arguments == ("backend-server", f"--token={opaque_secret}")
+        assert environ is os.environ
+        raise raw_error
+
+    monkeypatch.setenv("AIWS_SOURCE_CONFIG", str(tmp_path / "source.jsonc"))
+    monkeypatch.setenv("AIWS_CONFIG", str(tmp_path / "runtime.jsonc"))
+    monkeypatch.setattr(ContainerRuntimeAdapter, "project", successful_project)
+    monkeypatch.setattr(ContainerRuntimeAdapter, "replace", failing_replace)
+
+    assert container_entrypoint.main(["backend-server", f"--token={opaque_secret}"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert calls == ["project", "exec"]
+    assert "容器运行配置已原子投影" in captured.err
+    assert "容器目标进程启动失败" in captured.err
+    assert "运行配置已原子投影" in captured.err
+    assert "目标进程尚未启动" in captured.err
+    assert "未预期的 builtins.RuntimeError" in captured.err
+    assert "builtins.RuntimeError" in captured.err
+    assert opaque_secret not in captured.err
+    assert forged_line not in captured.err
+    assert "password=" not in captured.err
+    assert "\x1b" not in captured.err
 
 
 def test_default_runtime_projection_keeps_development_mocks(tmp_path: Path) -> None:

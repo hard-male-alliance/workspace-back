@@ -12,6 +12,7 @@ import json5
 from dbctl.application.errors import (
     DbctlConfigurationError,
     add_safe_diagnostic_note,
+    safe_domain_error_message,
     safe_external_cause,
 )
 from dbctl.application.progress import (
@@ -121,7 +122,8 @@ class DbctlConfigStore:
         try:
             return self._load(initialize=False)
         except DomainError as error:
-            wrapped = DbctlConfigurationError(str(error))
+            message = safe_domain_error_message(error) or "数据库配置违反领域约束。"
+            wrapped = DbctlConfigurationError(message)
             add_safe_diagnostic_note(wrapped, self._diagnostic_context(initialize=False))
             self._report_failure(initialize=False)
             raise wrapped from error
@@ -141,7 +143,8 @@ class DbctlConfigStore:
         try:
             return self._load(initialize=True)
         except DomainError as error:
-            wrapped = DbctlConfigurationError(str(error))
+            message = safe_domain_error_message(error) or "数据库配置违反领域约束。"
+            wrapped = DbctlConfigurationError(message)
             add_safe_diagnostic_note(wrapped, self._diagnostic_context(initialize=True))
             self._report_failure(initialize=True)
             raise wrapped from error

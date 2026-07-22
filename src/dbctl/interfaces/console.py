@@ -3,23 +3,35 @@
 from __future__ import annotations
 
 import os
-import traceback
+import sys
 from pathlib import Path
-from typing import TextIO, assert_never
+from types import FrameType, ModuleType
+from typing import Final, TextIO, assert_never
 
 from rich.console import Console
 from rich.text import Text
 
+from dbctl.application.container_startup import ContainerLaunchError, ContainerProjectionError
 from dbctl.application.errors import (
     ApplicationError,
     BootstrapExecutionError,
+    ContainerEntrypointError,
+    DatabaseAlreadyExistsError,
     DbctlConfigurationError,
     ExternalDiagnosticError,
     MigrationExecutionError,
     RetentionExecutionError,
     ShellExecutionError,
     redact_sensitive_text,
+    safe_diagnostic_message_snapshot,
     safe_diagnostic_notes,
+    safe_domain_error_message,
+    safe_exception_category,
+    safe_exception_cause,
+    safe_exception_context,
+    safe_exception_matches,
+    safe_exception_suppresses_context,
+    safe_exception_traceback,
 )
 from dbctl.application.migrate import MigrationRevision
 from dbctl.application.progress import OperationName, ProgressSink, ProgressState, ProgressUpdate
@@ -36,12 +48,18 @@ from dbctl.application.prune_telemetry import (
     PrunePreview,
     RetentionDisabled,
 )
-from dbctl.domain.database import LoginDatabase
-from dbctl.domain.errors import DomainError
+from dbctl.domain.errors import (
+    DomainError,
+    InvalidDatabaseModelError,
+    InvalidNameError,
+    InvalidRetentionPolicyError,
+    InvalidRoleSetError,
+)
 
 _OPERATION_LABELS = {
     OperationName.CONFIGURATION: "配置",
     OperationName.BOOTSTRAP: "bootstrap",
+    OperationName.CONTAINER: "container",
     OperationName.MIGRATION: "migration",
     OperationName.PRUNE_TELEMETRY: "prune-telemetry",
     OperationName.SHELL: "shell",
@@ -55,6 +73,44 @@ _STATE_PRESENTATION = {
     ProgressState.FAILED: ("✗", "失败", "bold red"),
 }
 """@brief 进度状态的符号、文字和颜色 / Symbol, text, and color for each progress state."""
+
+_DBCTL_PACKAGE_ROOT: Final[str] = os.path.realpath(str(Path(__file__).parents[1]))
+"""@brief 唯一允许显示具体栈帧元数据的源码根 / Sole source root whose frame metadata may be shown."""
+
+_MAX_FRAME_PATH_LENGTH: Final[int] = 1_024
+"""@brief 进入路径处理前允许的最大 code filename / Maximum code filename before path processing."""
+
+_MAX_FUNCTION_NAME_LENGTH: Final[int] = 256
+"""@brief 可信函数名的最大字符数 / Maximum characters in a trusted function name."""
+
+_MAX_EXCEPTION_CHAIN_DEPTH: Final[int] = 32
+"""@brief 安全诊断允许遍历的最大异常链深度 / Maximum safe diagnostic chain depth."""
+
+_SAFE_ERROR_LABELS: Final[tuple[tuple[type[BaseException], str], ...]] = (
+    (ApplicationError, "dbctl.application.errors.ApplicationError"),
+    (BootstrapExecutionError, "dbctl.application.errors.BootstrapExecutionError"),
+    (ContainerEntrypointError, "dbctl.application.errors.ContainerEntrypointError"),
+    (
+        ContainerLaunchError,
+        "dbctl.application.container_startup.ContainerLaunchError",
+    ),
+    (
+        ContainerProjectionError,
+        "dbctl.application.container_startup.ContainerProjectionError",
+    ),
+    (DatabaseAlreadyExistsError, "dbctl.application.errors.DatabaseAlreadyExistsError"),
+    (DbctlConfigurationError, "dbctl.application.errors.DbctlConfigurationError"),
+    (DomainError, "dbctl.domain.errors.DomainError"),
+    (ExternalDiagnosticError, "dbctl.application.errors.ExternalDiagnosticError"),
+    (InvalidDatabaseModelError, "dbctl.domain.errors.InvalidDatabaseModelError"),
+    (InvalidNameError, "dbctl.domain.errors.InvalidNameError"),
+    (InvalidRetentionPolicyError, "dbctl.domain.errors.InvalidRetentionPolicyError"),
+    (InvalidRoleSetError, "dbctl.domain.errors.InvalidRoleSetError"),
+    (MigrationExecutionError, "dbctl.application.errors.MigrationExecutionError"),
+    (RetentionExecutionError, "dbctl.application.errors.RetentionExecutionError"),
+    (ShellExecutionError, "dbctl.application.errors.ShellExecutionError"),
+)
+"""@brief 安全应用/领域错误的固定标签 / Fixed labels for safe application and domain errors."""
 
 
 class OperatorConsole(ProgressSink):
@@ -77,9 +133,7 @@ class OperatorConsole(ProgressSink):
         """
 
         color_disabled = (
-            no_color
-            or "NO_COLOR" in os.environ
-            or os.environ.get("TERM", "").casefold() == "dumb"
+            no_color or "NO_COLOR" in os.environ or os.environ.get("TERM", "").casefold() == "dumb"
         )
         self._console = Console(
             file=stderr,
@@ -155,36 +209,49 @@ class OperatorConsole(ProgressSink):
         @param error 带 traceback 的失败对象 / Failure carrying a traceback.
         @param exit_code CLI 将返回的状态 / Status the CLI will return.
         @return 无返回值 / No return value.
-        @note traceback 不捕获 locals；只有完全由安全异常类型组成的显式因果链才会显示。
-        / Tracebacks never capture locals, and a cause chain is shown only when every member is an
-        explicitly safe exception type.
+        @note traceback 不读取 locals、源码行、任意 Python notes 或外部异常正文；
+        只有完全由安全异常类型组成的显式因果链才会显示。/ Tracebacks do not read locals,
+        source lines, arbitrary Python notes, or external exception text; a cause chain is shown
+        only when every member is an explicitly safe exception type.
         """
 
-        safe_error = isinstance(error, (ApplicationError, DomainError))
+        approved_message = _approved_error_message(error)
+        error_label = _safe_exception_label(error)
         reason = (
-            redact_sensitive_text(str(error))
-            if safe_error
-            else f"未预期的 {type(error).__module__}.{type(error).__qualname__}；原始消息已隐藏"
+            approved_message
+            if approved_message is not None
+            else f"未预期的 {error_label}；原始消息已隐藏"
         )
         heading = Text("✗ ", style="bold red")
         heading.append(f"dbctl {_one_line(command)} 未完成", style="bold red")
         heading.append(f"（退出码 {exit_code}）", style="dim")
         self._print(heading)
-        self._print(Text(f"  原因：{type(error).__name__}: {reason}"))
+        self._print(Text(f"  原因：{error_label.rpartition('.')[2]}: {reason}"))
         self._print(Text(f"  建议：{_failure_hint(error, command)}", style="yellow"))
-        self._print(Text("  Traceback（已脱敏；未捕获 locals）：", style="bold red"))
+        self._print(
+            Text(
+                "  Traceback（已脱敏；未读取 locals/源码行/外部异常正文）：",
+                style="bold red",
+            )
+        )
         self._print(Text(_safe_traceback(error)))
 
-    def cancelled(self, command: str) -> None:
+    def cancelled(self, command: str, error: KeyboardInterrupt | None = None) -> None:
         """@brief 报告操作者通过中断取消命令 / Report cancellation through an operator interrupt.
 
         @param command 被取消的子命令 / Cancelled subcommand.
+        @param error 可选中断对象，用于展示 dbctl 构造的安全影响注释。
+        / Optional interrupt carrying dbctl-authored safe impact notes.
         @return 无返回值 / No return value.
         """
 
         self._print(
             Text(f"! dbctl {_one_line(command)} 已由操作者取消（退出码 130）", style="yellow")
         )
+        if error is None:
+            return
+        for note in safe_diagnostic_notes(error):
+            self._print(Text(f"  安全诊断：{note}", style="yellow"))
 
     def _print(self, value: Text) -> None:
         """@brief 尽力写 stderr 且不影响数据库操作 / Write stderr best-effort without affecting operations.
@@ -209,25 +276,14 @@ def render_bootstrap_plan(plan: BootstrapPlan) -> str:
     @return 不含参数原文的可管道化终端文本 / Pipeable terminal text containing no parameter values.
     """
 
-    statement_count = sum(len(stage.statements) for stage in plan.stages)
     lines = [
         "-- dbctl bootstrap dry-run（不执行任何 SQL）",
-        (
-            "-- 目标："
-            f"{plan.database_target.host}:{plan.database_target.port}/{plan.database.value}；"
-            f"{len(plan.stages)} 个阶段，{statement_count} 条计划 SQL。"
-        ),
-        "-- 本地配置初始化可能已完成；本命令未连接 PostgreSQL。",
         "-- 不修改 pg_hba.conf；不创建 PostgreSQL superuser。",
     ]
-    for stage_number, stage in enumerate(plan.stages, start=1):
+    for stage in plan.stages:
         target = "maintenance" if stage.target is ExecutionTarget.MAINTENANCE else "database"
         if stage.condition is StageCondition.DATABASE_ABSENT:
             target += "/conditional"
-        lines.append(
-            f"-- === 阶段 {stage_number}/{len(plan.stages)}：{stage.label} "
-            f"[{target}; {stage.transaction_mode.value}] ==="
-        )
         for statement in stage.statements:
             lines.extend(
                 (
@@ -235,26 +291,18 @@ def render_bootstrap_plan(plan: BootstrapPlan) -> str:
                     _render_redacted_statement(statement),
                 )
             )
-    lines.extend(
-        (
-            "-- dry-run 完成：数据库状态未改变。",
-            "-- 下一步：审阅计划后运行 `dbctl bootstrap`，再运行 `dbctl migrate --revision head`。",
-        )
-    )
     return "\n".join(lines)
 
 
-def render_bootstrap_result(result: BootstrapResult, plan: BootstrapPlan) -> str:
+def render_bootstrap_result(result: BootstrapResult) -> str:
     """@brief 渲染 bootstrap 最终状态与下一步 / Render final bootstrap state and next action.
 
     @param result 不含 secret 的执行结果 / Secret-free execution result.
-    @param plan 本轮执行的不可变计划 / Immutable plan executed in this run.
     @return 保持既有 stdout 契约的单行主结果 / Single-line result preserving the stdout contract.
-    @note 目标、阶段和下一步已由 stderr 进度报告；保留 ``plan`` 参数兼容既有调用。
-    / Target, stage, and next-action detail is reported on stderr; ``plan`` remains for call compatibility.
+    @note 目标、阶段和下一步已由 stderr 进度报告。
+    / Target, stage, and next-action detail is reported on stderr.
     """
 
-    del plan
     database_status = "已创建" if result.database_created else "已存在"
     return (
         f"dbctl bootstrap 完成：目标数据库{database_status}；"
@@ -262,17 +310,15 @@ def render_bootstrap_result(result: BootstrapResult, plan: BootstrapPlan) -> str
     )
 
 
-def render_migration_result(revision: MigrationRevision, login: LoginDatabase) -> str:
+def render_migration_result(revision: MigrationRevision) -> str:
     """@brief 渲染 migration 完成状态 / Render completed migration state.
 
     @param revision 请求并完成的 Alembic 目标 / Requested and completed Alembic target.
-    @param login 本轮使用的 migrator 登录 / Migrator login used by this run.
     @return 保持既有 stdout 契约的单行主结果 / Single-line result preserving the stdout contract.
-    @note 目标与身份已由 stderr 进度报告；保留 ``login`` 参数兼容既有调用。
-    / Target and identity are reported on stderr; ``login`` remains for call compatibility.
+    @note 目标与身份已由 stderr 进度报告。
+    / Target and identity are reported on stderr.
     """
 
-    del login
     return f"dbctl migrate 完成：已升级至 {revision.value}。"
 
 
@@ -284,10 +330,7 @@ def render_prune_outcome(outcome: PruneOutcome) -> str:
     """
 
     if isinstance(outcome, RetentionDisabled):
-        return (
-            "dbctl prune-telemetry：observability.retention_days=0，"
-            "清理已停用；未连接数据库。"
-        )
+        return "dbctl prune-telemetry：observability.retention_days=0，清理已停用；未连接数据库。"
     if isinstance(outcome, PrunePreview):
         return (
             "dbctl prune-telemetry dry-run：不会连接数据库或执行删除；"
@@ -323,85 +366,212 @@ def _render_redacted_statement(statement: SqlStatement) -> str:
 
 
 def _safe_traceback(error: BaseException) -> str:
-    """@brief 构造不捕获 locals 的安全 traceback / Build a safe traceback without captured locals.
+    """@brief 仅遍历原生栈指针构造安全 traceback / Build a safe traceback from raw stack pointers only.
 
     @param error 当前失败 / Current failure.
     @return 保留安全因果链或隐藏未知消息的 traceback / Traceback with a safe chain or hidden unknown message.
+    @note 不构造 ``TracebackException``；该类会读取异常正文、notes 与源码。
+    / ``TracebackException`` is deliberately not constructed because it reads exception text,
+    notes, and source lines.
     """
 
-    if isinstance(error, (ApplicationError, DomainError)):
-        trace = traceback.TracebackException.from_exception(
-            error,
-            capture_locals=False,
-            compact=True,
-        )
-        _discard_untrusted_traceback_notes(trace)
-        rendered = "".join(trace.format(chain=_chain_is_safe(error)))
-    else:
-        stack = "".join(traceback.format_tb(error.__traceback__))
-        error_type = f"{type(error).__module__}.{type(error).__qualname__}"
-        rendered = (
-            "Traceback (most recent call last):\n"
-            f"{stack}{error_type}: <原始异常消息已隐藏；请依据异常类型和栈帧诊断>\n"
-        )
+    errors, relationships = _displayed_exception_chain(error)
+    rendered_parts: list[str] = []
+    for index, current in enumerate(errors):
+        rendered_parts.append(_format_traceback_exception(current))
+        if index < len(relationships):
+            rendered_parts.append(
+                "\n上述安全诊断是后续异常的直接原因。\n\n"
+                if relationships[index] == "cause"
+                else "\n处理上述安全诊断时，又发生了后续异常。\n\n"
+            )
+    rendered = "".join(rendered_parts)
     notes = safe_diagnostic_notes(error)
     if notes:
         rendered += "".join(f"安全诊断：{note}\n" for note in notes)
-    return "\n".join(_redact_traceback_line(line) for line in rendered.splitlines())
+    return rendered.rstrip("\n")
 
 
-def _redact_traceback_line(line: str) -> str:
-    """@brief 脱敏 traceback 行且保留结构缩进 / Redact a traceback line while preserving indentation.
+def _displayed_exception_chain(
+    error: BaseException,
+) -> tuple[tuple[BaseException, ...], tuple[str, ...]]:
+    """@brief 按 traceback 顺序选取可展示异常链 / Select a display-safe exception chain in traceback order.
 
-    @param line 单个 traceback 行 / One traceback line.
-    @return 无控制符但保留前导空白的行 / Control-free line retaining leading whitespace.
+    @param error 顶层失败 / Top-level failure.
+    @return 从最底层到顶层的异常及它们之间的 cause/context 关系。
+    / Exceptions from root to top and the cause/context relationships between them.
     """
 
-    indentation_length = len(line) - len(line.lstrip(" \t"))
-    indentation = line[:indentation_length]
-    content = redact_sensitive_text(line[indentation_length:])
-    return indentation + content
-
-
-def _discard_untrusted_traceback_notes(trace: traceback.TracebackException) -> None:
-    """@brief 从格式化对象递归移除任意 Python notes / Recursively remove arbitrary Python notes.
-
-    @param trace 不捕获 locals 的 traceback 格式化对象 / Traceback formatter without locals.
-    @return 无返回值 / No return value.
-    @note 只有 ``safe_diagnostic_notes`` 返回的 dbctl 专用注释会在随后单独渲染。
-    / Only dbctl-specific notes returned by ``safe_diagnostic_notes`` are rendered separately.
-    """
-
-    trace.__notes__ = None
-    if trace.__cause__ is not None:
-        _discard_untrusted_traceback_notes(trace.__cause__)
-    if trace.__context__ is not None:
-        _discard_untrusted_traceback_notes(trace.__context__)
-    if trace.exceptions is not None:
-        for nested in trace.exceptions:
-            _discard_untrusted_traceback_notes(nested)
-
-
-def _chain_is_safe(error: BaseException) -> bool:
-    """@brief 只允许显式安全异常类型进入显示链 / Allow only explicitly safe types in the displayed chain.
-
-    @param error traceback 顶层异常 / Top-level traceback exception.
-    @return 整条 cause/context 链均安全时为真 / True when every cause/context member is safe.
-    """
-
-    current: BaseException | None = error
+    errors: list[BaseException] = []
+    relationships: list[str] = []
+    current = error
     visited: set[int] = set()
-    while current is not None and id(current) not in visited:
-        visited.add(id(current))
-        if not isinstance(current, (ApplicationError, DomainError, ExternalDiagnosticError)):
-            return False
-        if current.__cause__ is not None:
-            current = current.__cause__
-        elif current.__context__ is not None and not current.__suppress_context__:
-            current = current.__context__
+    while len(errors) < _MAX_EXCEPTION_CHAIN_DEPTH:
+        identity = id(current)
+        if identity in visited or _approved_error_message(current) is None:
+            return (error,), ()
+        visited.add(identity)
+        errors.append(current)
+        cause = safe_exception_cause(current)
+        context = safe_exception_context(current)
+        if cause is not None:
+            relationships.append("cause")
+            current = cause
+        elif context is not None and not safe_exception_suppresses_context(current):
+            relationships.append("context")
+            current = context
         else:
-            current = None
-    return current is None
+            errors.reverse()
+            relationships.reverse()
+            return tuple(errors), tuple(relationships)
+    return (error,), ()
+
+
+def _format_traceback_exception(error: BaseException) -> str:
+    """@brief 只格式化受信任栈帧元数据与已批准消息 / Format trusted frame metadata and approved text only.
+
+    @param error 待格式化异常 / Exception whose traceback is formatted.
+    @return 不含源码行和任意底层消息的文本 / Text without source lines or arbitrary raw messages.
+    """
+
+    lines = ["Traceback (most recent call last):\n"]
+    traceback_value = safe_exception_traceback(error)
+    while traceback_value is not None:
+        lines.append(_format_frame(traceback_value.tb_frame, traceback_value.tb_lineno))
+        traceback_value = traceback_value.tb_next
+    error_label = _safe_exception_label(error)
+    message = _approved_error_message(error)
+    if message is None:
+        message = "<原始异常消息已隐藏；请依据异常类别和受信任栈帧诊断>"
+    lines.append(f"{error_label}: {message}\n")
+    return "".join(lines)
+
+
+def _format_frame(frame: FrameType, line_number: int) -> str:
+    """@brief 仅展示 dbctl package 内可验证的栈帧 / Show verifiable dbctl-package frames only.
+
+    @param frame 原生 Python frame；只验证 globals 字典身份，不读取其值或 locals。
+    / Native Python frame; only its globals-dictionary identity is verified, and locals are not read.
+    @param line_number traceback 记录的正整数行号 / Positive line number recorded by the traceback.
+    @return 可信 dbctl 位置或固定的外部帧占位 / Trusted dbctl location or a fixed external-frame placeholder.
+    """
+
+    location = _trusted_frame_location(frame)
+    if location is None:
+        return f"  <external frame hidden>, line {line_number}\n"
+    safe_path, function_name = location
+    return f'  File "dbctl/{safe_path}", line {line_number}, in {function_name}\n'
+
+
+def _trusted_frame_location(frame: FrameType) -> tuple[str, str] | None:
+    """@brief 以模块 namespace 身份验证 dbctl 栈帧 / Authenticate a dbctl frame by module namespace identity.
+
+    @param frame 待验证原生 frame / Native frame to authenticate.
+    @return package 相对路径与函数名，或固定隐藏信号 None。
+    / Package-relative path and function name, or ``None`` to hide it.
+    @note 仅伪造 ``co_filename`` 不足以通过：frame globals 必须与 ``sys.modules`` 中精确
+    ``ModuleType`` 的 namespace 为同一对象，且 module ``__file__`` 必须匹配 code filename。
+    / Forging ``co_filename`` alone is insufficient: frame globals must be identical to the
+    namespace of an exact ``ModuleType`` in ``sys.modules``, and module ``__file__`` must match.
+    """
+
+    namespace = frame.f_globals
+    module_name = dict.get(namespace, "__name__")
+    if type(module_name) is not str or not (
+        module_name == "dbctl" or module_name.startswith("dbctl.")
+    ):
+        return None
+    module = sys.modules.get(module_name)
+    if type(module) is not ModuleType:
+        return None
+    module_namespace = vars(module)
+    if namespace is not module_namespace:
+        return None
+
+    code = frame.f_code
+    filename = code.co_filename
+    function_name = code.co_name
+    module_file = dict.get(module_namespace, "__file__")
+    if (
+        type(module_file) is not str
+        or not filename
+        or len(filename) > _MAX_FRAME_PATH_LENGTH
+        or not function_name
+        or len(function_name) > _MAX_FUNCTION_NAME_LENGTH
+    ):
+        return None
+    try:
+        normalized = os.path.realpath(os.path.abspath(os.path.normpath(filename)))
+        normalized_module_file = os.path.realpath(os.path.abspath(os.path.normpath(module_file)))
+        if normalized != normalized_module_file:
+            return None
+        within_package = (
+            os.path.commonpath((_DBCTL_PACKAGE_ROOT, normalized)) == _DBCTL_PACKAGE_ROOT
+        )
+        safe_path = os.path.relpath(normalized, _DBCTL_PACKAGE_ROOT).replace(os.sep, "/")
+    except OSError, ValueError:
+        return None
+    if not within_package:
+        return None
+    path_is_safe = bool(safe_path) and all(
+        character.isascii() and (character.isalnum() or character in "._-/")
+        for character in safe_path
+    )
+    function_is_safe = all(
+        character.isascii() and (character.isalnum() or character == "_")
+        for character in function_name
+    )
+    return (safe_path, function_name) if path_is_safe and function_is_safe else None
+
+
+def _safe_exception_label(error: BaseException) -> str:
+    """@brief 从固定映射获取安全异常标签 / Get a safe exception label from fixed mappings.
+
+    @param error 当前失败 / Current failure.
+    @return 内部错误的固定类标签或外部基类分类 / Fixed internal label or external base category.
+    """
+
+    error_type = type(error)
+    for known_type, label in _SAFE_ERROR_LABELS:
+        if error_type is known_type:
+            return label
+    return safe_exception_category(error)
+
+
+def _approved_error_message(error: BaseException) -> str | None:
+    """@brief 一次验证并读取内部错误正文快照 / Validate and read an internal error snapshot once.
+
+    @param error 候选应用或领域错误 / Candidate application or domain error.
+    @return 已脱敏且来源获批的构造快照，其他情况为 None。
+    / Redacted construction snapshot with approved provenance, otherwise ``None``.
+    """
+
+    error_type = type(error)
+    known_type = any(error_type is candidate for candidate, _label in _SAFE_ERROR_LABELS)
+    if not known_type:
+        return None
+    application_snapshot = safe_diagnostic_message_snapshot(error)
+    if application_snapshot is not None:
+        message, allows_external_origin = application_snapshot
+        if allows_external_origin or _trusted_exception_origin(error):
+            return message
+        return None
+    return safe_domain_error_message(error)
+
+
+def _trusted_exception_origin(error: BaseException) -> bool:
+    """@brief 验证异常最终 raise frame 来自真实 dbctl 模块 / Authenticate the final raise frame.
+
+    @param error 待验证异常 / Exception to authenticate.
+    @return traceback 最内层 frame 可信时为真 / True when the innermost traceback frame is trusted.
+    """
+
+    traceback_value = safe_exception_traceback(error)
+    if traceback_value is None:
+        return False
+    while traceback_value.tb_next is not None:
+        traceback_value = traceback_value.tb_next
+    return _trusted_frame_location(traceback_value.tb_frame) is not None
 
 
 def _failure_hint(error: BaseException, command: str) -> str:
@@ -412,17 +582,23 @@ def _failure_hint(error: BaseException, command: str) -> str:
     @return 不含 secret 的修复建议 / Secret-free recovery suggestion.
     """
 
-    if isinstance(error, DbctlConfigurationError):
+    if _approved_error_message(error) is None:
+        return (
+            f"保留这份安全 traceback，并附上 `dbctl {_one_line(command)} --help` 输出提交问题报告。"
+        )
+    if safe_exception_matches(error, DbctlConfigurationError):
         return "检查上方 config/dbinit 路径、JSONC 字段及 config.jsonc 的 owner-only 权限。"
-    if isinstance(error, BootstrapExecutionError):
+    if safe_exception_matches(error, BootstrapExecutionError):
         return "根据失败阶段核验 psql/sudo、PostgreSQL 可达性与管理权限；幂等阶段可修复后重试。"
-    if isinstance(error, MigrationExecutionError):
+    if safe_exception_matches(error, ContainerEntrypointError):
+        return "先确认 dbctl 持久配置可投影；若投影已完成，再检查目标命令与容器用户执行权限。"
+    if safe_exception_matches(error, MigrationExecutionError):
         return "先核验当前 Alembic revision、数据库锁和 migrator 权限，再决定是否重试。"
-    if isinstance(error, RetentionExecutionError):
+    if safe_exception_matches(error, RetentionExecutionError):
         return "先阅读“运维影响”确认已提交批次，再在维护窗口以相同边界重试。"
-    if isinstance(error, ShellExecutionError):
+    if safe_exception_matches(error, ShellExecutionError):
         return "确认本机 psql 可执行、目标可达，并检查临时凭据文件的创建/清理权限。"
-    if isinstance(error, DomainError):
+    if safe_exception_matches(error, DomainError):
         return "修正命令参数或 dbinit 中违反领域约束的值后重新运行。"
     return f"保留这份安全 traceback，并附上 `dbctl {_one_line(command)} --help` 输出提交问题报告。"
 
