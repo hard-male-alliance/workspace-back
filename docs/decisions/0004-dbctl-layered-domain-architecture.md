@@ -6,7 +6,7 @@
 
 ## 背景
 
-原实现已经具备正确的安全意图：bootstrap、migration、遥测清理和交互式 shell
+原实现已经具备正确的安全意图：bootstrap、migration、遥测清理、交互式 shell 和容器启动
 均为显式运维动作，运行时身份相互隔离，secret 不进入命令行或操作者错误信息。
 问题在于领域状态、用例编排、PostgreSQL/Alembic/subprocess 细节和终端展示被压在同一组
 平铺模块中。默认 bootstrap 还会为约 123 条逻辑 SQL 启动约 124 个 `psql` 子进程，
@@ -25,10 +25,10 @@ Eric Evans 的 DDD Reference 强调，应按领域复杂度选择模式，而不
 ```text
 src/dbctl/
 ├── domain/          # 不可变值对象、数据库目标状态和不变量
-├── application/     # 四个用例及其少量 purposeful ports
+├── application/     # 五个用例、与消费者共置的窄端口及强类型进度契约
 ├── infrastructure/  # JSONC、文件、psql、psycopg、Alembic、包资源
-├── interfaces/      # CLI、presenter、容器入口
-├── composition.py   # 唯一组合根
+├── interfaces/      # CLI、操作者控制台、容器入口
+├── composition.py   # 唯一组合根；按命令装配单一能力
 └── __main__.py
 ```
 
@@ -46,13 +46,17 @@ infrastructure ───┘
 
 1. `domain` 只依赖 Python 标准库，不认识路径、JSON、argparse、psycopg、Alembic 或
    subprocess。
-2. `application` 只依赖 `domain`，端口（port）按一次有目的的外部对话定义，而不是按
-   每个函数生成接口。
+2. `application` 只依赖 `domain`，端口（port）按一次有目的的外部对话定义，并与唯一消费
+   它的用例共置，而不是集中放入宽泛的 `ports` 模块或按每个函数生成接口。
 3. `infrastructure` 实现 application ports；`interfaces` 只解析输入、调用用例和展示
    结果，不直接构造 adapter。
-4. `composition.py` 是唯一组合根（composition root），只装配配置与 adapter，不承载
-   领域判断。
+4. `composition.py` 是唯一组合根（composition root），为每个命令分别装配配置、该命令的
+   用例及所需 adapter。它不承载领域判断，也不构造包含所有能力的应用容器。
 5. 通过静态 AST 测试持续执行这些依赖规则；目录命名本身不算架构保证。
+
+操作者进度是 application 的强类型输出端口，不是领域事件或日志记录；stdout、stderr、
+安全 traceback 与退出码的呈现契约见
+[ADR 0005](0005-dbctl-operator-diagnostics.md)。
 
 ## 核心模型
 
@@ -104,7 +108,7 @@ revision ID、链或源码，也不把其中重复的标识符校验提取到运
   混装。
 - **为所有 I/O 建 Repository/UoW**：dbctl 不持久化领域 aggregate，这些抽象没有替换
   轴，只会增加间接层。
-- **引入 DI 框架或 Pydantic 重写领域层**：四个同步用例可由显式构造函数装配；额外框架
+- **引入 DI 框架或 Pydantic 重写领域层**：五个同步用例可由显式构造函数装配；额外框架
   会带来 coercion、错误泄密和生命周期复杂度。
 - **保留旧模块转发 shim**：仓库没有需要兼容的第三方 Python API；转发层会让旧结构与
   新结构长期并存。

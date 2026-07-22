@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from conftest import PROJECT_ROOT
-from dbctl.application.errors import RetentionExecutionError
+from dbctl.application.errors import ExternalDiagnosticError, RetentionExecutionError
 from dbctl.application.prune_telemetry import (
     DeleteTelemetryBatch,
     PruneApplied,
@@ -22,11 +22,11 @@ from dbctl.application.prune_telemetry import (
     RetentionDisabled,
     StaleTelemetryProbe,
 )
-from dbctl.composition import compose_dbctl
+from dbctl.composition import compose_prune_telemetry
 from dbctl.domain.retention import PruneLimits, RetentionPolicy
 from dbctl.infrastructure.postgres.telemetry import PsycopgTelemetryRetentionAdapter
 from dbctl.interfaces.cli import main
-from dbctl.interfaces.presenters import render_prune_outcome
+from dbctl.interfaces.console import render_prune_outcome
 
 
 @dataclass
@@ -176,10 +176,10 @@ def _adapter(config_path: Path) -> PsycopgTelemetryRetentionAdapter:
     @return Psycopg adapter / Psycopg adapter.
     """
 
-    settings = compose_dbctl(
+    settings, _prune = compose_prune_telemetry(
         config_path,
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
-    ).settings
+    )
     return PsycopgTelemetryRetentionAdapter(
         settings.connections.migrator,
         owner_role=settings.blueprint.roles.owner,
@@ -325,11 +325,11 @@ def test_psycopg_adapter_sets_local_owner_and_binds_values(
     assert "password" not in delete_sql
 
 
-def test_psycopg_adapter_hides_driver_secret_and_cause(
+def test_psycopg_adapter_builds_secret_safe_diagnostic_cause(
     monkeypatch: pytest.MonkeyPatch,
     dbctl_config_path: Path,
 ) -> None:
-    """@brief adapter 隐藏驱动错误与异常链 / Adapter hides driver errors and exception chains.
+    """@brief adapter 保留安全驱动异常链 / Adapter retains a secret-safe driver exception chain.
 
     @param monkeypatch pytest 替换夹具 / pytest patch fixture.
     @param dbctl_config_path 隔离私密配置 / Isolated private config.
@@ -351,7 +351,11 @@ def test_psycopg_adapter_hides_driver_secret_and_cause(
     assert "password-sentinel" not in displayed
     assert "postgresql://" not in displayed
     assert "DELETE" not in displayed
-    assert error_info.value.__cause__ is None
+    cause = error_info.value.__cause__
+    assert isinstance(cause, ExternalDiagnosticError)
+    assert cause.__traceback__ is not None
+    assert "password-sentinel" not in str(cause)
+    assert "postgresql://" not in str(cause)
 
 
 def test_cli_consumes_root_retention_and_defaults_to_dry_run(

@@ -9,7 +9,19 @@ from typing import Any, Final
 
 import json5
 
-from dbctl.application.errors import DbctlConfigurationError
+from dbctl.application.errors import (
+    DbctlConfigurationError,
+    add_safe_diagnostic_note,
+    safe_domain_error_message,
+    safe_external_cause,
+)
+from dbctl.application.progress import (
+    OperationName,
+    ProgressSink,
+    ProgressState,
+    ProgressUpdate,
+    publish_progress,
+)
 from dbctl.domain.database import (
     BootstrapAccess,
     ConnectionCatalog,
@@ -59,6 +71,8 @@ class DbctlConfigStore:
         self,
         config_path: Path | str | None = None,
         dbinit_path: Path | str | None = None,
+        *,
+        progress: ProgressSink | None = None,
     ) -> None:
         """@brief 创建配置存储 / Create a configuration store.
 
@@ -66,6 +80,7 @@ class DbctlConfigStore:
         / Private configuration path; None enables current-directory defaults and package fallback.
         @param dbinit_path 数据库目标状态路径；None 使用配置同目录默认值。
         / Database target-state path; None uses the default beside the private configuration.
+        @param progress 可选同步进度输出端口 / Optional synchronous progress output port.
         """
 
         uses_default_config = config_path is None
@@ -76,6 +91,7 @@ class DbctlConfigStore:
             else Path(dbinit_path)
         )
         self._allow_packaged_dbinit_fallback = uses_default_config and dbinit_path is None
+        self._progress = progress
 
     @property
     def config_path(self) -> Path:
@@ -106,7 +122,15 @@ class DbctlConfigStore:
         try:
             return self._load(initialize=False)
         except DomainError as error:
-            raise DbctlConfigurationError(str(error)) from error
+            message = safe_domain_error_message(error) or "数据库配置违反领域约束。"
+            wrapped = DbctlConfigurationError(message)
+            add_safe_diagnostic_note(wrapped, self._diagnostic_context(initialize=False))
+            self._report_failure(initialize=False)
+            raise wrapped from error
+        except Exception as error:
+            add_safe_diagnostic_note(error, self._diagnostic_context(initialize=False))
+            self._report_failure(initialize=False)
+            raise
 
     def initialize(self) -> DbctlSettings:
         """@brief 在内存完成配置后一次原子提交 / Complete configuration in memory and commit it atomically once.
@@ -119,7 +143,15 @@ class DbctlConfigStore:
         try:
             return self._load(initialize=True)
         except DomainError as error:
-            raise DbctlConfigurationError(str(error)) from error
+            message = safe_domain_error_message(error) or "数据库配置违反领域约束。"
+            wrapped = DbctlConfigurationError(message)
+            add_safe_diagnostic_note(wrapped, self._diagnostic_context(initialize=True))
+            self._report_failure(initialize=True)
+            raise wrapped from error
+        except Exception as error:
+            add_safe_diagnostic_note(error, self._diagnostic_context(initialize=True))
+            self._report_failure(initialize=True)
+            raise
 
     def _load(self, *, initialize: bool) -> DbctlSettings:
         """@brief 按显式副作用权限加载配置 / Load configuration under explicit side-effect permission.
@@ -128,9 +160,41 @@ class DbctlConfigStore:
         @return 类型化设置 / Typed settings.
         """
 
+        dbinit_source = (
+            str(self._dbinit_path)
+            if self._dbinit_path.is_file() or not self._allow_packaged_dbinit_fallback
+            else "内置资源 dbinit.jsonc"
+        )
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.CONFIGURATION,
+                state=ProgressState.STARTED,
+                message="读取数据库目标声明",
+                detail=f"来源={dbinit_source}",
+            )
+        )
         dbinit = self._load_dbinit_mapping()
         blueprint, access, target = _decode_database_declaration(dbinit)
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.CONFIGURATION,
+                state=ProgressState.SUCCEEDED,
+                message="数据库目标声明已验证",
+                detail=(
+                    f"目标={target.host}:{target.port}/{target.database.value}；"
+                    f"受管角色=owner/migrator/app/dashboard"
+                ),
+            )
+        )
         config_was_missing = not self._config_path.is_file()
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.CONFIGURATION,
+                state=ProgressState.STARTED,
+                message=("初始化私密运行配置" if initialize else "只读加载私密运行配置"),
+                detail=f"路径={self._config_path}",
+            )
+        )
         if config_was_missing:
             if not initialize:
                 raise DbctlConfigurationError(f"dbctl 配置文件不存在：{self._config_path}")
@@ -139,14 +203,67 @@ class DbctlConfigStore:
             root = self._load_mapping_file(self._config_path, "dbctl 配置")
         if not initialize:
             self._validate_private_permissions()
-        changed = _ensure_database_dsns(root, blueprint, target) if initialize else False
+        generated_credentials = _ensure_database_dsns(root, blueprint, target) if initialize else 0
         settings = _decode_private_settings(root, blueprint, access, target)
         if initialize:
-            if config_was_missing or changed:
+            if config_was_missing or generated_credentials:
                 self._write_private_root(root)
             else:
                 self._tighten_private_permissions()
+            if config_was_missing:
+                message = "私密运行配置已创建"
+            elif generated_credentials:
+                message = "私密运行配置已补全"
+            else:
+                message = "私密运行配置已验证并收紧权限"
+            detail = f"路径={self._config_path}；生成凭据={generated_credentials} 组；权限=0600"
+        else:
+            message = "私密运行配置已只读加载"
+            detail = f"路径={self._config_path}；未写入文件"
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.CONFIGURATION,
+                state=ProgressState.SUCCEEDED,
+                message=message,
+                detail=detail,
+            )
+        )
         return settings
+
+    def _diagnostic_context(self, *, initialize: bool) -> str:
+        """@brief 构造不含 secret 的配置失败上下文 / Build secret-free configuration-failure context.
+
+        @param initialize 是否允许配置初始化副作用 / Whether initialization side effects were authorized.
+        @return 可附着到 traceback 的安全 note / Safe note suitable for a traceback.
+        """
+
+        mode = "初始化" if initialize else "只读加载"
+        return f"dbctl 配置{mode}失败：config={self._config_path}；dbinit={self._dbinit_path}。"
+
+    def _report_failure(self, *, initialize: bool) -> None:
+        """@brief 发布不读取异常正文的配置失败事件 / Publish a failure without reading exception text.
+
+        @param initialize 是否允许配置初始化副作用 / Whether initialization side effects were authorized.
+        @return 无返回值 / No return value.
+        """
+
+        self._publish(
+            ProgressUpdate(
+                operation=OperationName.CONFIGURATION,
+                state=ProgressState.FAILED,
+                message=("私密运行配置初始化失败" if initialize else "私密运行配置只读加载失败"),
+                detail=f"路径={self._config_path}；请查看下方安全 traceback",
+            )
+        )
+
+    def _publish(self, update: ProgressUpdate) -> None:
+        """@brief 向可选输出端口同步发布进度 / Publish progress synchronously to the optional output port.
+
+        @param update 已验证且不含 secret 的进度 / Validated secret-free progress update.
+        @return 无返回值 / No return value.
+        """
+
+        publish_progress(self._progress, update)
 
     def _load_dbinit_mapping(self) -> dict[str, Any]:
         """@brief 读取显式 dbinit 或内置默认目标 / Read explicit dbinit or the bundled default target.
@@ -172,7 +289,12 @@ class DbctlConfigStore:
             try:
                 text = template_path.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as error:
-                raise DbctlConfigurationError("无法读取 example.jsonc 初始化模板。") from error
+                raise DbctlConfigurationError(
+                    "无法读取 example.jsonc 初始化模板。"
+                ) from safe_external_cause(
+                    error,
+                    operation="读取 example.jsonc 初始化模板",
+                )
         else:
             text = read_default_text("example.jsonc")
         return self._load_mapping_text(text, "example.jsonc")
@@ -188,7 +310,12 @@ class DbctlConfigStore:
         try:
             mode = self._config_path.stat().st_mode & 0o777
         except OSError as error:
-            raise DbctlConfigurationError("无法检查 config.jsonc 文件权限。") from error
+            raise DbctlConfigurationError(
+                "无法检查 config.jsonc 文件权限。"
+            ) from safe_external_cause(
+                error,
+                operation="检查 config.jsonc 文件权限",
+            )
         if mode & 0o077:
             raise DbctlConfigurationError(
                 "config.jsonc 权限必须为 owner-only，拒绝读取可外泄的数据库密码。"
@@ -203,7 +330,12 @@ class DbctlConfigStore:
         try:
             self._config_path.chmod(0o600)
         except OSError as error:
-            raise DbctlConfigurationError("无法收紧 config.jsonc 文件权限。") from error
+            raise DbctlConfigurationError(
+                "无法收紧 config.jsonc 文件权限。"
+            ) from safe_external_cause(
+                error,
+                operation="将 config.jsonc 权限收紧为 0600",
+            )
 
     def _write_private_root(self, root: Mapping[str, Any]) -> None:
         """@brief 序列化并安全替换完整私密配置 / Serialize and securely replace the complete private configuration.
@@ -216,7 +348,10 @@ class DbctlConfigStore:
         try:
             atomic_write_private_text(self._config_path, content)
         except OSError as error:
-            raise DbctlConfigurationError("无法写入私密 config.jsonc。") from error
+            raise DbctlConfigurationError("无法写入私密 config.jsonc。") from safe_external_cause(
+                error,
+                operation="原子写入私密 config.jsonc",
+            )
 
     @staticmethod
     def _load_mapping_file(path: Path, label: str) -> dict[str, Any]:
@@ -232,7 +367,10 @@ class DbctlConfigStore:
         try:
             content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as error:
-            raise DbctlConfigurationError(f"{label}文件无法解析。") from error
+            raise DbctlConfigurationError(f"{label}文件无法读取。") from safe_external_cause(
+                error,
+                operation=f"读取 {label} 文件",
+            )
         return DbctlConfigStore._load_mapping_text(content, label)
 
     @staticmethod
@@ -247,7 +385,10 @@ class DbctlConfigStore:
         try:
             parsed = json5.loads(content)
         except ValueError as error:
-            raise DbctlConfigurationError(f"{label}文件无法解析。") from error
+            raise DbctlConfigurationError(f"{label}文件无法解析。") from safe_external_cause(
+                error,
+                operation=f"解析 {label} JSONC",
+            )
         if not isinstance(parsed, Mapping):
             raise DbctlConfigurationError(f"{label}根必须是对象。")
         return dict(parsed)
@@ -355,13 +496,13 @@ def _ensure_database_dsns(
     root: dict[str, Any],
     blueprint: DatabaseBlueprint,
     target: DatabaseTarget,
-) -> bool:
+) -> int:
     """@brief 补齐缺失 DSN，保留并验证既有 DSN / Complete missing DSNs while retaining and validating existing ones.
 
     @param root 可变私密配置根对象 / Mutable private configuration root.
     @param blueprint 数据库和 role 目标状态 / Database and role target state.
     @param target 每个 DSN 必须显式匹配的 target / Target every DSN must explicitly match.
-    @return 是否在内存修改了配置 / Whether the configuration changed in memory.
+    @return 本轮生成的独立登录凭据数量 / Number of independent login credentials generated.
     """
 
     raw_database = root.get("database")
@@ -377,7 +518,7 @@ def _ensure_database_dsns(
         (LoginRole.DASHBOARD, "dashboard_dsn", blueprint.roles.dashboard),
     )
     passwords: list[str] = []
-    changed = False
+    generated_credentials = 0
     for role, field_name, role_name in fields:
         raw_dsn = raw_database.get(field_name)
         if isinstance(raw_dsn, str) and raw_dsn.strip():
@@ -396,10 +537,10 @@ def _ensure_database_dsns(
             password=password,
         )
         passwords.append(password.reveal())
-        changed = True
+        generated_credentials += 1
     if len(set(passwords)) != len(passwords):
         raise DbctlConfigurationError("三个登录 role 必须使用互不相同的密码。")
-    return changed
+    return generated_credentials
 
 
 def _decode_schema_catalog(administration: Mapping[str, Any]) -> tuple[SchemaName, ...]:

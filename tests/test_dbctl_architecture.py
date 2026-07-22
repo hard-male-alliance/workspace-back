@@ -100,6 +100,38 @@ def test_core_layers_never_import_infrastructure_or_interfaces() -> None:
     assert violations == [], "核心层发生依赖倒置：\n" + "\n".join(violations)
 
 
+def test_interfaces_never_import_infrastructure_adapters() -> None:
+    """@brief 接口层必须经 composition 使用 adapter / Interfaces reach adapters through composition.
+
+    @return 无返回值 / No return value.
+    @note 该护栏防止容器等进程入口重新承担基础设施编排职责。
+    / This guard prevents process entrypoints such as the container interface from reclaiming
+    infrastructure orchestration responsibilities.
+    """
+
+    violations: list[str] = []
+    for source in _python_sources("interfaces"):
+        for imported in _resolved_imports(source):
+            if imported == "dbctl.infrastructure" or imported.startswith("dbctl.infrastructure."):
+                violations.append(f"{source.relative_to(PROJECT_ROOT)} -> {imported}")
+    assert violations == [], "interfaces 不得直接导入 infrastructure：\n" + "\n".join(violations)
+
+
+def test_infrastructure_never_imports_interfaces_or_composition_root() -> None:
+    """@brief 基础设施不得依赖呈现层或组合根 / Infrastructure cannot depend on presentation or composition.
+
+    @return 无返回值 / No return value.
+    """
+
+    forbidden = ("dbctl.interfaces", "dbctl.composition")
+    violations: list[str] = []
+    for source in _python_sources("infrastructure"):
+        for imported in _resolved_imports(source):
+            if any(imported == prefix or imported.startswith(f"{prefix}.") for prefix in forbidden):
+                violations.append(f"{source.relative_to(PROJECT_ROOT)} -> {imported}")
+    assert violations == [], "infrastructure 发生向外依赖：\n" + "\n".join(violations)
+
+
 def test_legacy_flat_dbctl_modules_are_removed() -> None:
     """@brief 分层实现不得与旧平铺实现并存 / Layered and legacy flat implementations must not coexist.
 
@@ -110,6 +142,30 @@ def test_legacy_flat_dbctl_modules_are_removed() -> None:
         path.name for path in _DBCTL_ROOT.glob("*.py") if path.name in _LEGACY_FLAT_MODULES
     )
     assert remaining == [], "仍存在旧 dbctl 平铺模块：\n" + "\n".join(remaining)
+
+
+def test_core_packages_do_not_reexport_barrel_apis() -> None:
+    """@brief 核心层 package 仅作标记，不集中转发 API / Core packages are markers, not API barrels.
+
+    @return 无返回值 / No return value.
+    """
+
+    violations: list[str] = []
+    for layer in ("application", "domain"):
+        source = _DBCTL_ROOT / layer / "__init__.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        if any(isinstance(node, (ast.Import, ast.ImportFrom)) for node in ast.walk(tree)):
+            violations.append(str(source.relative_to(PROJECT_ROOT)))
+    assert violations == [], "核心层不得维护集中导出面：\n" + "\n".join(violations)
+
+
+def test_application_ports_are_colocated_with_their_use_cases() -> None:
+    """@brief 禁止恢复与用例割裂的集中 ports 模块 / Keep ports colocated with use cases.
+
+    @return 无返回值 / No return value.
+    """
+
+    assert not (_DBCTL_ROOT / "application" / "ports.py").exists()
 
 
 def _invalid_imports(

@@ -3,7 +3,7 @@
 from alembic import command
 from alembic.config import Config
 
-from dbctl.application.errors import MigrationExecutionError
+from dbctl.application.errors import MigrationExecutionError, safe_external_cause
 from dbctl.application.migrate import MigrationRevision
 from dbctl.domain.database import DatabaseBlueprint, MigratorLogin
 from dbctl.infrastructure.resources import alembic_script_location
@@ -44,10 +44,13 @@ class AlembicMigrationAdapter:
                 configuration.set_main_option("aiws.app_role", roles.application.value)
                 configuration.set_main_option("aiws.dashboard_role", roles.dashboard.value)
                 command.upgrade(configuration, revision.value)
-        except Exception:
+        except Exception as error:
             raise MigrationExecutionError(
-                "Alembic migration 失败；底层数据库详情已隐藏。"
-            ) from None
+                f"Alembic upgrade 未能完成目标 revision {revision.value}。"
+            ) from safe_external_cause(
+                error,
+                operation="执行 Alembic upgrade",
+            )
 
 
 __all__ = ["AlembicMigrationAdapter"]

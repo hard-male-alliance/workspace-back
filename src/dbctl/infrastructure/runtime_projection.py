@@ -9,18 +9,12 @@ from typing import Any, Final
 
 import json5
 
-from workspace_shared.jsonc import ConfigurationError, load_jsonc, require_mapping
+from workspace_shared.jsonc import ConfigurationError, require_mapping
 
 from .private_files import atomic_write_private_text
 
 _PRIVATE_DIRECTORY_MODE: Final[int] = 0o700
 """@brief 运行投影父目录的创建权限 / Creation mode for the runtime projection directory."""
-
-
-def validate_runtime_config(config_path: Path) -> None:
-    """Validate the single private runtime configuration without rewriting it."""
-
-    load_jsonc(config_path)
 
 
 def build_runtime_config(
@@ -101,6 +95,9 @@ def build_runtime_config(
         value = _optional_text(environ, environment_name)
         if value is not None:
             ai[field_name] = value
+    api_key = _optional_text(environ, "AIWS_LLM_API_KEY")
+    if api_key is not None:
+        ai["api_key"] = api_key
     root["ai"] = ai
 
     logging = require_mapping(root.get("logging"), "logging")
@@ -115,7 +112,9 @@ def build_runtime_config(
     if identity_mode is not None:
         security["identity_mode"] = identity_mode
     if security.get("identity_mode") == "trusted_proxy_hmac":
-        _required_text(environ, "AIWS_TRUSTED_PROXY_HMAC_SECRET")
+        security["trusted_proxy_hmac_secret"] = _required_text(
+            environ, "AIWS_TRUSTED_PROXY_HMAC_SECRET"
+        )
     root["security"] = security
 
     dashboard = require_mapping(root.get("dashboard"), "dashboard")
@@ -124,6 +123,9 @@ def build_runtime_config(
     dashboard["api"] = dashboard_api
     dashboard_access = require_mapping(dashboard.get("access"), "dashboard.access")
     dashboard_access["mode"] = "operator_token"
+    dashboard_token = _optional_text(environ, "AIWS_DASHBOARD_OPERATOR_TOKEN")
+    if dashboard_token is not None:
+        dashboard_access["token"] = dashboard_token
     dashboard["access"] = dashboard_access
     root["dashboard"] = dashboard
     return root

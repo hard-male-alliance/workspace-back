@@ -14,6 +14,9 @@ from dbctl.application.errors import (
     BootstrapExecutionError,
     DatabaseAlreadyExistsError,
     DbctlConfigurationError,
+    add_safe_diagnostic_note,
+    safe_external_cause,
+    safe_process_exit_cause,
 )
 from dbctl.application.provision import (
     BootstrapAccessMode,
@@ -159,6 +162,11 @@ class LocalPsqlBootstrapRunner:
         except BootstrapExecutionError:
             if exception is None:
                 raise
+            add_safe_diagnostic_note(
+                exception,
+                "安全影响：bootstrap 主故障之后，至少一个临时 PGPASSFILE 清理失败；"
+                "请检查系统临时目录并按 owner 权限手工删除残留凭据文件。",
+            )
 
     def close(self) -> None:
         """@brief 幂等删除全部临时密码文件 / Idempotently remove all temporary password files.
@@ -167,16 +175,22 @@ class LocalPsqlBootstrapRunner:
         @raise BootstrapExecutionError 任一租约无法删除时抛出 / Raised when any lease cannot be removed.
         """
 
-        cleanup_failed = False
+        cleanup_error: OSError | None = None
         leases, self._leases = tuple(self._leases.values()), {}
         for lease in leases:
             try:
                 lease.close()
-            except OSError:
-                cleanup_failed = True
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
         self._admin_password = None
-        if cleanup_failed:
-            raise BootstrapExecutionError("无法删除临时 PostgreSQL 密码文件。")
+        if cleanup_error is not None:
+            raise BootstrapExecutionError(
+                "无法删除一个或多个临时 PostgreSQL 密码文件。"
+            ) from safe_external_cause(
+                cleanup_error,
+                operation="清理 bootstrap 临时 PGPASSFILE",
+            )
 
     def database_exists(self, database: DatabaseName) -> bool:
         """@brief 在 maintenance database 查询目标是否存在 / Query target existence via the maintenance database.
@@ -300,10 +314,21 @@ class LocalPsqlBootstrapRunner:
                 shell=False,
                 env=child_environment,
             )
-        except OSError:
-            raise BootstrapExecutionError("无法启动本地 PostgreSQL psql。") from None
+        except OSError as error:
+            program = "sudo" if self._access_mode is BootstrapAccessMode.SUDO else "psql"
+            raise BootstrapExecutionError(
+                f"无法启动本地程序 {program}；bootstrap 阶段未执行。"
+            ) from safe_external_cause(
+                error,
+                operation=f"启动 {program} 子进程",
+            )
         if completed.returncode != 0:
-            raise BootstrapExecutionError("本地 psql 执行 bootstrap SQL 失败；数据库详情已隐藏。")
+            raise BootstrapExecutionError(
+                f"本地 psql 执行 bootstrap SQL 失败（退出码 {completed.returncode}）。"
+            ) from safe_process_exit_cause(
+                program="psql",
+                exit_code=completed.returncode,
+            )
         return completed
 
     def _password_lease(self, database: DatabaseName) -> PgpassLease:
@@ -317,10 +342,18 @@ class LocalPsqlBootstrapRunner:
         if existing is not None:
             return existing
         if self._admin_password is None:
-            raw_password = self._password_prompt(
-                "PostgreSQL bootstrap 管理角色 "
-                f"{self._plan.access.bootstrap_database_user.value} 密码："
-            )
+            try:
+                raw_password = self._password_prompt(
+                    "PostgreSQL bootstrap 管理角色 "
+                    f"{self._plan.access.bootstrap_database_user.value} 密码："
+                )
+            except (EOFError, OSError) as error:
+                raise DbctlConfigurationError(
+                    "无法从终端读取 PostgreSQL 管理密码；请使用交互式 TTY 或 sudo 模式。"
+                ) from safe_external_cause(
+                    error,
+                    operation="读取 PostgreSQL bootstrap 管理密码",
+                )
             if (
                 not isinstance(raw_password, str)
                 or not raw_password
@@ -340,8 +373,13 @@ class LocalPsqlBootstrapRunner:
                 password=self._admin_password,
                 prefix="dbctl-bootstrap-pgpass-",
             )
-        except OSError, ValueError:
-            raise BootstrapExecutionError("无法创建临时 PostgreSQL 密码文件。") from None
+        except (OSError, ValueError) as error:
+            raise BootstrapExecutionError(
+                "无法创建临时 PostgreSQL 密码文件。"
+            ) from safe_external_cause(
+                error,
+                operation="创建 bootstrap 临时 PGPASSFILE",
+            )
         self._leases[database] = lease
         return lease
 

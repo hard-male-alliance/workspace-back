@@ -11,7 +11,11 @@ from typing import Any, Self
 import pytest
 
 from conftest import PROJECT_ROOT
-from dbctl.application.errors import DbctlConfigurationError
+from dbctl.application.errors import (
+    BootstrapExecutionError,
+    DbctlConfigurationError,
+    ExternalDiagnosticError,
+)
 from dbctl.application.provision import (
     BootstrapAccessMode,
     BootstrapPlan,
@@ -22,12 +26,12 @@ from dbctl.application.provision import (
     TransactionMode,
     build_bootstrap_plan,
 )
-from dbctl.composition import compose_dbctl
+from dbctl.composition import compose_bootstrap
 from dbctl.domain.names import DatabaseName
 from dbctl.domain.roles import Secret
 from dbctl.infrastructure.postgres.psql import LocalPsqlBootstrapRunnerFactory
 from dbctl.interfaces.cli import main
-from dbctl.interfaces.presenters import render_bootstrap_plan
+from dbctl.interfaces.console import render_bootstrap_plan
 
 
 @dataclass
@@ -40,6 +44,7 @@ class RecordingBootstrapRunner:
 
     database_present: bool = False
     stages: list[BootstrapStage] = field(default_factory=list)
+    access_mode: BootstrapAccessMode = BootstrapAccessMode.PROMPT
 
     def __enter__(self) -> Self:
         """@brief 进入 fake 生命周期 / Enter the fake lifecycle.
@@ -115,14 +120,14 @@ def _plan_and_secret(config_path: Path) -> tuple[BootstrapPlan, str]:
     @return bootstrap plan 与 app 密码 / Bootstrap plan and app password.
     """
 
-    application = compose_dbctl(
+    settings, _bootstrap = compose_bootstrap(
         config_path,
         dbinit_path=PROJECT_ROOT / "dbinit.jsonc",
         environ={},
     )
     return (
-        build_bootstrap_plan(application.settings),
-        application.settings.connections.application.password.reveal(),
+        build_bootstrap_plan(settings),
+        settings.connections.application.password.reveal(),
     )
 
 
@@ -297,6 +302,56 @@ def test_sudo_runner_batches_stage_into_one_transactional_psql_process(
     assert "--single-transaction" in command
     assert keywords["input"].count("ALTER ROLE") >= 4
     assert all(not name.startswith("PG") for name in keywords["env"])
+
+
+def test_psql_failure_never_exposes_arbitrary_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    dbctl_config_path: Path,
+) -> None:
+    """@brief psql 任意 stderr 不进入安全异常链 / Arbitrary psql stderr never enters the safe exception chain.
+
+    @param monkeypatch pytest 替换夹具 / Pytest monkeypatch fixture.
+    @param dbctl_config_path 隔离私密配置 / Isolated private config.
+    @return 无返回值 / No return value.
+    """
+
+    opaque_server_value = "opaque-trigger-row-sentinel"
+
+    def fail_with_server_stderr(
+        command: list[str],
+        **_keywords: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        """@brief 模拟服务器回显任意行数据 / Simulate a server echoing arbitrary row data.
+
+        @param command psql argv / psql arguments.
+        @param _keywords 未使用 subprocess 参数 / Unused subprocess options.
+        @return 固定非零进程结果 / Fixed non-zero process result.
+        """
+
+        return subprocess.CompletedProcess(
+            command,
+            9,
+            stdout="",
+            stderr=f"trigger failure: {opaque_server_value}",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_with_server_stderr)
+    plan, _secret = _plan_and_secret(dbctl_config_path)
+    factory = LocalPsqlBootstrapRunnerFactory(
+        platform_name="posix",
+        executable_finder=lambda executable: f"/usr/bin/{executable}",
+        environ={},
+    )
+
+    with factory.open(plan, BootstrapAccessMode.SUDO) as runner:
+        with pytest.raises(BootstrapExecutionError) as error_info:
+            runner.execute_stage(plan.stages[0])
+
+    cause = error_info.value.__cause__
+    assert isinstance(cause, ExternalDiagnosticError)
+    assert "退出码=9" in str(cause)
+    assert opaque_server_value not in str(error_info.value)
+    assert opaque_server_value not in str(cause)
 
 
 def test_complete_bootstrap_uses_six_processes_for_126_logical_statements(

@@ -40,7 +40,8 @@ RUN apt-get update \
     && install --directory --owner aiws --group aiws --mode 0700 \
         /var/lib/aiws /var/lib/aiws-config
 
-ENV PATH=/app/.venv/bin:$PATH \
+ENV AIWS_CONFIG=/tmp/aiws/config.jsonc \
+    PATH=/app/.venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
