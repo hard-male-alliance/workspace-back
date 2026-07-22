@@ -10,20 +10,15 @@ from .errors import (
     RetentionExecutionError,
     ShellExecutionError,
 )
-from .migrate import HEAD_REVISION, MigrationRevision, MigrationService
-from .open_shell import OpenShellService
-from .ports import (
-    BootstrapRunner,
-    BootstrapRunnerFactory,
-    MigrationPort,
-    ShellPort,
-    TelemetryRetentionPort,
-)
+from .migrate import HEAD_REVISION, MigrationPort, MigrationRevision, MigrationService
+from .open_shell import OpenShellService, ShellPort
 from .progress import OperationName, ProgressSink, ProgressState, ProgressUpdate
 from .provision import (
     BootstrapAccessMode,
     BootstrapPlan,
     BootstrapResult,
+    BootstrapRunner,
+    BootstrapRunnerFactory,
     BootstrapService,
     BootstrapStage,
     ExecutionTarget,
@@ -43,6 +38,7 @@ from .prune_telemetry import (
     PruneTelemetryService,
     RetentionDisabled,
     StaleTelemetryProbe,
+    TelemetryRetentionPort,
 )
 
 __all__ = (

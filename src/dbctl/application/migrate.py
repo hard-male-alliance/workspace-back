@@ -2,13 +2,12 @@
 
 import re
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Protocol
 
-from dbctl.domain.database import DatabaseLogin, DbctlSettings, MigratorLogin
+from dbctl.domain.database import DatabaseBlueprint, DatabaseLogin, DbctlSettings, MigratorLogin
 from dbctl.domain.roles import LoginRole
 
 from .errors import DbctlConfigurationError, MigrationExecutionError, add_safe_diagnostic_note
-from .ports import MigrationPort
 from .progress import (
     OperationName,
     ProgressSink,
@@ -52,6 +51,26 @@ class MigrationRevision:
 
 HEAD_REVISION: Final[MigrationRevision] = MigrationRevision()
 """@brief 默认迁移目标 head / Default migration target ``head``."""
+
+
+class MigrationPort(Protocol):
+    """@brief Alembic 升级的基础设施端口 / Infrastructure port for Alembic upgrades."""
+
+    def upgrade(
+        self,
+        login: MigratorLogin,
+        revision: MigrationRevision,
+        blueprint: DatabaseBlueprint,
+    ) -> None:
+        """@brief 使用 migrator 升级到强类型 revision / Upgrade with migrator to a typed revision.
+
+        @param login 强类型 migrator 登录 / Purpose-typed migrator login.
+        @param revision 已验证 Alembic revision / Validated Alembic revision.
+        @param blueprint 不含其他登录 secret 的 role 与 schema 目标状态。
+        / Role and schema target state without unrelated login secrets.
+        @return 无返回值 / No return value.
+        """
+        ...
 
 
 class MigrationService:
