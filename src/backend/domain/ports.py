@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -55,11 +56,12 @@ class OAuthAuthorizationRequestRepository(Protocol):
         *,
         subject: str,
         user_id: str,
+        login_session_id: str,
         code_hash: str,
         auth_time: datetime,
         expires_at: datetime,
     ) -> bool:
-        """Atomically complete a pending authorization request and persist a one-time code."""
+        """Atomically complete a pending request and persist a code bound to its login session."""
 
     async def exchange_authorization_code(
         self,
@@ -95,6 +97,30 @@ class OAuthAuthorizationRequestRepository(Protocol):
     async def access_token_is_revoked(self, jti: str) -> bool:
         """Check an access-token JTI without exposing it outside the identity boundary."""
 
+    async def revoke_access_tokens_for_user(
+        self,
+        user_id: str,
+        revoked_before: datetime,
+    ) -> None:
+        """@brief 撤销用户在截止时刻及之前签发的全部 access token / Revoke all user access tokens issued at or before a cutoff.
+
+        @param user_id 本地用户 ID / Local user identifier.
+        @param revoked_before 带时区的 inclusive 签发截止时间 / Timezone-aware inclusive issue cutoff.
+        """
+
+    async def user_access_tokens_are_revoked(
+        self,
+        user_id: str,
+        issued_at: datetime,
+    ) -> bool:
+        """@brief 检查用户级 token epoch / Check the user-level token epoch.
+
+        @param user_id access token 的本地用户 claim / Local user claim from the access token.
+        @param issued_at token 的 ``iat`` / Token ``iat`` instant.
+        @return token 在用户级撤销截止内时为真 / True when the token falls within the user's
+            revocation cutoff.
+        """
+
 
 class OAuthTokenIssuerVerifier(Protocol):
     """Asymmetric JWT issuance and verification port."""
@@ -106,13 +132,14 @@ class OAuthTokenIssuerVerifier(Protocol):
     def issue_access_token(
         self,
         *,
+        user_id: str,
         subject: str,
         client_id: str,
         scopes: tuple[str, ...],
         lifetime_seconds: int,
         now: datetime | None = None,
     ) -> tuple[str, datetime, str]:
-        """Issue one Resource Server access token."""
+        """Issue one Resource Server access token bound to its local user."""
 
     def issue_id_token(
         self,
@@ -158,8 +185,23 @@ class HostedIdentityRepository(Protocol):
         user_id: str | None = None,
         authorization_resume_uri: str | None = None,
         webauthn_options: dict[str, object] | None = None,
+        completed_at: datetime | None = None,
     ) -> IdentityFlowRecord | None:
-        """Atomically dedupe and apply one allowed finite-state transition."""
+        """@brief 原子去重并应用一次允许的状态转换 / Atomically apply one allowed transition.
+
+        @param flow_id 流程标识 / Flow identifier.
+        @param browser_session_id 绑定的浏览器会话 / Bound browser session.
+        @param step_id 客户端幂等步骤标识 / Client idempotency step identifier.
+        @param expected_step 当前允许的步骤类型 / Currently allowed step kind.
+        @param allowed_steps 转换后的允许步骤 / Allowed steps after transition.
+        @param status 转换后的状态 / Status after transition.
+        @param state_updates 私有状态增量 / Private-state delta.
+        @param user_id 可选绑定用户 / Optional bound user.
+        @param authorization_resume_uri 可选授权恢复 URI / Optional authorization resume URI.
+        @param webauthn_options 可选 WebAuthn 参数 / Optional WebAuthn options.
+        @param completed_at 进入 completed 状态的时刻 / Instant entering completed state.
+        @return 转换后的流程；冲突时为空 / Transitioned flow, or ``None`` on conflict.
+        """
 
     async def processed_step_kind(self, flow_id: str, step_id: str) -> str | None:
         """Return the non-secret kind of an already processed step receipt."""
@@ -179,7 +221,18 @@ class HostedIdentityRepository(Protocol):
         now: datetime,
         passkey: IdentityAuthenticatorRecord | None = None,
     ) -> bool:
-        """Atomically create one unique account and its password authenticator."""
+        """@brief 原子完成首次注册 provision / Atomically complete first-registration provisioning.
+
+        @param user 唯一 identity 用户 / Unique identity user.
+        @param password_authenticator_id 密码验证器 ID / Password-authenticator ID.
+        @param password_verifier 不可逆密码 verifier / Irreversible password verifier.
+        @param now 所有资源共享的创建时刻 / Creation instant shared by all resources.
+        @param passkey 可选同时注册 passkey / Optional passkey registered at the same time.
+        @return 用户、密码、可选 passkey、个人 Workspace、owner membership 与
+            ``default_workspace_id`` 全部提交时为真；唯一性冲突时为假 / True only when the
+            user, password, optional passkey, personal Workspace, owner membership, and
+            ``default_workspace_id`` all commit; false on a uniqueness conflict.
+        """
 
     async def password_verifier(self, user_id: str) -> str | None:
         """Read the active password verifier for authentication."""
@@ -239,14 +292,73 @@ class HostedIdentityRepository(Protocol):
         """Atomically consume one exact recovery-code verifier once."""
 
 
-class IdentityEmailSender(Protocol):
-    """Secret-safe delivery boundary for identity verification and security notices."""
+class IdentityEmailRateLimitExceeded(RuntimeError):
+    """@brief 身份邮件的持久化频控额度已耗尽 / Durable identity-email budget is exhausted."""
 
-    async def send_verification_code(self, recipient: str, code: str) -> None:
-        """Deliver a short-lived code without logging or retaining its plaintext."""
+
+class IdentityEmailEnqueueError(RuntimeError):
+    """@brief 身份邮件无法原子写入 durable outbox / Identity email cannot enter the durable outbox."""
+
+
+class IdentityEmailSender(Protocol):
+    """@brief 身份邮件的事务型队列端口 / Transactional identity-email queue port.
+
+    @note ``send_*`` 表示邮件已被可靠接纳，而不是 SMTP 已完成；网络投递只能由
+        outbox worker 执行。 / ``send_*`` acknowledges durable acceptance, not SMTP delivery;
+        only the outbox worker performs network I/O.
+    """
+
+    def atomic(self) -> AbstractAsyncContextManager[None]:
+        """@brief 打开与身份仓储共享的原子事务 / Open an atomic transaction shared with identity storage.
+
+        @return 正常退出才提交的异步上下文 / Async context committed only on normal exit.
+        """
+
+    async def send_verification_code(
+        self,
+        recipient: str,
+        code: str,
+        *,
+        browser_session_id: str,
+        network_identifier: str,
+        limit_per_hour: int,
+    ) -> None:
+        """@brief 原子消费三维额度并入队验证码 / Atomically consume three budgets and enqueue a code.
+
+        @param recipient 规范化收件地址 / Normalized recipient address.
+        @param code 单次短期验证码 / Single-use short-lived code.
+        @param browser_session_id 设备维度的浏览器绑定 / Browser binding for the device axis.
+        @param network_identifier 可信网络维度 / Trusted network axis.
+        @param limit_per_hour 每维每小时硬上限 / Per-dimension hourly hard limit.
+        @raise IdentityEmailRateLimitExceeded 任一维额度耗尽 / Any dimension is exhausted.
+        @raise IdentityEmailEnqueueError 密文无法持久化 / Encrypted payload cannot be persisted.
+        """
 
     async def send_recovery_notification(self, recipient: str) -> None:
-        """Notify an account owner after credentials and sessions were rotated."""
+        """@brief 原子入队凭据轮换安全通知 / Atomically enqueue a credential-rotation notice.
+
+        @param recipient 已恢复账户的地址 / Address of the recovered account.
+        @raise IdentityEmailEnqueueError 密文无法持久化 / Encrypted payload cannot be persisted.
+        """
+
+
+class BreachedPasswordChecker(Protocol):
+    """@brief 检查候选密码是否出现在泄露语料中 / Check whether a candidate password appears in breach corpora.
+
+    @note 实现不得记录、持久化或向远端发送明文密码；外部检查应使用 k-anonymity
+        或等价的隐私保护协议。 / Implementations must not log, persist, or transmit the
+        plaintext password; remote checks should use k-anonymity or an equivalent privacy-preserving
+        protocol.
+    """
+
+    async def is_breached(self, password: str) -> bool:
+        """@brief 返回密码是否已泄露 / Return whether the password is known to be breached.
+
+        @param password 仅在当前调用内存活的候选明文 / Candidate plaintext scoped to this call.
+        @return 已出现在泄露语料时为真 / True when present in breach corpora.
+        @raise RuntimeError 检查器无法给出可信结论时抛出 / Raised when the checker cannot
+            produce a trustworthy decision.
+        """
 
 
 class WorkspaceRepository(Protocol):

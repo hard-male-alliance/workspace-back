@@ -11,6 +11,8 @@
     "migrator_role": "workspace_migrator",
     "app_role": "workspace_app",
     "dashboard_role": "workspace_dashboard",
+    "v2_default_data_region": "private_deployment",
+    "v2_legacy_workspace_plans": {},
     "schemas": ["identity", "resume", "agent", "interview", "knowledge", "observability"],
     "observability_schema": "observability",
     "local_postgres_user": "postgres",

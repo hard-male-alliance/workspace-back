@@ -34,6 +34,15 @@ CANONICAL_SCHEMA_CATALOG: Final[tuple[SchemaName, ...]] = (
 )
 """@brief 应用唯一受支持的固定 schema 目录 / The application's sole canonical schema catalog."""
 
+type DataRegion = Literal["cn", "global", "private_deployment"]
+"""@brief 迁移允许的数据驻留地域 / Data-residency regions accepted by migrations."""
+
+type WorkspacePlan = Literal["personal", "team", "enterprise"]
+"""@brief 迁移允许的 Workspace 计划 / Workspace plans accepted by migrations."""
+
+type LegacyWorkspacePlans = tuple[tuple[str, WorkspacePlan], ...]
+"""@brief 按 Workspace ID 排序的显式旧数据计划映射 / Explicit legacy plan mapping sorted by Workspace ID."""
+
 
 @dataclass(frozen=True, slots=True)
 class DatabaseTarget:
@@ -198,11 +207,15 @@ class DatabaseBlueprint:
 
     @param database 项目数据库名 / Project database name.
     @param roles 四职责角色集合 / Four-responsibility role set.
+    @param v2_default_data_region 旧 Workspace 的显式数据地域 / Explicit data region for legacy Workspaces.
+    @param v2_legacy_workspace_plans 每个旧 Workspace 的显式计划 / Explicit plan for every legacy Workspace.
     @param schemas 固定 schema 目录；不支持运行时扩展 / Fixed schema catalog; runtime extension is unsupported.
     """
 
     database: DatabaseName
     roles: RoleSet
+    v2_default_data_region: DataRegion
+    v2_legacy_workspace_plans: LegacyWorkspacePlans
     schemas: tuple[SchemaName, ...] = CANONICAL_SCHEMA_CATALOG
 
     def __post_init__(self) -> None:
@@ -218,6 +231,23 @@ class DatabaseBlueprint:
             raise InvalidDatabaseModelError("项目数据库不能使用 PostgreSQL 系统数据库名。")
         if not isinstance(self.roles, RoleSet):
             raise InvalidDatabaseModelError("DatabaseBlueprint.roles 必须是 RoleSet。")
+        if self.v2_default_data_region not in {"cn", "global", "private_deployment"}:
+            raise InvalidDatabaseModelError("V2 默认数据地域不合法。")
+        if (
+            not isinstance(self.v2_legacy_workspace_plans, tuple)
+            or any(
+                not isinstance(workspace_id, str)
+                or not workspace_id
+                or workspace_id.strip() != workspace_id
+                or plan not in {"personal", "team", "enterprise"}
+                for workspace_id, plan in self.v2_legacy_workspace_plans
+            )
+            or tuple(sorted(self.v2_legacy_workspace_plans))
+            != self.v2_legacy_workspace_plans
+            or len({workspace_id for workspace_id, _ in self.v2_legacy_workspace_plans})
+            != len(self.v2_legacy_workspace_plans)
+        ):
+            raise InvalidDatabaseModelError("V2 旧 Workspace plan 映射不合法。")
         if not isinstance(self.schemas, tuple) or self.schemas != CANONICAL_SCHEMA_CATALOG:
             raise InvalidDatabaseModelError("项目必须使用固定的 canonical schema 目录。")
 

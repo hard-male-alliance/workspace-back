@@ -19,6 +19,61 @@ from backend.infrastructure.providers import (
 )
 
 
+def _agent_response_schema() -> dict[str, object]:
+    """@brief 构造测试用 Agent strict JSON schema / Build the Agent strict-JSON schema used by tests.
+
+    @return 满足 OpenAI strict object 约束的封闭 schema / Closed schema satisfying OpenAI strict-object constraints.
+    """
+    operation_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["op", "entity_id", "field_path", "value"],
+        "properties": {
+            "op": {"type": "string", "const": "set_field"},
+            "entity_id": {"type": "string"},
+            "field_path": {"type": "array", "items": {"type": "string"}},
+            "value": {"type": "string"},
+        },
+    }
+    proposal_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["title", "operations"],
+        "properties": {
+            "title": {"type": "string"},
+            "operations": {
+                "type": "array",
+                "minItems": 1,
+                "items": operation_schema,
+            },
+        },
+    }
+    return {
+        "title": "A caller-controlled title that must not become the provider schema name",
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "protocol_version",
+            "text",
+            "citation_indices",
+            "resume_proposal",
+        ],
+        "properties": {
+            "protocol_version": {
+                "type": "string",
+                "const": "agent.output.strict_json.v1",
+            },
+            "text": {"type": ["string", "null"]},
+            "citation_indices": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {"type": "integer", "minimum": 0},
+            },
+            "resume_proposal": {"anyOf": [proposal_schema, {"type": "null"}]},
+        },
+    }
+
+
 def _external_inference(*, allow_fallback: bool = True, region: str = "global") -> dict[str, object]:
     """@brief 构建允许外部模型的正式推理意图 / Build a formal inference intent permitting external models.
 
@@ -131,6 +186,122 @@ async def test_openai_compatible_provider_streams_delta_and_builds_safe_payload(
     assert "resume wording" in payload["messages"][0]["content"]
     assert payload["messages"][1] == {"role": "assistant", "content": "上一轮建议"}
     assert payload["messages"][-1] == {"role": "user", "content": "请帮我润色项目经历。"}
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_provider_wires_exact_native_strict_schema_with_streaming() -> None:
+    """@brief strict Agent 请求应原样传 schema 且继续使用 SSE / A strict Agent request forwards its exact schema while retaining SSE."""
+    observed_payload: dict[str, Any] = {}
+    schema = _agent_response_schema()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """@brief 捕获 strict 请求并返回完成流 / Capture the strict request and return a completed stream.
+
+        @param request MockTransport 收到的 HTTP 请求 / HTTP request received by MockTransport.
+        @return 最小有效 SSE 响应 / Minimal valid SSE response.
+        """
+        observed_payload.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'data: {"choices":[{"delta":{"content":"{}"},"finish_reason":"stop"}]}\n\n'
+                b"data: [DONE]\n\n"
+            ),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = OpenAICompatibleModelProvider(
+            provider="openrouter",
+            model="server-side-model",
+            base_url="https://provider.example/v1",
+            api_key="test-only-secret",
+            client=client,
+        )
+        request = {
+            "capability": "resume_edit",
+            "output_modes": ["text", "citations", "resume_operations"],
+            "response_format": "agent.output.strict_json.v1",
+            "response_schema": schema,
+            "inference": _external_inference(),
+        }
+        assert [chunk async for chunk in provider.stream_text("test", request)] == ["{}"]
+
+    assert observed_payload["stream"] is True
+    assert observed_payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "agent_output_strict_json_v1",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+    assert all(
+        descriptor.supports_structured_output for descriptor in provider.capabilities()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "structured_fields",
+    [
+        {"response_format": "agent.output.strict_json.v1"},
+        {"response_schema": _agent_response_schema()},
+        {
+            "response_format": "agent.output.strict_json.v1",
+            "response_schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": True,
+            },
+        },
+        {
+            "response_format": "agent.output.strict_json.v1",
+            "response_schema": _agent_response_schema(),
+            "response_schema_name": "caller-chosen-name",
+        },
+    ],
+)
+async def test_structured_output_request_validation_fails_closed(
+    structured_fields: dict[str, object],
+) -> None:
+    """@brief 缺失配对、非 strict schema 或 caller name 均应在网络前拒绝 / Missing pairs, non-strict schemas, and caller names are rejected before network I/O.
+
+    @param structured_fields 待验证的结构化请求字段 / Structured request fields under test.
+    """
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """@brief 记录不应发生的 HTTP 调用 / Record an HTTP call that must not occur.
+
+        @param request 意外 HTTP 请求 / Unexpected HTTP request.
+        @return 不应消费的响应 / Response that must not be consumed.
+        """
+        nonlocal calls
+        del request
+        calls += 1
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = OpenAICompatibleModelProvider(
+            provider="openrouter",
+            model="server-side-model",
+            base_url="https://provider.example/v1",
+            api_key="test-only-secret",
+            client=client,
+        )
+        request = {
+            "capability": "general",
+            "inference": _external_inference(),
+            **structured_fields,
+        }
+        with pytest.raises(ModelProviderStreamError) as captured:
+            _ = [chunk async for chunk in provider.stream_text("test", request)]
+
+    assert captured.value.problem.code == "agent.provider_invalid_request"
+    assert captured.value.problem.retryable is False
+    assert calls == 0
 
 
 @pytest.mark.asyncio

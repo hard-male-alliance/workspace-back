@@ -1,12 +1,13 @@
 """@brief PostgreSQL 运行时 Repository 适配器 / PostgreSQL runtime repository adapters.
 
-本模块把领域聚合映射到 v0.1 的规范化 PostgreSQL 表。可演进、仅由当前 mock
-适配器使用的状态放在资源自身 JSONB（JSON Binary）``extensions.runtime`` 中；
-身份、租户、版本、事件、chunk、embedding 与二进制产物仍使用外键和独立表。
+本模块保留尚未拆分的旧 Workspace/Resume/Knowledge/Job 端口。Agent、Interview
+与 Artifact 已拥有 API V2 专用 Unit of Work（UoW），其不变量与旧端口不等价；
+对应旧 PostgreSQL 方法因此在任何数据库访问前显式失败，绝不把旧 payload 投影到
+canonical V2 真相表。
 
-每个公开方法都自行打开一个 ``AsyncDatabase`` 短事务（short transaction），并在
-进入后安装 ``ActorScope``。因此 Repository 不会跨 ``asyncio.Task`` 共享 Session，
-且应用层 tenant 谓词与 PostgreSQL RLS（Row-Level Security）同时生效。
+仍启用的公开方法自行打开 ``AsyncDatabase`` 短事务（short transaction），并在
+进入后安装 ``ActorScope``。Repository 不会跨 ``asyncio.Task`` 共享 Session，且
+应用层 tenant 谓词与 PostgreSQL RLS（Row-Level Security）同时生效。
 """
 
 from __future__ import annotations
@@ -16,11 +17,11 @@ import hashlib
 import hmac
 import json
 import secrets
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Never, cast
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
@@ -31,9 +32,6 @@ from backend.domain.agent import (
     AgentRunRecord as DomainAgentRunRecord,
 )
 from backend.domain.agent import (
-    AgentRunStatus,
-)
-from backend.domain.agent import (
     ConversationRecord as DomainConversationRecord,
 )
 from backend.domain.agent import (
@@ -41,21 +39,14 @@ from backend.domain.agent import (
 )
 from backend.domain.common import DomainError, Job, JobStatus, Problem
 from backend.domain.interview import InterviewSessionRecord as DomainInterviewSessionRecord
-from backend.domain.interview import InterviewStatus
 from backend.domain.knowledge import (
     EmbeddingSpace,
     KnowledgeChunk,
     KnowledgeClassification,
     KnowledgeContentType,
     KnowledgeDocumentPart,
-    KnowledgeTrustLevel,
 )
 from backend.domain.knowledge import KnowledgeSourceRecord as DomainKnowledgeSourceRecord
-from backend.domain.proposal import (
-    ProposalCitation,
-    ResumeProposalOperation,
-    ResumeProposalStatus,
-)
 from backend.domain.proposal import (
     ResumeProposalRecord as DomainResumeProposalRecord,
 )
@@ -63,34 +54,10 @@ from backend.domain.resume import ResumeRecord
 from backend.infrastructure.idempotency import IdempotentResponse
 from backend.infrastructure.persistence.database import AsyncDatabase
 from backend.infrastructure.persistence.models import (
-    AgentRunEventRecord as AgentRunEventOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
-    AgentRunRecord as AgentRunOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
-    ChatMessageRecord as ChatMessageOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
-    ConversationRecord as ConversationOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
     EmbeddingSpaceRecord as EmbeddingSpaceOrmRecord,
 )
 from backend.infrastructure.persistence.models import (
     IdempotencyRecord as IdempotencyOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
-    InterviewEventRecord as InterviewEventOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
-    InterviewReportRecord as InterviewReportOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
-    InterviewScenarioRecord as InterviewScenarioOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
-    InterviewSessionRecord as InterviewSessionOrmRecord,
 )
 from backend.infrastructure.persistence.models import (
     JobRecord as JobOrmRecord,
@@ -114,19 +81,7 @@ from backend.infrastructure.persistence.models import (
     KnowledgeVisibilityPolicyRecord as KnowledgeVisibilityPolicyOrmRecord,
 )
 from backend.infrastructure.persistence.models import (
-    RenderArtifactBlobRecord as RenderArtifactBlobOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
-    RenderArtifactRecord as RenderArtifactOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
     ResumeDocumentRecord as ResumeDocumentOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
-    ResumeProposalOperationRecord as ResumeProposalOperationOrmRecord,
-)
-from backend.infrastructure.persistence.models import (
-    ResumeProposalRecord as ResumeProposalOrmRecord,
 )
 from backend.infrastructure.persistence.models import (
     ResumeRenderJobRecord as ResumeRenderJobOrmRecord,
@@ -151,6 +106,26 @@ _RUNTIME_EXTENSION_KEY = "runtime"
 
 _PENDING_CLAIM_TOKEN_KEY = "pending_claim_token"
 """@brief pending 幂等 claim 的私有令牌字段 / Private token field for a pending idempotency claim."""
+
+_RETIRED_V1_POSTGRES_MESSAGE = (
+    "legacy PostgreSQL persistence surface is retired; use the API V2 unit-of-work"
+)
+"""@brief 已退休 V1 PostgreSQL 端口的稳定错误 / Stable error for retired V1 PostgreSQL ports."""
+
+
+def _reject_retired_v1_postgres_surface(surface: str) -> Never:
+    """@brief 在触碰 V2 真相表前拒绝旧持久化语义 / Reject legacy persistence semantics before touching V2 truth tables.
+
+    @param surface 被拒绝的旧端口名称 / Name of the retired legacy port.
+    @raise RuntimeError 该端口不能安全投影到 canonical V2 模型 / The port cannot be safely
+        projected onto the canonical V2 model.
+    @note V1 的可变 Message、事件型 Interview 和 Resume 专用 Artifact 表达与 V2
+        不变量不等价；这里显式失败，避免伪兼容导致跨产品数据损坏。
+        / V1 mutable Messages, event-shaped Interviews, and Resume-specific Artifacts are not
+        equivalent to V2 invariants; failing explicitly prevents pseudo-compatibility from
+        corrupting product data.
+    """
+    raise RuntimeError(f"{_RETIRED_V1_POSTGRES_MESSAGE}: {surface}")
 
 
 def _same_scope(left: ActorScope, right: ActorScope) -> bool:
@@ -488,11 +463,11 @@ def _workspace_member_payload(row: WorkspaceMemberRecord) -> dict[str, Any]:
 
 
 class PostgresWorkspaceRepository:
-    """@brief 五个领域共享的 PostgreSQL Repository / PostgreSQL repository shared by five domains.
+    """@brief 尚未拆分端口共享的 PostgreSQL Repository / PostgreSQL repository shared by ports not yet split.
 
-    该对象在结构化类型层面同时实现 Resume、Agent、Interview、Knowledge、Job 与
-    Artifact 的领域端口。它本身无可变请求状态；每次调用新建 session/transaction，
-    因而可被同一 worker 的并发请求安全复用。
+    该对象为旧 composition 保留结构化端口形状，但 Agent、Interview 与 Artifact 的
+    PostgreSQL 方法统一 fail closed；生产 V2 仅使用各自的专用 UoW。对象本身无可变
+    请求状态，仍启用的方法每次调用新建 session/transaction，可被并发请求安全复用。
 
     @param database 已配置的异步 PostgreSQL 资源所有者 / Configured async PostgreSQL owner.
     """
@@ -887,1015 +862,221 @@ class PostgresWorkspaceRepository:
     async def create_proposal(
         self, scope: ActorScope, record: DomainResumeProposalRecord
     ) -> None:
-        """Create or idempotently persist a Resume AI Proposal."""
-        _assert_record_scope(scope, record.scope)
-        async with self._database.transaction(scope) as session:
-            await _ensure_scope_identities(session, scope)
-            row = await _scoped_one(session, ResumeProposalOrmRecord, scope, record.id, lock=True)
-            if row is None:
-                row = ResumeProposalOrmRecord(
-                    id=record.id,
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    resume_id=record.resume_id,
-                    agent_run_id=None,
-                    base_revision_no=record.base_revision,
-                    status=record.status.value,
-                    decision_payload=None,
-                    decided_by_actor_id=record.decided_by_actor_id,
-                    decided_at=record.decided_at,
-                    expires_at=record.expires_at,
-                    created_at=record.created_at,
-                    updated_at=record.updated_at,
-                    revision=record.revision,
-                    extensions={},
-                )
-                session.add(row)
-                await session.flush()
-            await self._write_proposal_locked(session, scope, row, record)
+        """@brief 拒绝旧版 Resume Proposal 写入 / Reject legacy Resume-Proposal writes.
+
+        @param scope 请求租户范围 / Request tenant scope.
+        @param record 旧版 Proposal 聚合 / Legacy Proposal aggregate.
+        @raise RuntimeError PostgreSQL Proposal 只能经 V2 Agent/Resume UoW 写入。
+        """
+        del scope, record
+        _reject_retired_v1_postgres_surface("agent")
 
     async def get_proposal(
         self, scope: ActorScope, proposal_id: str
     ) -> DomainResumeProposalRecord | None:
-        """Read a tenant-scoped Resume AI Proposal and its ordered operations."""
-        async with self._database.read_session(scope) as session:
-            row = await _scoped_one(session, ResumeProposalOrmRecord, scope, proposal_id)
-            if row is None:
-                return None
-            operation_rows = (
-                await session.scalars(
-                    scoped_select(ResumeProposalOperationOrmRecord, scope)
-                    .where(ResumeProposalOperationOrmRecord.proposal_id == proposal_id)
-                    .order_by(ResumeProposalOperationOrmRecord.ordinal.asc())
-                )
-            ).all()
-            return self._proposal_from_rows(scope, row, operation_rows)
+        """@brief 拒绝旧版 Resume Proposal 投影 / Reject legacy Resume-Proposal projections.
+
+        @param scope 请求租户范围 / Request tenant scope.
+        @param proposal_id 旧版 Proposal ID / Legacy Proposal ID.
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Proposal 只能经 V2 Agent/Resume UoW 读取。
+        """
+        del scope, proposal_id
+        _reject_retired_v1_postgres_surface("agent")
 
     async def list_proposals(
         self, scope: ActorScope, resume_id: str
     ) -> list[DomainResumeProposalRecord]:
-        """List proposals for one scoped Resume in newest-first order."""
-        async with self._database.read_session(scope) as session:
-            rows = (
-                await session.scalars(
-                    scoped_select(ResumeProposalOrmRecord, scope)
-                    .where(ResumeProposalOrmRecord.resume_id == resume_id)
-                    .order_by(
-                        ResumeProposalOrmRecord.updated_at.desc(),
-                        ResumeProposalOrmRecord.id.desc(),
-                    )
-                )
-            ).all()
-            records: list[DomainResumeProposalRecord] = []
-            for row in rows:
-                operation_rows = (
-                    await session.scalars(
-                        scoped_select(ResumeProposalOperationOrmRecord, scope)
-                        .where(ResumeProposalOperationOrmRecord.proposal_id == row.id)
-                        .order_by(ResumeProposalOperationOrmRecord.ordinal.asc())
-                    )
-                ).all()
-                records.append(self._proposal_from_rows(scope, row, operation_rows))
-            return records
+        """@brief 拒绝旧版 Resume Proposal 列表投影 / Reject legacy Resume-Proposal list projections.
+
+        @param scope 请求租户范围 / Request tenant scope.
+        @param resume_id 旧版 Resume ID / Legacy Resume ID.
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Proposal 只能经 V2 Agent/Resume UoW 列出。
+        """
+        del scope, resume_id
+        _reject_retired_v1_postgres_surface("agent")
 
     async def save_proposal(
         self, scope: ActorScope, record: DomainResumeProposalRecord
     ) -> None:
-        """Persist a Proposal terminal decision using a row-level revision guard."""
-        _assert_record_scope(scope, record.scope)
-        async with self._database.transaction(scope) as session:
-            row = await _scoped_one(session, ResumeProposalOrmRecord, scope, record.id, lock=True)
-            if row is None:
-                raise RuntimeError("cannot save a proposal that does not exist in this scope")
-            if record.revision < int(row.revision):
-                raise RuntimeError("stale proposal write would overwrite a newer decision")
-            await self._write_proposal_locked(session, scope, row, record)
+        """@brief 拒绝旧版 Resume Proposal 决策写入 / Reject legacy Resume-Proposal decision writes.
 
-    async def _write_proposal_locked(
-        self,
-        session: AsyncSession,
-        scope: ActorScope,
-        row: Any,
-        record: DomainResumeProposalRecord,
-    ) -> None:
-        """Write Proposal state and replace its normalized operation projection."""
-        row.status = record.status.value
-        row.base_revision_no = record.base_revision
-        row.decided_by_actor_id = record.decided_by_actor_id
-        row.decided_at = record.decided_at
-        row.expires_at = record.expires_at
-        row.updated_at = record.updated_at
-        row.revision = record.revision
-        row.decision_payload = _with_runtime(
-            row.decision_payload,
-            {
-                "source_run_id": record.source_run_id,
-                "title": record.title,
-                "summary": record.summary,
-                "selected_operation_ids": list(record.selected_operation_ids),
-                "decision_comment": record.decision_comment,
-                "render_hint": deepcopy(record.render_hint),
-                "application_result": deepcopy(record.application_result),
-            },
-        )
-        await session.execute(
-            delete(ResumeProposalOperationOrmRecord).where(
-                ResumeProposalOperationOrmRecord.workspace_id == scope.workspace_id,
-                ResumeProposalOperationOrmRecord.resource_owner_id == scope.resource_owner_id,
-                ResumeProposalOperationOrmRecord.proposal_id == record.id,
-            )
-        )
-        await session.flush()
-        for ordinal, operation in enumerate(record.operations):
-            session.add(
-                ResumeProposalOperationOrmRecord(
-                    id=operation.id,
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    proposal_id=record.id,
-                    ordinal=ordinal,
-                    operation_type=str(operation.operation.get("op", "unknown")),
-                    payload={
-                        "operation": deepcopy(operation.operation),
-                        "reason": operation.reason,
-                        "atomic_group_id": operation.atomic_group_id,
-                        "trust_level": operation.trust_level.value,
-                        "citations": [citation.as_dict() for citation in operation.citations],
-                    },
-                    decision=(
-                        "accepted" if operation.id in record.selected_operation_ids else None
-                    ),
-                    extensions={},
-                )
-            )
-
-    @staticmethod
-    def _proposal_from_rows(
-        scope: ActorScope, row: Any, operation_rows: Sequence[Any]
-    ) -> DomainResumeProposalRecord:
-        """Rehydrate the Proposal aggregate from its normalized rows."""
-        runtime = _runtime_payload(row.decision_payload)
-        operations: list[ResumeProposalOperation] = []
-        for operation_row in operation_rows:
-            payload = _as_json_object(operation_row.payload)
-            citations: list[ProposalCitation] = []
-            raw_citations = payload.get("citations")
-            if isinstance(raw_citations, list):
-                for raw in raw_citations:
-                    if not isinstance(raw, dict):
-                        continue
-                    citations.append(
-                        ProposalCitation(
-                            source_id=str(raw.get("source_id", "")),
-                            source_version_id=str(raw.get("source_version_id", "")),
-                            chunk_id=str(raw.get("chunk_id", "")),
-                            quote=str(raw.get("quote", "")),
-                            trust_level=KnowledgeTrustLevel(
-                                str(raw.get("trust_level", "generated"))
-                            ),
-                            metadata=_as_json_object(raw.get("metadata")),
-                        )
-                    )
-            operations.append(
-                ResumeProposalOperation(
-                    id=str(operation_row.id),
-                    operation=_as_json_object(payload.get("operation")),
-                    reason=str(payload.get("reason", "")),
-                    atomic_group_id=str(payload.get("atomic_group_id", operation_row.id)),
-                    citations=tuple(citations),
-                    trust_level=KnowledgeTrustLevel(
-                        str(payload.get("trust_level", "generated"))
-                    ),
-                )
-            )
-        return DomainResumeProposalRecord(
-            scope=scope,
-            id=str(row.id),
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-            resume_id=str(row.resume_id),
-            base_revision=int(row.base_revision_no),
-            source_run_id=str(runtime.get("source_run_id", "run_unknown")),
-            title=str(runtime.get("title", "Resume proposal")),
-            summary=str(runtime.get("summary", "")),
-            operations=operations,
-            status=ResumeProposalStatus(str(row.status)),
-            revision=int(row.revision),
-            expires_at=row.expires_at,
-            selected_operation_ids=_as_string_list(runtime.get("selected_operation_ids")),
-            decision_comment=(
-                str(runtime["decision_comment"])
-                if isinstance(runtime.get("decision_comment"), str)
-                else None
-            ),
-            decided_by_actor_id=row.decided_by_actor_id,
-            decided_at=row.decided_at,
-            render_hint=(
-                _as_json_object(runtime.get("render_hint"))
-                if isinstance(runtime.get("render_hint"), dict)
-                else None
-            ),
-            application_result=(
-                _as_json_object(runtime.get("application_result"))
-                if isinstance(runtime.get("application_result"), dict)
-                else None
-            ),
-        )
+        @param scope 请求租户范围 / Request tenant scope.
+        @param record 旧版 Proposal 聚合 / Legacy Proposal aggregate.
+        @raise RuntimeError PostgreSQL Proposal 只能经 V2 Agent/Resume UoW 写入。
+        """
+        del scope, record
+        _reject_retired_v1_postgres_surface("agent")
 
     async def create_conversation(
         self,
         scope: ActorScope,
         record: DomainConversationRecord,
     ) -> None:
-        """@brief 创建或幂等更新 Agent 会话 / Create or idempotently update an Agent conversation.
+        """@brief 拒绝旧版 Agent Conversation 写入 / Reject legacy Agent-Conversation writes.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param record Conversation 聚合 / Conversation aggregate.
+        @raise RuntimeError PostgreSQL Agent 只能经 V2 UoW 写入。
         """
-        _assert_record_scope(scope, record.scope)
-        async with self._database.transaction(scope) as session:
-            await _ensure_scope_identities(session, scope)
-            row = await _scoped_one(session, ConversationOrmRecord, scope, record.id, lock=True)
-            if row is None:
-                row = ConversationOrmRecord(
-                    id=record.id,
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    title=record.title,
-                    capability=record.capability,
-                    created_at=record.created_at,
-                    updated_at=record.updated_at,
-                    revision=record.revision,
-                    extensions={},
-                )
-                session.add(row)
-            row.title = record.title
-            row.capability = record.capability
-            row.updated_at = record.updated_at
-            row.revision = record.revision
-            row.extensions = _with_runtime(
-                row.extensions,
-                {"context_refs": deepcopy(record.context_refs), "status": record.status},
-            )
+        del scope, record
+        _reject_retired_v1_postgres_surface("agent")
 
     async def get_conversation(
         self,
         scope: ActorScope,
         conversation_id: str,
     ) -> DomainConversationRecord | None:
-        """@brief 读取 Agent 会话及消息 ID 顺序 / Read an Agent conversation and its message-ID order.
+        """@brief 拒绝旧版 Agent Conversation 投影 / Reject legacy Agent-Conversation projections.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param conversation_id 会话 ID / Conversation ID.
-        @return ConversationRecord 或 None。
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Agent 只能经 V2 UoW 读取。
         """
-        async with self._database.read_session(scope) as session:
-            row = await _scoped_one(session, ConversationOrmRecord, scope, conversation_id)
-            return (
-                await self._conversation_from_row(session, scope, row) if row is not None else None
-            )
+        del scope, conversation_id
+        _reject_retired_v1_postgres_surface("agent")
 
     async def create_message(self, scope: ActorScope, record: DomainMessageRecord) -> None:
-        """@brief 保存或更新同一稳定 ID 的消息 / Persist or update a message with the same stable ID.
+        """@brief 拒绝旧版可变消息写入 / Reject legacy mutable-message writes.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param record 消息实体 / Message entity.
-        @raise PermissionError 会话不在 scope 内时抛出。
+        @raise RuntimeError PostgreSQL 仅允许 V2 append-only Message UoW 写入。
         """
-        async with self._database.transaction(scope) as session:
-            conversation = await _scoped_one(
-                session, ConversationOrmRecord, scope, record.conversation_id, lock=True
-            )
-            if conversation is None:
-                raise PermissionError("conversation is outside the supplied scope")
-            row = await _scoped_one(session, ChatMessageOrmRecord, scope, record.id, lock=True)
-            if row is None:
-                sequence_statement = select(
-                    func.coalesce(func.max(ChatMessageOrmRecord.sequence), -1)
-                ).where(
-                    ChatMessageOrmRecord.workspace_id == scope.workspace_id,
-                    ChatMessageOrmRecord.resource_owner_id == scope.resource_owner_id,
-                    ChatMessageOrmRecord.conversation_id == record.conversation_id,
-                )
-                last_sequence = await session.scalar(sequence_statement)
-                row = ChatMessageOrmRecord(
-                    id=record.id,
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    conversation_id=record.conversation_id,
-                    sequence=int(last_sequence if last_sequence is not None else -1) + 1,
-                    role=record.role,
-                    content_parts=deepcopy(record.content),
-                    created_at=record.created_at,
-                    updated_at=record.updated_at,
-                    revision=record.revision,
-                    extensions={},
-                )
-                session.add(row)
-            row.role = record.role
-            row.content_parts = deepcopy(record.content)
-            row.final_at = (
-                record.updated_at if record.status in {"completed", "cancelled"} else None
-            )
-            row.updated_at = record.updated_at
-            row.revision = record.revision
-            row.extensions = _with_runtime(
-                row.extensions,
-                {
-                    "status": record.status,
-                    "parent_message_id": record.parent_message_id,
-                    "run_id": record.run_id,
-                },
-            )
+        del scope, record
+        _reject_retired_v1_postgres_surface("agent.message")
 
     async def get_message(self, scope: ActorScope, message_id: str) -> DomainMessageRecord | None:
-        """@brief 读取范围内结构化消息 / Read a scoped structured message.
+        """@brief 拒绝旧版消息读取投影 / Reject legacy Message read projections.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param message_id 消息 ID / Message ID.
-        @return MessageRecord 或 None。
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Message 只能经 V2 UoW 读取。
         """
-        async with self._database.read_session(scope) as session:
-            row = await _scoped_one(session, ChatMessageOrmRecord, scope, message_id)
-            return self._message_from_row(row) if row is not None else None
+        del scope, message_id
+        _reject_retired_v1_postgres_surface("agent.message")
 
     async def list_messages(
         self,
         scope: ActorScope,
         conversation_id: str,
     ) -> list[DomainMessageRecord]:
-        """@brief 按稳定 sequence 列出会话消息 / List conversation messages by stable sequence.
+        """@brief 拒绝旧版消息列表投影 / Reject legacy Message list projections.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param conversation_id 会话 ID / Conversation ID.
-        @return 消息列表；会话不存在或越权时为空。
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Message 只能经 V2 UoW 列出。
         """
-        async with self._database.read_session(scope) as session:
-            conversation = await _scoped_one(session, ConversationOrmRecord, scope, conversation_id)
-            if conversation is None:
-                return []
-            statement = (
-                scoped_select(ChatMessageOrmRecord, scope)
-                .where(ChatMessageOrmRecord.conversation_id == conversation_id)
-                .order_by(ChatMessageOrmRecord.sequence.asc())
-            )
-            rows = (await session.scalars(statement)).all()
-            return [self._message_from_row(row) for row in rows]
+        del scope, conversation_id
+        _reject_retired_v1_postgres_surface("agent.message")
 
     async def create_run(self, scope: ActorScope, record: DomainAgentRunRecord) -> None:
-        """@brief 创建 Agent Run 及可重放事件 / Create an Agent Run and replayable events.
+        """@brief 拒绝旧版 Agent Run 写入 / Reject legacy Agent-Run writes.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param record Agent Run 记录 / Agent Run record.
+        @raise RuntimeError PostgreSQL Agent 只能经 V2 UoW 写入。
         """
-        _assert_record_scope(scope, record.scope)
-        async with self._database.transaction(scope) as session:
-            await _ensure_scope_identities(session, scope)
-            row = await _scoped_one(session, AgentRunOrmRecord, scope, record.id, lock=True)
-            if row is None:
-                conversation = await _scoped_one(
-                    session, ConversationOrmRecord, scope, record.conversation_id
-                )
-                message = await _scoped_one(
-                    session, ChatMessageOrmRecord, scope, record.input_message_id
-                )
-                if conversation is None or message is None:
-                    raise PermissionError("run references resources outside the supplied scope")
-                row = AgentRunOrmRecord(
-                    id=record.id,
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    conversation_id=record.conversation_id,
-                    input_message_id=record.input_message_id,
-                    job_id=None,
-                    capability=str(record.request.get("capability", "general")),
-                    status="queued",
-                    response_locale=str(record.request.get("response_locale", "zh-CN")),
-                    inference_intent=_as_json_object(record.request.get("inference")),
-                    effective_knowledge_selection=_as_json_object(record.request.get("knowledge")),
-                    token_usage=_as_json_object(record.token_usage),
-                    cost=_as_json_object(record.cost),
-                    created_at=record.created_at,
-                    updated_at=record.updated_at,
-                    revision=record.revision,
-                    extensions={},
-                )
-                session.add(row)
-                await session.flush()
-            await self._write_run_locked(session, scope, row, record)
+        del scope, record
+        _reject_retired_v1_postgres_surface("agent")
 
     async def get_run(self, scope: ActorScope, run_id: str) -> DomainAgentRunRecord | None:
-        """@brief 读取 Agent Run 与所有 SSE 事件 / Read an Agent Run and all SSE events.
+        """@brief 拒绝旧版 Agent Run 投影 / Reject legacy Agent-Run projections.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param run_id Run ID / Run ID.
-        @return AgentRunRecord 或 None。
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Agent 只能经 V2 UoW 读取。
         """
-        async with self._database.read_session(scope) as session:
-            row = await _scoped_one(session, AgentRunOrmRecord, scope, run_id)
-            return await self._run_from_row(session, scope, row) if row is not None else None
+        del scope, run_id
+        _reject_retired_v1_postgres_surface("agent")
 
     async def save_run(self, scope: ActorScope, record: DomainAgentRunRecord) -> None:
-        """@brief 保存 Agent Run 状态及完整事件日志 / Save Agent Run state and its complete event log.
+        """@brief 拒绝旧版 Agent Run 状态写入 / Reject legacy Agent-Run state writes.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param record Agent Run 记录 / Agent Run record.
+        @raise RuntimeError PostgreSQL Agent 只能经 V2 UoW 写入。
         """
-        _assert_record_scope(scope, record.scope)
-        async with self._database.transaction(scope) as session:
-            row = await _scoped_one(session, AgentRunOrmRecord, scope, record.id, lock=True)
-            if row is None:
-                raise RuntimeError("cannot save an agent run that does not exist in this scope")
-            await self._write_run_locked(session, scope, row, record)
-
-    async def _conversation_from_row(
-        self,
-        session: AsyncSession,
-        scope: ActorScope,
-        row: Any,
-    ) -> DomainConversationRecord:
-        """@brief 将会话行还原为领域聚合 / Rehydrate a conversation row into a domain aggregate.
-
-        @param session 已安装 scope 的读事务 / Scoped read transaction.
-        @param scope 请求租户范围 / Request tenant scope.
-        @param row 会话 ORM 行 / Conversation ORM row.
-        @return ConversationRecord。
-        """
-        runtime = _runtime_payload(row.extensions)
-        message_statement = (
-            scoped_select(ChatMessageOrmRecord, scope)
-            .where(ChatMessageOrmRecord.conversation_id == row.id)
-            .order_by(ChatMessageOrmRecord.sequence.asc())
-        )
-        message_ids = [
-            str(message.id) for message in (await session.scalars(message_statement)).all()
-        ]
-        return DomainConversationRecord(
-            scope=scope,
-            id=str(row.id),
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-            title=row.title,
-            capability=str(row.capability or "general"),
-            context_refs=[_as_json_object(item) for item in runtime.get("context_refs", [])]
-            if isinstance(runtime.get("context_refs"), list)
-            else [],
-            revision=int(row.revision),
-            status=str(runtime.get("status", "active")),
-            message_ids=message_ids,
-        )
-
-    @staticmethod
-    def _message_from_row(row: Any) -> DomainMessageRecord:
-        """@brief 将消息行还原为领域实体 / Rehydrate a message row into a domain entity.
-
-        @param row 消息 ORM 行 / Message ORM row.
-        @return MessageRecord。
-        """
-        runtime = _runtime_payload(row.extensions)
-        return DomainMessageRecord(
-            id=str(row.id),
-            conversation_id=str(row.conversation_id),
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-            role=str(row.role),
-            status=str(runtime.get("status", "completed")),
-            content=deepcopy(cast(list[dict[str, Any]], row.content_parts)),
-            revision=int(row.revision),
-            parent_message_id=runtime.get("parent_message_id")
-            if isinstance(runtime.get("parent_message_id"), str)
-            else None,
-            run_id=runtime.get("run_id") if isinstance(runtime.get("run_id"), str) else None,
-        )
-
-    async def _write_run_locked(
-        self,
-        session: AsyncSession,
-        scope: ActorScope,
-        row: Any,
-        record: DomainAgentRunRecord,
-    ) -> None:
-        """@brief 在锁定 Run 行上写状态和事件 / Write state and events on a locked Run row.
-
-        @param session 已安装 scope 的写事务 / Scoped write transaction.
-        @param scope 请求租户范围 / Request tenant scope.
-        @param row 已锁定 Run ORM 行 / Locked Run ORM row.
-        @param record 候选领域 Run / Candidate domain Run.
-        @raise RuntimeError 已持久化的终态被陈旧 worker 覆盖时抛出。
-
-        @note PostgreSQL 行锁只序列化写入，不会自动阻止“较晚到达的旧快照”写回。
-        因而这里把 completed/cancelled/failed 当作不可逆终态，并把事件日志视为只追加的
-        immutable log（不可变日志）：候选快照必须包含数据库已经接受的全部事件，且不得
-        改写同一 sequence。应用层仍负责在每个 streaming delta 前重读 Run，数据库层则是
-        跨 worker 的最终防线。
-        """
-        terminal = {
-            AgentRunStatus.COMPLETED,
-            AgentRunStatus.CANCELLED,
-            AgentRunStatus.FAILED,
-        }
-        persisted_runtime = _runtime_payload(row.extensions)
-        persisted_status_value = str(persisted_runtime.get("status", row.status))
-        if persisted_status_value == "succeeded":
-            persisted_status_value = AgentRunStatus.COMPLETED.value
-        try:
-            persisted_status = AgentRunStatus(persisted_status_value)
-        except ValueError:
-            persisted_status = AgentRunStatus.FAILED
-        if persisted_status in terminal and record.status is not persisted_status:
-            raise RuntimeError("cannot overwrite a terminal agent run with a stale worker snapshot")
-        persisted_storage_status = {
-            AgentRunStatus.COMPLETED: "succeeded",
-            AgentRunStatus.WAITING_FOR_APPROVAL: "running",
-        }.get(record.status, record.status.value)
-        row.capability = str(record.request.get("capability", row.capability))
-        row.status = persisted_storage_status
-        row.response_locale = str(record.request.get("response_locale", row.response_locale))
-        row.inference_intent = _as_json_object(record.request.get("inference"))
-        row.effective_knowledge_selection = _as_json_object(record.request.get("knowledge"))
-        row.token_usage = _as_json_object(record.token_usage)
-        row.cost = _as_json_object(record.cost)
-        row.error = _problem_to_json(record.problem)
-        row.started_at = record.created_at if record.status is not AgentRunStatus.QUEUED else None
-        row.finished_at = record.updated_at if record.status in terminal else None
-        row.updated_at = record.updated_at
-        row.revision = record.revision
-        row.extensions = _with_runtime(
-            row.extensions,
-            {
-                "request": deepcopy(record.request),
-                "status": record.status.value,
-                "phase": record.phase,
-                "output_message_id": record.output_message_id,
-                "cancelled": record.cancelled,
-                "extensions": deepcopy(record.extensions),
-            },
-        )
-        persisted_event_statement = (
-            scoped_select(AgentRunEventOrmRecord, scope)
-            .where(AgentRunEventOrmRecord.run_id == record.id)
-            .order_by(AgentRunEventOrmRecord.sequence.asc())
-        )
-        persisted_event_rows = (await session.scalars(persisted_event_statement)).all()
-        persisted_events = {int(event.sequence): event for event in persisted_event_rows}
-        incoming_events = sorted(record.events, key=lambda event: int(event.get("sequence", -1)))
-        incoming_sequences: set[int] = set()
-        for expected_sequence, event in enumerate(incoming_events):
-            sequence = int(event.get("sequence", -1))
-            if sequence != expected_sequence or sequence in incoming_sequences:
-                raise RuntimeError("agent run event sequences must be a contiguous immutable log")
-            incoming_sequences.add(sequence)
-            persisted_event = persisted_events.get(sequence)
-            if persisted_event is not None:
-                if (
-                    str(persisted_event.id) != str(event.get("event_id", ""))
-                    or str(persisted_event.event_type) != str(event.get("event_type", "agent.unknown"))
-                    or _as_json_object(persisted_event.payload) != _as_json_object(event.get("payload"))
-                    or persisted_event.trace_id
-                    != (event.get("trace_id") if isinstance(event.get("trace_id"), str) else None)
-                ):
-                    raise RuntimeError("cannot rewrite a persisted immutable agent run event")
-                continue
-            occurred_at = _as_datetime(event.get("occurred_at"), record.updated_at)
-            session.add(
-                AgentRunEventOrmRecord(
-                    id=str(event.get("event_id", new_opaque_id("evt"))),
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    run_id=record.id,
-                    sequence=sequence,
-                    event_type=str(event.get("event_type", "agent.unknown")),
-                    occurred_at=occurred_at,
-                    payload=_as_json_object(event.get("payload")),
-                    trace_id=event.get("trace_id")
-                    if isinstance(event.get("trace_id"), str)
-                    else None,
-                    created_at=occurred_at,
-                    updated_at=occurred_at,
-                    revision=1,
-                    extensions=_with_runtime(
-                        {},
-                        {
-                            "protocol_version": event.get("protocol_version", "1.0"),
-                            "ack_sequence": event.get("ack_sequence"),
-                            "extensions": _as_json_object(event.get("extensions")),
-                        },
-                    ),
-                )
-            )
-        if set(persisted_events) - incoming_sequences:
-            raise RuntimeError("candidate agent run snapshot omits a persisted immutable event")
-
-    async def _run_from_row(
-        self,
-        session: AsyncSession,
-        scope: ActorScope,
-        row: Any,
-    ) -> DomainAgentRunRecord:
-        """@brief 将 Run 和事件行还原为领域对象 / Rehydrate Run and event rows into a domain object.
-
-        @param session 已安装 scope 的读事务 / Scoped read transaction.
-        @param scope 请求租户范围 / Request tenant scope.
-        @param row Run ORM 行 / Run ORM row.
-        @return AgentRunRecord。
-        """
-        runtime = _runtime_payload(row.extensions)
-        raw_status = str(runtime.get("status", row.status))
-        if raw_status == "succeeded":
-            raw_status = AgentRunStatus.COMPLETED.value
-        try:
-            status = AgentRunStatus(raw_status)
-        except ValueError:
-            status = AgentRunStatus.FAILED
-        event_statement = (
-            scoped_select(AgentRunEventOrmRecord, scope)
-            .where(AgentRunEventOrmRecord.run_id == row.id)
-            .order_by(AgentRunEventOrmRecord.sequence.asc())
-        )
-        event_rows = (await session.scalars(event_statement)).all()
-        events = [self._run_event_from_row(event_row) for event_row in event_rows]
-        return DomainAgentRunRecord(
-            scope=scope,
-            id=str(row.id),
-            conversation_id=str(row.conversation_id),
-            input_message_id=str(row.input_message_id),
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-            request=_as_json_object(runtime.get("request")),
-            status=status,
-            phase=str(runtime.get("phase", "queued")),
-            revision=int(row.revision),
-            output_message_id=runtime.get("output_message_id")
-            if isinstance(runtime.get("output_message_id"), str)
-            else None,
-            problem=_problem_from_json(row.error),
-            events=events,
-            cancelled=bool(runtime.get("cancelled", False)),
-            extensions=_as_json_object(runtime.get("extensions")),
-            token_usage=_as_json_object(getattr(row, "token_usage", {})),
-            cost=_as_json_object(getattr(row, "cost", {})),
-        )
-
-    @staticmethod
-    def _run_event_from_row(row: Any) -> dict[str, Any]:
-        """@brief 将 Run 事件行还原为 SSE envelope / Rehydrate a Run event row into an SSE envelope.
-
-        @param row AgentRunEvent ORM 行 / AgentRunEvent ORM row.
-        @return 可回放事件 envelope。
-        """
-        runtime = _runtime_payload(row.extensions)
-        return {
-            "protocol_version": str(runtime.get("protocol_version", "1.0")),
-            "event_id": str(row.id),
-            "event_type": str(row.event_type),
-            "run_id": str(row.run_id),
-            "sequence": int(row.sequence),
-            "ack_sequence": runtime.get("ack_sequence"),
-            "occurred_at": row.occurred_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
-            "trace_id": row.trace_id,
-            "payload": deepcopy(cast(dict[str, Any], row.payload)),
-            "extensions": _as_json_object(runtime.get("extensions")),
-        }
+        del scope, record
+        _reject_retired_v1_postgres_surface("agent")
 
     async def create_session(
         self,
         scope: ActorScope,
         record: DomainInterviewSessionRecord,
     ) -> None:
-        """@brief 创建数字人面试会话 / Create a digital-interview session.
+        """@brief 拒绝旧版面试会话写入 / Reject legacy Interview-session writes.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param record 面试 Session 聚合 / Interview Session aggregate.
+        @raise RuntimeError PostgreSQL Interview 只能经 V2 UoW 写入。
         """
-        _assert_record_scope(scope, record.scope)
-        async with self._database.transaction(scope) as session:
-            await _ensure_scope_identities(session, scope)
-            row = await _scoped_one(session, InterviewSessionOrmRecord, scope, record.id, lock=True)
-            if row is None:
-                scenario_id = await self._ensure_interview_scenario(session, scope, record.request)
-                row = InterviewSessionOrmRecord(
-                    id=record.id,
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    scenario_id=scenario_id,
-                    resume_revision_id=None,
-                    state=InterviewStatus.CREATED.value,
-                    job_target=_as_json_object(record.request.get("job_target")),
-                    effective_knowledge_selection=_as_json_object(record.request.get("knowledge")),
-                    inference_intent=_as_json_object(record.request.get("inference")),
-                    media_capabilities=_as_json_object(record.request.get("client_capabilities")),
-                    avatar_output_mode=self._avatar_output_mode(record.request),
-                    consent=_as_json_object(record.request.get("recording")),
-                    created_at=record.created_at,
-                    updated_at=record.updated_at,
-                    revision=record.revision,
-                    extensions={},
-                )
-                session.add(row)
-                await session.flush()
-            await self._write_interview_session_locked(session, scope, row, record)
+        del scope, record
+        _reject_retired_v1_postgres_surface("interview")
 
     async def get_session(
         self,
         scope: ActorScope,
         session_id: str,
     ) -> DomainInterviewSessionRecord | None:
-        """@brief 读取面试会话及实时事件 / Read an interview session and realtime events.
+        """@brief 拒绝旧版面试会话投影 / Reject legacy Interview-session projections.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param session_id Session ID / Session ID.
-        @return InterviewSessionRecord 或 None。
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Interview 只能经 V2 UoW 读取。
         """
-        async with self._database.read_session(scope) as session:
-            row = await _scoped_one(session, InterviewSessionOrmRecord, scope, session_id)
-            return (
-                await self._interview_session_from_row(session, scope, row)
-                if row is not None
-                else None
-            )
+        del scope, session_id
+        _reject_retired_v1_postgres_surface("interview")
 
     async def list_sessions(
         self,
         scope: ActorScope,
     ) -> list[DomainInterviewSessionRecord]:
-        """List scoped interview sessions in stable newest-first order."""
-        async with self._database.read_session(scope) as session:
-            statement = scoped_select(InterviewSessionOrmRecord, scope).order_by(
-                InterviewSessionOrmRecord.updated_at.desc(),
-                InterviewSessionOrmRecord.id.desc(),
-            )
-            rows = (await session.scalars(statement)).all()
-            return [
-                await self._interview_session_from_row(session, scope, row)
-                for row in rows
-            ]
+        """@brief 拒绝旧版面试列表投影 / Reject legacy Interview list projections.
+
+        @param scope 请求租户范围 / Request tenant scope.
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Interview 只能经 V2 UoW 列出。
+        """
+        del scope
+        _reject_retired_v1_postgres_surface("interview")
 
     async def save_session(self, scope: ActorScope, record: DomainInterviewSessionRecord) -> None:
-        """@brief 保存面试状态机与事件历史 / Save interview state machine and event history.
+        """@brief 拒绝旧版面试状态写入 / Reject legacy Interview-state writes.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param record 面试 Session 聚合 / Interview Session aggregate.
+        @raise RuntimeError PostgreSQL Interview 只能经 V2 UoW 写入。
         """
-        _assert_record_scope(scope, record.scope)
-        async with self._database.transaction(scope) as session:
-            row = await _scoped_one(session, InterviewSessionOrmRecord, scope, record.id, lock=True)
-            if row is None:
-                raise RuntimeError("cannot save an interview session outside the supplied scope")
-            await self._write_interview_session_locked(session, scope, row, record)
+        del scope, record
+        _reject_retired_v1_postgres_surface("interview")
 
     async def save_report(self, scope: ActorScope, report: dict[str, Any]) -> None:
-        """@brief 保存完整且可审计的面试报告 / Persist a complete, auditable interview report.
+        """@brief 拒绝旧版面试报告写入 / Reject legacy Interview-report writes.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param report 公开 InterviewReport 对象 / Public InterviewReport object.
-        @raise PermissionError report 指向越权 Session 时抛出。
+        @raise RuntimeError PostgreSQL Interview Report 只能经 V2 UoW 写入。
         """
-        report_id = report.get("id")
-        session_id = report.get("session_id")
-        if not isinstance(report_id, str) or not isinstance(session_id, str):
-            raise ValueError("interview report requires id and session_id")
-        async with self._database.transaction(scope) as session:
-            session_row = await _scoped_one(session, InterviewSessionOrmRecord, scope, session_id)
-            if session_row is None:
-                raise PermissionError("interview report session is outside the supplied scope")
-            row = await _scoped_one(session, InterviewReportOrmRecord, scope, report_id, lock=True)
-            revision = report.get("revision")
-            numeric_revision = int(revision) if isinstance(revision, int) and revision > 0 else 1
-            rubric_ref = _as_json_object(report.get("rubric_ref"))
-            if row is None:
-                row = InterviewReportOrmRecord(
-                    id=report_id,
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    session_id=session_id,
-                    report_version=numeric_revision,
-                    rubric_version=str(rubric_ref.get("version", "runtime-v1")),
-                    engine_version=str(report.get("report_version", "runtime-v1")),
-                    report=deepcopy(report),
-                    generated_at=_as_datetime(report.get("created_at"), datetime.now(UTC)),
-                    created_at=_as_datetime(report.get("created_at"), datetime.now(UTC)),
-                    updated_at=_as_datetime(report.get("updated_at"), datetime.now(UTC)),
-                    revision=numeric_revision,
-                    extensions={},
-                )
-                session.add(row)
-                return
-            row.report = deepcopy(report)
-            row.report_version = numeric_revision
-            row.rubric_version = str(rubric_ref.get("version", row.rubric_version))
-            row.engine_version = str(report.get("report_version", row.engine_version))
-            row.updated_at = _as_datetime(report.get("updated_at"), datetime.now(UTC))
-            row.revision = numeric_revision
+        del scope, report
+        _reject_retired_v1_postgres_surface("interview")
 
     async def get_report(self, scope: ActorScope, report_id: str) -> dict[str, Any] | None:
-        """@brief 读取范围内面试报告 / Read a scoped interview report.
+        """@brief 拒绝旧版面试报告投影 / Reject legacy Interview-report projections.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param report_id 报告 ID / Report ID.
-        @return 深复制的公开报告或 None。
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Interview Report 只能经 V2 UoW 读取。
         """
-        async with self._database.read_session(scope) as session:
-            row = await _scoped_one(session, InterviewReportOrmRecord, scope, report_id)
-            return deepcopy(cast(dict[str, Any], row.report)) if row is not None else None
-
-    async def _ensure_interview_scenario(
-        self,
-        session: AsyncSession,
-        scope: ActorScope,
-        request: dict[str, Any],
-    ) -> str:
-        """@brief 确保 Session 所引用场景存在 / Ensure the scenario referenced by a session exists.
-
-        @param session 已安装 scope 的写事务 / Scoped write transaction.
-        @param scope 请求租户范围 / Request tenant scope.
-        @param request 正式创建请求 / Formal create request.
-        @return 可供 session 外键引用的 scenario ID。
-
-        @note 当前正式契约允许 ``scenario_id`` 为 null，而 v0.1 模型要求外键。null
-        因此创建 per-tenant 内建场景；非空但尚未创建的 ID 也以最小占位场景落库，使
-        mock 适配器的既有行为不被破坏。
-        """
-        requested_id = request.get("scenario_id")
-        scenario_id = (
-            requested_id
-            if isinstance(requested_id, str)
-            else _stable_id("scn", scope.workspace_id, scope.resource_owner_id, "builtin")
-        )
-        existing = await _scoped_one(session, InterviewScenarioOrmRecord, scope, scenario_id)
-        if existing is not None:
-            return scenario_id
-        session.add(
-            InterviewScenarioOrmRecord(
-                id=scenario_id,
-                workspace_id=scope.workspace_id,
-                resource_owner_id=scope.resource_owner_id,
-                title="Runtime interview scenario",
-                locale=str(request.get("locale", "zh-CN")),
-                role_target=_as_json_object(request.get("job_target")),
-                rubric={"version": "runtime-v1", "dimensions": []},
-                is_template=False,
-                extensions={"runtime": {"placeholder": True}},
-            )
-        )
-        await session.flush()
-        return scenario_id
-
-    @staticmethod
-    def _avatar_output_mode(request: dict[str, Any]) -> str:
-        """@brief 提取非空 avatar 输出模式 / Extract a non-empty avatar output mode.
-
-        @param request 正式创建请求 / Formal create request.
-        @return 满足数据库非空约束的模式。
-        """
-        media = _as_json_object(request.get("media"))
-        avatar = _as_json_object(media.get("avatar"))
-        mode = avatar.get("output_mode")
-        return mode if isinstance(mode, str) and mode else "audio_only"
-
-    async def _write_interview_session_locked(
-        self,
-        session: AsyncSession,
-        scope: ActorScope,
-        row: Any,
-        record: DomainInterviewSessionRecord,
-    ) -> None:
-        """@brief 在锁定 Session 行上保存状态和事件 / Save state and events on a locked Session row.
-
-        @param session 已安装 scope 的写事务 / Scoped write transaction.
-        @param scope 请求租户范围 / Request tenant scope.
-        @param row 已锁定 Session ORM 行 / Locked Session ORM row.
-        @param record 候选领域 Session / Candidate domain Session.
-        """
-        recording = _as_json_object(record.request.get("recording"))
-        retention_days = recording.get("retention_days")
-        retention_until = (
-            record.created_at + timedelta(days=retention_days)
-            if isinstance(retention_days, int)
-            and not isinstance(retention_days, bool)
-            and retention_days >= 0
-            else None
-        )
-        row.scenario_id = await self._ensure_interview_scenario(session, scope, record.request)
-        row.state = record.status.value
-        row.job_target = _as_json_object(record.request.get("job_target"))
-        row.effective_knowledge_selection = _as_json_object(record.request.get("knowledge"))
-        row.inference_intent = _as_json_object(record.request.get("inference"))
-        row.media_capabilities = _as_json_object(record.request.get("client_capabilities"))
-        row.avatar_output_mode = self._avatar_output_mode(record.request)
-        row.consent = recording
-        row.recording_retention_until = retention_until
-        row.started_at = record.started_at
-        row.ended_at = record.ended_at
-        row.failure = _problem_to_json(record.problem)
-        row.updated_at = record.updated_at
-        row.revision = record.revision
-        row.extensions = _with_runtime(
-            row.extensions,
-            {
-                "request": deepcopy(record.request),
-                "report_id": record.report_id,
-            },
-        )
-        await session.execute(
-            delete(InterviewEventOrmRecord).where(
-                InterviewEventOrmRecord.workspace_id == scope.workspace_id,
-                InterviewEventOrmRecord.resource_owner_id == scope.resource_owner_id,
-                InterviewEventOrmRecord.session_id == record.id,
-            )
-        )
-        await session.flush()
-        for event in record.events:
-            occurred_at = _as_datetime(event.get("occurred_at"), record.updated_at)
-            session.add(
-                InterviewEventOrmRecord(
-                    id=str(event.get("event_id", new_opaque_id("evt"))),
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    session_id=record.id,
-                    sequence=int(event.get("sequence", 0)),
-                    ack_sequence=event.get("ack_sequence")
-                    if isinstance(event.get("ack_sequence"), int)
-                    else None,
-                    event_type=str(event.get("event_type", "interview.unknown")),
-                    occurred_at=occurred_at,
-                    payload=_as_json_object(event.get("payload")),
-                    trace_id=event.get("trace_id")
-                    if isinstance(event.get("trace_id"), str)
-                    else None,
-                    created_at=occurred_at,
-                    updated_at=occurred_at,
-                    revision=1,
-                    extensions=_with_runtime(
-                        {},
-                        {
-                            "protocol_version": event.get("protocol_version", "1.0"),
-                            "extensions": _as_json_object(event.get("extensions")),
-                        },
-                    ),
-                )
-            )
-
-    async def _interview_session_from_row(
-        self,
-        session: AsyncSession,
-        scope: ActorScope,
-        row: Any,
-    ) -> DomainInterviewSessionRecord:
-        """@brief 将 Session 和事件行还原为领域对象 / Rehydrate Session and event rows into a domain object.
-
-        @param session 已安装 scope 的读事务 / Scoped read transaction.
-        @param scope 请求租户范围 / Request tenant scope.
-        @param row Session ORM 行 / Session ORM row.
-        @return InterviewSessionRecord。
-        """
-        runtime = _runtime_payload(row.extensions)
-        try:
-            status = InterviewStatus(str(row.state))
-        except ValueError:
-            status = InterviewStatus.FAILED
-        event_statement = (
-            scoped_select(InterviewEventOrmRecord, scope)
-            .where(InterviewEventOrmRecord.session_id == row.id)
-            .order_by(InterviewEventOrmRecord.sequence.asc())
-        )
-        event_rows = (await session.scalars(event_statement)).all()
-        return DomainInterviewSessionRecord(
-            scope=scope,
-            id=str(row.id),
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-            request=_as_json_object(runtime.get("request")),
-            status=status,
-            revision=int(row.revision),
-            started_at=row.started_at,
-            ended_at=row.ended_at,
-            report_id=runtime.get("report_id")
-            if isinstance(runtime.get("report_id"), str)
-            else None,
-            problem=_problem_from_json(row.failure),
-            events=[self._interview_event_from_row(event_row) for event_row in event_rows],
-        )
-
-    @staticmethod
-    def _interview_event_from_row(row: Any) -> dict[str, Any]:
-        """@brief 将面试事件行还原为 realtime envelope / Rehydrate an interview event into a realtime envelope.
-
-        @param row InterviewEvent ORM 行 / InterviewEvent ORM row.
-        @return 可回放的 realtime 事件。
-        """
-        runtime = _runtime_payload(row.extensions)
-        return {
-            "protocol_version": str(runtime.get("protocol_version", "1.0")),
-            "event_id": str(row.id),
-            "event_type": str(row.event_type),
-            "session_id": str(row.session_id),
-            "sequence": int(row.sequence),
-            "ack_sequence": row.ack_sequence,
-            "occurred_at": row.occurred_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
-            "trace_id": row.trace_id,
-            "payload": deepcopy(cast(dict[str, Any], row.payload)),
-            "extensions": _as_json_object(runtime.get("extensions")),
-        }
+        del scope, report_id
+        _reject_retired_v1_postgres_surface("interview")
 
     async def create_source(
         self,
@@ -2710,29 +1891,22 @@ class PostgresWorkspaceRepository:
         resume_id: str,
         resume_revision_id: str,
     ) -> str | None:
-        """Return and validate the first persisted artifact linked by a render Job."""
+        """@brief 拒绝旧 Job 到 V2 Artifact 的伪链接 / Reject pseudo-linking a legacy Job to a V2 Artifact.
+
+        @param session 已安装 scope 的事务 / Transaction with installed scope.
+        @param scope 请求租户范围 / Request tenant scope.
+        @param job 旧版 Job 聚合 / Legacy Job aggregate.
+        @param resume_id 旧版 Resume ID / Legacy Resume ID.
+        @param resume_revision_id 旧版内部 revision ID / Legacy internal revision ID.
+        @return Job 尚无产物时返回 None；否则不返回 / None while the Job has no artifact;
+            otherwise this method never returns.
+        @raise RuntimeError 旧 Artifact 写入端口已停用。
+        """
         artifacts = job.extensions.get("artifacts")
         if not isinstance(artifacts, list) or not artifacts:
             return None
-        first_artifact = artifacts[0]
-        if not isinstance(first_artifact, dict):
-            raise ValueError("resume render job artifact metadata is invalid")
-        artifact_id = first_artifact.get("id")
-        if not isinstance(artifact_id, str) or not artifact_id:
-            raise ValueError("resume render job artifact id is invalid")
-        artifact = await _scoped_one(
-            session,
-            RenderArtifactOrmRecord,
-            scope,
-            artifact_id,
-        )
-        if (
-            artifact is None
-            or str(artifact.resume_id) != resume_id
-            or str(artifact.resume_revision_id) != resume_revision_id
-        ):
-            raise ValueError("resume render job artifact references a different resume revision")
-        return artifact_id
+        del session, scope, resume_id, resume_revision_id
+        _reject_retired_v1_postgres_surface("artifact")
 
     @staticmethod
     def _write_job_row(row: Any, job: Job) -> None:
@@ -2811,26 +1985,16 @@ class PostgresWorkspaceRepository:
         content: bytes,
         source_map: dict[str, Any] | None,
     ) -> None:
-        """@brief 保存渲染元数据、二进制 PDF 与 source map / Persist render metadata, binary PDF, and source map.
+        """@brief 拒绝旧版 Artifact 写入 / Reject legacy Artifact writes.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param artifact 公开产物元数据 / Public artifact metadata.
         @param content 原始二进制内容 / Raw binary content.
         @param source_map 可选语义 source map / Optional semantic source map.
-        @raise ValueError 元数据没有有效简历 revision 引用时抛出。
+        @raise RuntimeError PostgreSQL Artifact 只能经 V2 Resume/Platform UoW 写入。
         """
-        artifact_id = artifact.get("id")
-        resume_id = artifact.get("resume_id")
-        resume_revision = artifact.get("resume_revision")
-        if (
-            not isinstance(artifact_id, str)
-            or not isinstance(resume_id, str)
-            or isinstance(resume_revision, bool)
-            or not isinstance(resume_revision, int)
-        ):
-            raise ValueError("render artifact metadata requires id, resume_id, and resume_revision")
-        async with self._database.transaction(scope) as session:
-            await self._save_artifact_locked(session, scope, artifact, content, source_map)
+        del scope, artifact, content, source_map
+        _reject_retired_v1_postgres_surface("artifact")
 
     async def save_artifact_and_job(
         self,
@@ -2840,149 +2004,45 @@ class PostgresWorkspaceRepository:
         source_map: dict[str, Any] | None,
         job: Job,
     ) -> None:
-        """Atomically publish artifact metadata/bytes and the successful render Job."""
-        async with self._database.transaction(scope) as session:
-            await self._save_artifact_locked(session, scope, artifact, content, source_map)
-            await self._save_job_locked(session, scope, job, allow_create=False)
+        """@brief 拒绝旧版 Artifact 与 Job 双写 / Reject legacy Artifact-and-Job dual writes.
 
-    async def _save_artifact_locked(
-        self,
-        session: AsyncSession,
-        scope: ActorScope,
-        artifact: dict[str, Any],
-        content: bytes,
-        source_map: dict[str, Any] | None,
-    ) -> None:
-        """Persist one render artifact inside an existing tenant transaction."""
-        artifact_id = artifact.get("id")
-        resume_id = artifact.get("resume_id")
-        resume_revision = artifact.get("resume_revision")
-        if (
-            not isinstance(artifact_id, str)
-            or not isinstance(resume_id, str)
-            or isinstance(resume_revision, bool)
-            or not isinstance(resume_revision, int)
-        ):
-            raise ValueError("render artifact metadata requires id, resume_id, and resume_revision")
-        resume = await _scoped_one(session, ResumeDocumentOrmRecord, scope, resume_id)
-        revision_statement = scoped_select(ResumeRevisionOrmRecord, scope).where(
-            ResumeRevisionOrmRecord.resume_id == resume_id,
-            ResumeRevisionOrmRecord.revision_no == resume_revision,
-        )
-        revision_row = (await session.scalars(revision_statement)).first()
-        if resume is None or revision_row is None:
-            raise ValueError("render artifact references an unknown scoped resume revision")
-        row = await _scoped_one(session, RenderArtifactOrmRecord, scope, artifact_id, lock=True)
-        created_at = _as_datetime(artifact.get("created_at"), datetime.now(UTC))
-        updated_at = _as_datetime(artifact.get("updated_at"), created_at)
-        if row is None:
-            row = RenderArtifactOrmRecord(
-                id=artifact_id,
-                workspace_id=scope.workspace_id,
-                resource_owner_id=scope.resource_owner_id,
-                resume_id=resume_id,
-                resume_revision_id=str(revision_row.id),
-                artifact_kind=str(artifact.get("artifact_kind", "rendered_resume")),
-                format=str(artifact.get("format", "pdf")),
-                storage_key=f"database://resume-artifacts/{artifact_id}",
-                content_sha256=str(artifact.get("sha256", _bytes_hash(content))),
-                content_bytes=len(content),
-                created_at=created_at,
-                updated_at=updated_at,
-                revision=int(artifact.get("revision", 1)),
-                extensions={},
-            )
-            session.add(row)
-            await session.flush()
-        row.resume_id = resume_id
-        row.resume_revision_id = str(revision_row.id)
-        row.artifact_kind = str(artifact.get("artifact_kind", row.artifact_kind))
-        row.format = str(artifact.get("format", row.format))
-        row.content_sha256 = str(artifact.get("sha256", _bytes_hash(content)))
-        row.content_bytes = len(content)
-        row.updated_at = updated_at
-        row.revision = int(artifact.get("revision", row.revision))
-        row.extensions = _with_runtime(row.extensions, {"public_metadata": deepcopy(artifact)})
-        blob_statement = scoped_select(RenderArtifactBlobOrmRecord, scope).where(
-            RenderArtifactBlobOrmRecord.artifact_id == artifact_id
-        )
-        blob = (await session.scalars(blob_statement)).first()
-        if blob is None:
-            session.add(
-                RenderArtifactBlobOrmRecord(
-                    id=_stable_id("artblob", artifact_id),
-                    workspace_id=scope.workspace_id,
-                    resource_owner_id=scope.resource_owner_id,
-                    artifact_id=artifact_id,
-                    content=content,
-                    source_map=deepcopy(source_map),
-                    created_at=created_at,
-                    updated_at=updated_at,
-                    revision=1,
-                    extensions={},
-                )
-            )
-            return
-        blob.content = content
-        blob.source_map = deepcopy(source_map)
-        blob.updated_at = updated_at
-        blob.revision = int(blob.revision) + 1
+        @param scope 请求租户范围 / Request tenant scope.
+        @param artifact 旧版 Artifact metadata / Legacy Artifact metadata.
+        @param content 旧版 Artifact bytes / Legacy Artifact bytes.
+        @param source_map 旧版 source map / Legacy source map.
+        @param job 旧版 Job / Legacy Job.
+        @raise RuntimeError PostgreSQL Artifact 只能经 V2 Resume/Platform UoW 原子写入。
+        """
+        del scope, artifact, content, source_map, job
+        _reject_retired_v1_postgres_surface("artifact")
 
     async def get_artifact(
         self,
         scope: ActorScope,
         artifact_id: str,
     ) -> tuple[dict[str, Any], bytes, dict[str, Any] | None] | None:
-        """@brief 读取渲染产物、内容和 source map / Read render artifact metadata, content, and source map.
+        """@brief 拒绝旧版 Artifact 读取投影 / Reject legacy Artifact read projections.
 
         @param scope 请求租户范围 / Request tenant scope.
         @param artifact_id 产物 ID / Artifact ID.
-        @return ``(metadata, bytes, source_map)`` 或 None。
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Artifact 只能经 V2 Platform UoW 读取。
         """
-        async with self._database.read_session(scope) as session:
-            row = await _scoped_one(session, RenderArtifactOrmRecord, scope, artifact_id)
-            if row is None:
-                return None
-            blob_statement = scoped_select(RenderArtifactBlobOrmRecord, scope).where(
-                RenderArtifactBlobOrmRecord.artifact_id == artifact_id
-            )
-            blob = (await session.scalars(blob_statement)).first()
-            if blob is None:
-                return None
-            runtime = _runtime_payload(row.extensions)
-            metadata = _as_json_object(runtime.get("public_metadata"))
-            if not metadata:
-                metadata = {
-                    "id": str(row.id),
-                    "resume_id": str(row.resume_id),
-                    "format": str(row.format),
-                    "size_bytes": int(row.content_bytes),
-                    "sha256": str(row.content_sha256),
-                }
-            return metadata, bytes(blob.content), deepcopy(blob.source_map)
+        del scope, artifact_id
+        _reject_retired_v1_postgres_surface("artifact")
 
     async def list_artifacts(
         self, scope: ActorScope, resume_id: str
     ) -> list[dict[str, Any]]:
-        """List public artifact metadata for one scoped Resume without loading blobs."""
-        async with self._database.read_session(scope) as session:
-            rows = (
-                await session.scalars(
-                    scoped_select(RenderArtifactOrmRecord, scope)
-                    .where(RenderArtifactOrmRecord.resume_id == resume_id)
-                    .order_by(
-                        RenderArtifactOrmRecord.updated_at.desc(),
-                        RenderArtifactOrmRecord.id.desc(),
-                    )
-                )
-            ).all()
-            artifacts: list[dict[str, Any]] = []
-            for row in rows:
-                runtime = _runtime_payload(row.extensions)
-                metadata = _as_json_object(runtime.get("public_metadata"))
-                if metadata:
-                    artifacts.append(metadata)
-            return artifacts
+        """@brief 拒绝旧版 Artifact 列表投影 / Reject legacy Artifact list projections.
+
+        @param scope 请求租户范围 / Request tenant scope.
+        @param resume_id 旧版 Resume ID / Legacy Resume ID.
+        @return 此端口不会返回 / This port never returns.
+        @raise RuntimeError PostgreSQL Artifact 只能经 V2 Platform UoW 列出。
+        """
+        del scope, resume_id
+        _reject_retired_v1_postgres_surface("artifact")
 
 
 @dataclass(frozen=True, slots=True)

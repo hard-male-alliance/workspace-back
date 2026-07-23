@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from backend.api.constants import PUBLIC_ORIGIN
-from backend.domain.oauth import OAuthTokenValidationError
+from backend.domain.oauth import ACCESS_TOKEN_USER_ID_CLAIM, OAuthTokenValidationError
 from workspace_shared.ids import new_opaque_id
 
 
@@ -68,6 +68,7 @@ class OAuthTokenSigner:
     def issue_access_token(
         self,
         *,
+        user_id: str,
         subject: str,
         client_id: str,
         scopes: tuple[str, ...],
@@ -83,6 +84,7 @@ class OAuthTokenSigner:
             {
                 "iss": PUBLIC_ORIGIN,
                 "sub": subject,
+                ACCESS_TOKEN_USER_ID_CLAIM: user_id,
                 "aud": PUBLIC_ORIGIN,
                 "exp": int(expires_at.timestamp()),
                 "nbf": int(issued_at.timestamp()),
@@ -131,7 +133,13 @@ class OAuthTokenSigner:
 
         claims = self._verify(token, expected_type="at+jwt")
         current = int((now or datetime.now(UTC)).timestamp())
-        required_strings = ("sub", "jti", "client_id", "scope")
+        required_strings = (
+            "sub",
+            ACCESS_TOKEN_USER_ID_CLAIM,
+            "jti",
+            "client_id",
+            "scope",
+        )
         if any(
             not isinstance(claims.get(name), str) or not claims[name] for name in required_strings
         ):

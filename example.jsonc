@@ -3,23 +3,29 @@
 {
   // 运行环境标签；development、test、staging 或 production。
   "environment": "development",
+  "api": {
+    // V1 仅供显式并行迁移；正常运行和所有部署环境只挂载 API STANDARD V2。
+    "legacy_v1_enabled": false
+  },
   "workspace": {
     // 未接入认证前的开发默认身份；生产环境由认证中间件覆盖。
     "default_actor_id": "usr_local_demo",
     // 每一个 Repository 查询必须携带此 workspace 范围。
     "default_workspace_id": "ws_local_demo",
     // 资源所有者；用于防止未来认证接入时发生越权考古。
-    "default_resource_owner_id": "usr_local_demo"
+    "default_resource_owner_id": "usr_local_demo",
+    // 新注册个人 Workspace 的显式数据驻留地域；不得从时区或部署位置猜测。
+    "default_data_region": "private_deployment"
   },
   "network": {
     // Nginx 后的内部监听地址和端口；客户端不可假设可直连。
     "bind_host": "127.0.0.1",
-    "bind_port": 8000,
+    "bind_port": 9000,
     // 生成短期回调/连接描述时使用的外部基址。
-    "public_base_url": "https://workspace.example.cn",
+    "public_base_url": "http://dev.hmalliances.org:9000",
     // 浏览器可访问产品 API 的精确 Origin；生产建议同源部署并保留空数组。
     "cors_allowed_origins": [],
-    // trusted_proxy_hmac 只接受这些实际 TCP 对端的签名断言；绝不信任客户端 forwarded headers。
+    // 仅显式开启 V1 trusted_proxy_hmac 迁移面时使用；V2 Bearer 身份不读取该列表。
     "trusted_proxy_cidrs": ["127.0.0.1/32"],
     // 统一为所有外部 HTTP 客户端配置的可选代理；null 表示禁用。
     "outbound_proxy_url": null,
@@ -50,15 +56,93 @@
     "knowledge_concurrency": 2,
     "interview_concurrency": 16,
     "job_queue_capacity": 256,
-    "sse_heartbeat_ms": 15000
+    "sse_heartbeat_ms": 15000,
+    "maintenance_interval_seconds": 60,
+    "maintenance_invitation_batch_size": 250,
+    "maintenance_idempotency_batch_size": 250
   },
-  // Local modular-monolith blob adapter. Mount a durable private volume in production.
+  // Knowledge V2 的每个外部能力都显式选择 adapter；memory 模式不配置 Connection provider。
   "knowledge": {
-    "blob_directory": "data/knowledge-blobs",
-    "max_upload_bytes": 10485760,
-    "max_extracted_characters": 1000000,
-    "chunk_max_characters": 800,
-    "chunk_overlap_characters": 80
+    "connections": {
+      // provider 授权事务和持久 credential 使用独立 AES-256 keyring。
+      // keys 的值是无 padding 的 32-byte base64url；公开模板只保留 null/空映射。
+      "provider_session_keyring": {"active_key_id": null, "keys": {}},
+      "credential_keyring": {"active_key_id": null, "keys": {}},
+      "credential_fingerprint_hmac_key": null,
+      "credential_reference_hmac_key": null,
+      "orphan_grace_seconds": 86400,
+      "connect_timeout_ms": 3000,
+      "read_timeout_ms": 15000,
+      // 生产 PostgreSQL 可配置显式 provider allowlist；memory 模式必须为空。
+      // 每项完整声明 OAuth/device endpoints、allowed_scopes 和可选 API-token validation。
+      "providers": []
+    },
+    "uploads": {
+      "storage": {
+        // local 仅供 development/test；容器 production 投影为 S3-compatible SigV4。
+        "mode": "local",
+        "local": {
+          "directory": "data/knowledge-blobs",
+          "public_origin": "http://dev.hmalliances.org:9000",
+          "signing_hmac_key": null
+        },
+        "s3": null
+      },
+      // dev 是显式 allow-all scanner；部署环境只能选择 clamav 或 fail-closed reject。
+      "malware": {"mode": "dev", "clamav": null},
+      // quota 在 PostgreSQL 中以原子 reservation 执行；不得只做进程内先查后写。
+      "maximum_workspace_bytes": 1073741824,
+      "maximum_object_bytes": 10485760,
+      "maximum_archive_entries": 2000,
+      "maximum_archive_depth": 3,
+      "maximum_expanded_bytes": 268435456,
+      "maximum_inflation_ratio": 100.0,
+      "maximum_scanner_chunk_bytes": 1048576,
+      "erasure_batch_size": 250
+    },
+    "source_network": {
+      // 同一闭合 allowlist 应用于初始 URL 与每一次 redirect；每跳重新解析并 DNS pin。
+      "allowed_schemes": ["https"],
+      "allowed_ports": [443],
+      "allowed_host_patterns": ["example.com", "*.example.com"],
+      "maximum_redirects": 5,
+      "allow_https_downgrade": false,
+      "maximum_body_bytes": 10485760,
+      "connect_timeout_ms": 3000,
+      "read_timeout_ms": 30000
+    },
+    "worker": {
+      "maximum_attempts": 12,
+      "maximum_material_bytes": 10485760
+    },
+    "search": {
+      "lexical_weight": 0.45,
+      "semantic_weight": 0.55,
+      "candidate_multiplier": 4
+    },
+    "index": {
+      "maximum_extracted_characters": 1000000,
+      "maximum_chunks": 10000,
+      "chunk_max_characters": 800,
+      "chunk_overlap_characters": 80,
+      "embedding_batch_size": 64
+    }
+  },
+  // Interview V2 realtime 凭据必须是独立、短期且绑定 audience 的 HMAC grant。
+  "interview": {
+    "realtime": {
+      // 公开模板不伪造可持久 secret；development/test 未配置时组合根 fail closed。
+      // staging/production 必须配置 active key 与对应的无 padding 32-byte base64url key。
+      "signing_keyring": {"active_key_id": null, "keys": {}},
+      // 部署环境必须是非占位的精确 HTTPS/WSS endpoint；不得在代码中写死假 URL。
+      "signaling_url": null,
+      "allowed_transports": ["webrtc", "websocket"],
+      // Infrastructure 与 domain 共用硬上限 15 分钟。
+      "credential_ttl_seconds": 300,
+      "heartbeat_interval_ms": 5000,
+      // 可选 RFC 7064/7065 STUN/TURN URI；TURN 凭据由服务端短期签发。
+      "ice_urls": []
+    }
   },
   "resume_rendering": {
     // mock 用于可重复测试；xelatex 启用受限子进程编译器。
@@ -151,10 +235,14 @@
     ]
   },
   "security": {
-    // development/test 允许 development_mock；staging/production 必须为 trusted_proxy_hmac。
+    // 仅显式 V1 迁移使用；staging/production 固定 disabled，V2 始终使用 OAuth Bearer。
     "identity_mode": "development_mock",
     // 私有 config.jsonc 直接填写；生产入口代理与后端共享的密钥必须至少 32 bytes。
     "trusted_proxy_hmac_secret": null,
+    // cursor 必须在多 worker 间共享；staging/production 直接配置至少 32 bytes 的独立密钥。
+    "cursor_hmac_secret": null,
+    // 含 API token 的可重试请求仅把独立密钥 HMAC 后的指纹交给通用 receipt store。
+    "sensitive_idempotency_hmac_secret": null,
     // 代理和应用服务器的签名时钟双向偏差，上限 600 秒。
     "trusted_proxy_max_clock_skew_seconds": 300
   },
@@ -174,8 +262,8 @@
           "https://app.hmalliances.org/oauth/callback"
         ],
         "allowed_scopes": [
-          "openid", "profile", "offline_access", "workspace.read",
-          "resume.read", "resume.write", "resume.render"
+          "openid", "profile", "email", "offline_access", "workspace.read", "workspace.write",
+          "resume.read", "resume.write", "resume.render", "interview.read", "interview.write"
         ]
       },
       {
@@ -184,8 +272,8 @@
         // RFC 8252 loopback 注册值不带端口；实际请求只允许随机端口不同。
         "redirect_uris": ["http://127.0.0.1/oauth/callback"],
         "allowed_scopes": [
-          "openid", "profile", "offline_access", "workspace.read",
-          "resume.read", "resume.write", "resume.render"
+          "openid", "profile", "email", "offline_access", "workspace.read", "workspace.write",
+          "resume.read", "resume.write", "resume.render", "interview.read", "interview.write"
         ]
       }
     ]
@@ -199,6 +287,13 @@
     "session_idle_ttl_seconds": 1800,
     "session_absolute_ttl_seconds": 2592000,
     "recent_reauthentication_seconds": 300,
+    "password_breach": {
+      // development/test 可关闭；staging/production 必须使用 pwned_passwords k-anonymity 查询。
+      "mode": "disabled",
+      "request_timeout_ms": 3000,
+      "cache_ttl_seconds": 21600,
+      "max_cache_entries": 4096
+    },
     "email": {
       // development/test 可用 memory；staging/production 必须改为 smtp。
       "mode": "memory",
@@ -208,7 +303,22 @@
       "smtp_username": null,
       // 私有 config.jsonc 直接填写，示例与 Git 中不得放真实凭据。
       "smtp_password": null,
-      "smtp_start_tls": true
+      "smtp_start_tls": true,
+      "outbox": {
+        // staging/production 必须配置 active_key_id、对应的 32-byte base64url AES key，
+        // 以及一把独立的 32-byte base64url HMAC key；旧 key 保留到其 pending rows 排空。
+        "active_key_id": null,
+        "encryption_keys": {},
+        "rate_limit_hmac_key": null,
+        "poll_interval_ms": 1000,
+        "batch_size": 50,
+        "lease_seconds": 60,
+        "retry_base_seconds": 5,
+        "retry_cap_seconds": 3600,
+        "max_attempts": 8,
+        // sent/dead rows 已无密文，仅作为不可逆、有限期的投递审计证据。
+        "retention_days": 30
+      }
     }
   },
   "dashboard": {

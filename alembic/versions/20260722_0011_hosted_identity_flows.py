@@ -25,7 +25,10 @@ _TABLES = ("identity.identity_browser_sessions", "identity.identity_flows")
 
 
 def _configured_role(option: RuntimeRoleOption) -> str:
-    value = op.get_context().config.get_main_option(f"aiws.{option}")
+    configuration = op.get_context().config
+    if configuration is None:
+        raise RuntimeError("Alembic configuration is unavailable")
+    value = configuration.get_main_option(f"aiws.{option}")
     if not value or _ROLE_IDENTIFIER_PATTERN.fullmatch(value) is None or len(value.encode()) > 63:
         raise RuntimeError(f"missing or invalid dbctl role option: {option}")
     return '"' + value.replace('"', '""') + '"'

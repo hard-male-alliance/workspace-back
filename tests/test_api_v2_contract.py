@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from jsonschema import Draft202012Validator
 
@@ -32,9 +34,7 @@ V2_DIRECTORY = PROJECT_ROOT / "workspace-shared-docs" / "contracts" / "v2"
 
 
 def _v2_schema() -> dict[str, Any]:
-    payload = load_jsonc_document(
-        (V2_DIRECTORY / "schema.jsonc").read_text(encoding="utf-8")
-    )
+    payload = load_jsonc_document((V2_DIRECTORY / "schema.jsonc").read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
     return payload
 
@@ -58,9 +58,7 @@ def test_v2_schema_and_every_published_example_validate_directly_from_jsonc() ->
     Draft202012Validator.check_schema(schema)
     serialized = (V2_DIRECTORY / "schema.jsonc").read_text(encoding="utf-8")
     validator = ContractValidator.from_jsonc(serialized)
-    examples = load_jsonc_document(
-        (V2_DIRECTORY / "examples.jsonc").read_text(encoding="utf-8")
-    )
+    examples = load_jsonc_document((V2_DIRECTORY / "examples.jsonc").read_text(encoding="utf-8"))
     validator.validate_definition("ExampleCatalog", examples)
     names: set[str] = set()
     for case in examples["cases"]:
@@ -121,7 +119,54 @@ def test_public_v2_template_routes_use_the_canonical_shape(backend_client: TestC
     )
 
 
-def test_openapi_contains_only_the_v2_routes_implemented_to_standard(
+def test_public_template_collection_uses_a_signed_keyset_cursor_and_strict_boundary(
+    backend_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief 公共端点也拒绝游标篡改、未知查询与 GET body / Public endpoints reject cursor tampering, unknown queries, and GET bodies."""
+    from backend.api import v2 as v2_api
+    from backend.domain.templates import list_template_manifests
+
+    first = deepcopy(list_template_manifests(None)[0])
+    second = deepcopy(first)
+    second["id"] = "tpl_second_v1"
+    second["name"] = "Second template"
+    monkeypatch.setattr(v2_api, "list_template_manifests", lambda _locale: [first, second])
+
+    page_one = backend_client.get("/api/v2/resume-templates", params={"limit": 1})
+    assert page_one.status_code == 200
+    cursor = page_one.json()["page"]["next_cursor"]
+    assert isinstance(cursor, str)
+    assert 0 < len(cursor) <= 2048
+
+    page_two = backend_client.get(
+        "/api/v2/resume-templates",
+        params={"limit": 1, "cursor": cursor},
+    )
+    assert page_two.status_code == 200
+    assert [item["id"] for item in page_two.json()["items"]] == ["tpl_second_v1"]
+
+    replacement = "A" if cursor[-1] != "A" else "B"
+    tampered = backend_client.get(
+        "/api/v2/resume-templates",
+        params={"limit": 1, "cursor": cursor[:-1] + replacement},
+    )
+    assert tampered.status_code == 400
+    assert tampered.json()["code"] == "http.cursor_invalid"
+
+    unknown_query = backend_client.get(
+        "/api/v2/resume-templates",
+        params={"locale": "en-US"},
+    )
+    assert unknown_query.status_code == 400
+    assert unknown_query.json()["code"] == "http.invalid_query"
+
+    body = backend_client.request("GET", "/api/v2/resume-templates", json={})
+    assert body.status_code == 400
+    assert body.json()["code"] == "http.unexpected_body"
+
+
+def test_openapi_contains_the_access_resume_platform_and_template_routes_implemented_to_standard(
     backend_client: TestClient,
 ) -> None:
     paths = backend_client.get("/openapi.json").json()["paths"]
@@ -131,17 +176,152 @@ def test_openapi_contains_only_the_v2_routes_implemented_to_standard(
         if path.startswith("/api/v2/")
         for method in operations
     }
-    assert v2_methods == {
+    expected_slice = {
+        ("GET", "/api/v2/me"),
+        ("PATCH", "/api/v2/me"),
+        ("POST", "/api/v2/me/account-deletion-requests"),
+        ("GET", "/api/v2/me/account-deletion-requests/{request_id}"),
+        ("POST", "/api/v2/me/account-deletion-requests/{request_id}/cancellations"),
         ("GET", "/api/v2/resume-templates"),
         ("GET", "/api/v2/resume-templates/{template_id}"),
+        ("GET", "/api/v2/workspaces"),
+        ("POST", "/api/v2/workspaces"),
+        ("GET", "/api/v2/workspaces/{workspace_id}"),
+        ("PATCH", "/api/v2/workspaces/{workspace_id}"),
+        ("DELETE", "/api/v2/workspaces/{workspace_id}"),
+        ("GET", "/api/v2/workspaces/{workspace_id}/members"),
+        ("GET", "/api/v2/workspaces/{workspace_id}/members/{member_id}"),
+        ("PATCH", "/api/v2/workspaces/{workspace_id}/members/{member_id}"),
+        ("DELETE", "/api/v2/workspaces/{workspace_id}/members/{member_id}"),
+        ("GET", "/api/v2/workspaces/{workspace_id}/invitations"),
+        ("POST", "/api/v2/workspaces/{workspace_id}/invitations"),
+        ("GET", "/api/v2/workspaces/{workspace_id}/invitations/{invitation_id}"),
+        ("DELETE", "/api/v2/workspaces/{workspace_id}/invitations/{invitation_id}"),
+        (
+            "POST",
+            "/api/v2/workspaces/{workspace_id}/invitations/{invitation_id}/acceptances",
+        ),
+        ("GET", "/api/v2/workspaces/{workspace_id}/resumes"),
+        ("POST", "/api/v2/workspaces/{workspace_id}/resumes"),
+        ("POST", "/api/v2/workspaces/{workspace_id}/resume-import-jobs"),
+        ("GET", "/api/v2/workspaces/{workspace_id}/resumes/{resume_id}"),
+        ("PATCH", "/api/v2/workspaces/{workspace_id}/resumes/{resume_id}"),
+        ("DELETE", "/api/v2/workspaces/{workspace_id}/resumes/{resume_id}"),
+        (
+            "GET",
+            "/api/v2/workspaces/{workspace_id}/resumes/{resume_id}/revisions",
+        ),
+        (
+            "GET",
+            "/api/v2/workspaces/{workspace_id}/resumes/{resume_id}/revisions/{revision}",
+        ),
+        (
+            "POST",
+            "/api/v2/workspaces/{workspace_id}/resumes/{resume_id}/restore-jobs",
+        ),
+        (
+            "POST",
+            "/api/v2/workspaces/{workspace_id}/resumes/{resume_id}/operations",
+        ),
+        (
+            "POST",
+            "/api/v2/workspaces/{workspace_id}/resumes/{resume_id}/render-jobs",
+        ),
+        (
+            "GET",
+            "/api/v2/workspaces/{workspace_id}/resumes/{resume_id}/proposals",
+        ),
+        (
+            "GET",
+            "/api/v2/workspaces/{workspace_id}/resume-proposals/{proposal_id}",
+        ),
+        (
+            "POST",
+            "/api/v2/workspaces/{workspace_id}/resume-proposals/{proposal_id}/decisions",
+        ),
+        ("GET", "/api/v2/workspaces/{workspace_id}/jobs"),
+        ("GET", "/api/v2/workspaces/{workspace_id}/jobs/{job_id}"),
+        (
+            "POST",
+            "/api/v2/workspaces/{workspace_id}/jobs/{job_id}/cancellations",
+        ),
+        ("GET", "/api/v2/workspaces/{workspace_id}/artifacts"),
+        ("GET", "/api/v2/workspaces/{workspace_id}/artifacts/{artifact_id}"),
+        (
+            "GET",
+            "/api/v2/workspaces/{workspace_id}/artifacts/{artifact_id}/content",
+        ),
+        (
+            "GET",
+            "/api/v2/workspaces/{workspace_id}/artifacts/{artifact_id}/source-map",
+        ),
+        ("GET", "/api/v2/workspaces/{workspace_id}/events"),
+        ("GET", "/api/v2/workspaces/{workspace_id}/audit-events"),
     }
-    assert (
-        paths["/api/v2/resume-templates"]["get"]["x-contract-response"]
-        == "TemplateList"
-    )
+    # Knowledge, Agent, and Interview are implemented by their own layered routers. This older
+    # vertical-slice gate deliberately checks its original slice as a subset; the dynamic
+    # ``test_v2_route_contract`` gate is the single exact inventory derived from contract.md.
+    assert expected_slice <= v2_methods
+    assert len(v2_methods) == 85
+    assert paths["/api/v2/resume-templates"]["get"]["x-contract-response"] == "TemplateList"
     assert (
         paths["/api/v2/resume-templates/{template_id}"]["get"]["x-contract-response"]
         == "TemplateManifest"
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/resumes"]["post"]["x-contract-request"]
+        == "CreateResumeRequest"
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/resumes"]["post"]["x-contract-response"]
+        == "ResumeDocument"
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/resumes/{resume_id}/operations"]["post"][
+            "x-contract-request"
+        ]
+        == "ResumeOperationBatch"
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/resumes/{resume_id}/operations"]["post"][
+            "x-contract-response"
+        ]
+        == "ResumeOperationResult"
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/resume-proposals/{proposal_id}/decisions"]["post"][
+            "x-contract-request"
+        ]
+        == "ProposalDecisionRequest"
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/resume-proposals/{proposal_id}/decisions"]["post"][
+            "x-contract-response"
+        ]
+        == "ResumeOperationResult"
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/jobs"]["get"]["x-contract-response"] == "JobList"
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/jobs/{job_id}/cancellations"]["post"][
+            "x-contract-response"
+        ]
+        == "Job"
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/artifacts/{artifact_id}/content"]["get"][
+            "x-api-v2-phase"
+        ]
+        == 6
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/events"]["get"]["x-contract-stream-item"]
+        == "ApiEvent"
+    )
+    assert (
+        paths["/api/v2/workspaces/{workspace_id}/audit-events"]["get"]["x-contract-response"]
+        == "AuditEventList"
     )
 
 
@@ -198,6 +378,8 @@ def test_public_openid_configuration_only_advertises_the_frozen_secure_flow(
             "nonce",
             "name",
             "locale",
+            "email",
+            "email_verified",
         ],
         "request_parameter_supported": False,
         "request_uri_parameter_supported": False,
@@ -223,6 +405,4 @@ def test_public_protected_resource_metadata_matches_the_bearer_challenge(
         "scopes_supported": list(RESOURCE_SCOPES),
         "bearer_methods_supported": ["header"],
     }
-    assert PROTECTED_RESOURCE_METADATA_URL == (
-        f"{PUBLIC_ORIGIN}{PROTECTED_RESOURCE_METADATA_PATH}"
-    )
+    assert PROTECTED_RESOURCE_METADATA_URL == (f"{PUBLIC_ORIGIN}{PROTECTED_RESOURCE_METADATA_PATH}")

@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.composition import BackendContainer
+from backend.domain.oauth import AuthorizationRequestRecord
 from backend.infrastructure.contracts import ContractValidator
+from backend.infrastructure.oauth import InMemoryOAuthAuthorizationRequestRepository
 from backend.package_resources import read_contract_schema_text
 
 
@@ -49,6 +53,7 @@ def _authorize_and_complete(
             request_id,
             subject="oidc-subject-token-test",
             user_id="usr_local_demo",
+            login_session_id="idses_oauth_token_test",
         )
     )
     query = parse_qs(urlsplit(callback).query)
@@ -77,7 +82,97 @@ def _exchange(client: TestClient, *, code: str, verifier: str) -> dict[str, obje
     return payload
 
 
-def test_jwks_and_authorization_code_exchange_produce_a_valid_resource_token(
+@pytest.mark.asyncio
+async def test_revoking_one_login_session_revokes_only_its_refresh_family() -> None:
+    """@brief 会话撤销只影响其精确 refresh family / Session revocation targets only its exact refresh family."""
+
+    repository = InMemoryOAuthAuthorizationRequestRepository()
+    now = datetime.now(UTC)
+    for suffix in ("a", "b"):
+        request = AuthorizationRequestRecord(
+            id=f"authreq_session_{suffix}",
+            client_id="aiws-web-local",
+            redirect_uri="https://app.hmalliances.org/oauth/callback",
+            scopes=("openid", "offline_access"),
+            state=f"state-{suffix}",
+            nonce=f"nonce-{suffix}",
+            code_challenge=f"challenge-{suffix}",
+            code_challenge_method="S256",
+            prompt=("consent",),
+            screen_hint=None,
+            status="pending",
+            created_at=now,
+            expires_at=now + timedelta(minutes=5),
+        )
+        await repository.create_authorization_request(request)
+        assert await repository.issue_authorization_code(
+            request.id,
+            subject="oidc-subject-token-test",
+            user_id="usr_local_demo",
+            login_session_id=f"idses_{suffix}",
+            code_hash=f"code-hash-{suffix}",
+            auth_time=now,
+            expires_at=now + timedelta(minutes=1),
+        )
+        assert (
+            await repository.exchange_authorization_code(
+                f"code-hash-{suffix}",
+                client_id=request.client_id,
+                redirect_uri=request.redirect_uri,
+                verifier_challenge=request.code_challenge,
+                refresh_family_id=f"rtfam_{suffix}",
+                refresh_token_id=f"rt_{suffix}_1",
+                refresh_token_hash=f"refresh-hash-{suffix}",
+                refresh_expires_at=now + timedelta(days=1),
+            )
+            is not None
+        )
+
+    await repository.revoke_families_for_login_session(
+        "usr_local_demo", "idses_a", now + timedelta(seconds=1)
+    )
+
+    assert (
+        await repository.rotate_refresh_token(
+            "refresh-hash-a",
+            client_id="aiws-web-local",
+            replacement_token_id="rt_a_2",
+            replacement_token_hash="refresh-hash-a-2",
+            replacement_expires_at=now + timedelta(days=1),
+        )
+        is None
+    )
+    assert (
+        await repository.rotate_refresh_token(
+            "refresh-hash-b",
+            client_id="aiws-web-local",
+            replacement_token_id="rt_b_2",
+            replacement_token_hash="refresh-hash-b-2",
+            replacement_expires_at=now + timedelta(days=1),
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_user_access_token_epoch_is_monotonic_and_inclusive() -> None:
+    """@brief 用户级撤销立即覆盖既有 JWT 且不会倒退 / User-level revocation immediately covers existing JWTs and never regresses."""
+
+    repository = InMemoryOAuthAuthorizationRequestRepository()
+    issued_before = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
+    cutoff = issued_before + timedelta(seconds=10)
+    issued_after = cutoff + timedelta(seconds=1)
+
+    assert not await repository.user_access_tokens_are_revoked("usr_local_demo", issued_before)
+    await repository.revoke_access_tokens_for_user("usr_local_demo", cutoff)
+    await repository.revoke_access_tokens_for_user("usr_local_demo", cutoff - timedelta(seconds=5))
+
+    assert await repository.user_access_tokens_are_revoked("usr_local_demo", issued_before)
+    assert await repository.user_access_tokens_are_revoked("usr_local_demo", cutoff)
+    assert not await repository.user_access_tokens_are_revoked("usr_local_demo", issued_after)
+
+
+def test_jwks_and_authorization_code_exchange_produce_a_signed_but_user_bound_token(
     backend_client: TestClient,
 ) -> None:
     verifier = "v" * 43
@@ -94,14 +189,15 @@ def test_jwks_and_authorization_code_exchange_produce_a_valid_resource_token(
     assert len(jwks.json()["keys"]) == 1
     assert set(jwks.json()["keys"][0]) == {"kty", "use", "alg", "kid", "n", "e"}
 
-    accepted = backend_client.get(
+    unbound = backend_client.get(
         "/api/v2/me",
         headers={
             "X-Request-Id": "req-valid-jwt-test",
             "Authorization": f"Bearer {access_token}",
         },
     )
-    assert accepted.status_code == 404
+    assert unbound.status_code == 401
+    assert unbound.json()["code"] == "oauth.invalid_token"
 
     replay = backend_client.post(
         "/oauth/token",

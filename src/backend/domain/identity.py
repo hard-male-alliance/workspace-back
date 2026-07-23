@@ -28,7 +28,13 @@ class IdentityBrowserSessionRecord:
 
 @dataclass(frozen=True, slots=True)
 class IdentityFlowRecord:
-    """Secret-free state of one registration, login, recovery, or reauth flow."""
+    """@brief 一次注册、登录、恢复或重新认证流程的无密钥状态。
+
+    / Secret-free state of one registration, login, recovery, or reauthentication flow.
+
+    @param completed_at 流程进入 completed 状态的精确时刻 / Exact instant when the flow
+        entered the completed state.
+    """
 
     id: str
     purpose: str
@@ -45,6 +51,24 @@ class IdentityFlowRecord:
     internal_state: dict[str, object] | None = None
     authorization_resume_uri: str | None = None
     webauthn_options: dict[str, object] | None = None
+    completed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """@brief 校验完成状态与完成时刻的一致性 / Validate completion-state consistency.
+
+        @return 无返回值 / No return value.
+        @raise ValueError completed 状态与完成时刻不一致或时间次序无效时抛出 / Raised when
+            completion state and instant disagree or chronology is invalid.
+        """
+        is_completed = self.status == "completed"
+        if is_completed != (self.completed_at is not None):
+            raise ValueError("completed identity flows require exactly one completion instant")
+        if self.completed_at is None:
+            return
+        if self.completed_at.tzinfo is None or self.completed_at.utcoffset() is None:
+            raise ValueError("identity flow completion instant must be timezone-aware")
+        if not self.created_at <= self.completed_at <= self.expires_at:
+            raise ValueError("identity flow completion instant is outside the flow lifetime")
 
     def as_public_dict(self) -> dict[str, object]:
         """Return exactly the API v2 ``IdentityFlow`` projection."""

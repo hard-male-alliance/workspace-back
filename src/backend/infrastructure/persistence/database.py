@@ -6,13 +6,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from sqlalchemy import URL, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
@@ -70,6 +73,18 @@ class AsyncDatabaseOptions:
             raise ValueError("database lock and statement timeouts must be positive and ordered")
 
 
+@dataclass(frozen=True, slots=True)
+class _AtomicEnvelopeBinding:
+    """@brief 当前任务独占的外层连接 / Outer connection exclusively owned by one task.
+
+    @param connection 外层事务连接 / Outer transaction connection.
+    @param owner_task 创建信封的 asyncio Task / Asyncio task that created the envelope.
+    """
+
+    connection: AsyncConnection
+    owner_task: object
+
+
 def normalize_asyncpg_dsn(dsn: str) -> str:
     """@brief 规范化为 SQLAlchemy asyncpg DSN / Normalize a SQLAlchemy asyncpg DSN.
 
@@ -89,7 +104,9 @@ def normalize_asyncpg_dsn(dsn: str) -> str:
     return url.render_as_string(hide_password=False)
 
 
-def create_session_factory(options: AsyncDatabaseOptions) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
+def create_session_factory(
+    options: AsyncDatabaseOptions,
+) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
     """@brief 创建异步 Engine 与 Session 工厂 / Create async engine and session factory.
 
     @param options 已校验的连接池配置。
@@ -168,6 +185,10 @@ class AsyncDatabase:
         self._engine, self._session_factory = create_session_factory(options)
         self._statement_timeout_ms = options.statement_timeout_ms
         self._lock_timeout_ms = options.lock_timeout_ms
+        self._envelope_binding: ContextVar[_AtomicEnvelopeBinding | None] = ContextVar(
+            f"aiws_database_envelope_{id(self)}",
+            default=None,
+        )
 
     @property
     def engine(self) -> AsyncEngine:
@@ -188,6 +209,187 @@ class AsyncDatabase:
         """
         return self._session_factory
 
+    def new_session(self) -> AsyncSession:
+        """@brief 创建独立或加入请求信封的 Session / Create an independent or envelope-joined Session.
+
+        @return 未进入上下文的异步 Session / An async Session not yet entered as a context.
+
+        @note 普通调用绑定 Engine 并拥有自己的事务；原子请求信封内则显式绑定同一
+            ``AsyncConnection``，使用 ``create_savepoint`` 加入外部事务。每个 UoW 仍有
+            独立 Session，避免跨协程并发共享可变 ``AsyncSession``。
+            / Ordinary calls bind the Engine and own their transaction. Inside an atomic request
+            envelope, the Session explicitly joins the same connection using ``create_savepoint``.
+            Each UoW still gets a distinct Session, avoiding concurrent sharing of mutable state.
+        """
+        binding = self._envelope_binding.get()
+        if binding is None:
+            return self._session_factory()
+        if asyncio.current_task() is not binding.owner_task:
+            raise RuntimeError("atomic database envelope cannot be used by a child task")
+        return AsyncSession(
+            bind=binding.connection,
+            expire_on_commit=False,
+            autoflush=False,
+            join_transaction_mode="create_savepoint",
+        )
+
+    @property
+    def in_atomic_envelope(self) -> bool:
+        """@brief 判断当前调用链是否处于原子信封 / Report whether this call path is enveloped.
+
+        @return 当前上下文绑定外部事务时为真 / True when an external transaction is bound.
+        """
+        return self._envelope_binding.get() is not None
+
+    @asynccontextmanager
+    async def atomic_envelope(
+        self,
+        *,
+        connection: AsyncConnection | None = None,
+    ) -> AsyncIterator[None]:
+        """@brief 打开可供多个短 UoW 加入的原子请求信封 / Open an atomic request envelope.
+
+        @param connection 可选、已由 session-level coordinator 独占且当前无事务的连接 /
+            Optional transaction-free connection exclusively held by a session-level coordinator.
+        @return 上下文正常退出才提交的外部事务 / External transaction committed only on
+            normal context exit.
+        @raise RuntimeError 同一调用链嵌套信封时抛出 / Raised for a nested envelope in the
+            same call path.
+
+        @note 信封只允许串行调用 UoW；不得把继承该 ``ContextVar`` 的子任务并发运行。
+            外层连接事务使幂等 claim、业务状态、transactional outbox 与 response receipt
+            要么全部提交，要么全部回滚。内部 UoW 的 commit 仅释放其 SAVEPOINT。
+            / UoWs inside the envelope must run serially, never in concurrently spawned child
+            tasks inheriting this context. The outer connection transaction commits or rolls back
+            the idempotency claim, domain state, transactional outbox, and response receipt as one.
+        """
+        if self._envelope_binding.get() is not None:
+            raise RuntimeError("atomic database envelopes cannot be nested")
+        owner_task = asyncio.current_task()
+        if owner_task is None:
+            raise RuntimeError("atomic database envelope requires an asyncio task")
+        if connection is not None:
+            async with self._atomic_envelope_on_connection(connection, owner_task):
+                yield
+            return
+        async with self._engine.connect() as owned_connection:
+            async with self._atomic_envelope_on_connection(owned_connection, owner_task):
+                yield
+
+    @asynccontextmanager
+    async def coordination_lock(
+        self,
+        lock_key: int,
+    ) -> AsyncIterator[AsyncConnection | None]:
+        """@brief 尝试持有无事务的 PostgreSQL session advisory lock / Try a transaction-free PostgreSQL session advisory lock.
+
+        @param lock_key 有符号 64 位 advisory-lock key / Signed 64-bit advisory-lock key.
+        @return 成功时返回独占连接；竞争失败时返回 ``None`` / Exclusively held connection on
+            success, or ``None`` on contention.
+        @raise RuntimeError PostgreSQL 返回非布尔结果或释放失败时抛出 / Raised for an invalid
+            PostgreSQL result or failed unlock.
+
+        @note 获取与释放各自结束 SQLAlchemy 的隐式短事务；yield 期间连接持有的是
+            session-level lock，不存在活动事务、行锁或 MVCC snapshot。该能力要求
+            session-pooling/direct PostgreSQL，不能放在 transaction-pooling proxy 后面 /
+            Acquisition and release each close SQLAlchemy's implicit short transaction. During
+            ``yield`` only the session-level lock remains, requiring direct/session-pooled PostgreSQL.
+        """
+
+        if isinstance(lock_key, bool) or not -(2**63) <= lock_key < 2**63:
+            raise ValueError("coordination lock key must be a signed 64-bit integer")
+        async with self._engine.connect() as connection:
+            acquired = await connection.scalar(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": lock_key},
+            )
+            await connection.commit()
+            if not isinstance(acquired, bool):
+                raise RuntimeError("PostgreSQL returned an invalid session-lock result")
+            if not acquired:
+                yield None
+                return
+            try:
+                yield connection
+            finally:
+                if connection.in_transaction():
+                    await connection.rollback()
+                released = await connection.scalar(
+                    text("SELECT pg_advisory_unlock(:lock_key)"),
+                    {"lock_key": lock_key},
+                )
+                await connection.commit()
+                if released is not True:
+                    raise RuntimeError("PostgreSQL failed to release a session advisory lock")
+
+    @asynccontextmanager
+    async def _atomic_envelope_on_connection(
+        self,
+        connection: AsyncConnection,
+        owner_task: object,
+    ) -> AsyncIterator[None]:
+        """@brief 在指定空闲连接上绑定原子信封 / Bind an atomic envelope to a supplied idle connection.
+
+        @param connection 当前无活动事务的独占连接 / Exclusive connection without an active transaction.
+        @param owner_task 拥有调用链的 asyncio Task / Owning asyncio task.
+        @return 正常退出才提交的原子信封 / Atomic envelope committed only on normal exit.
+        @raise RuntimeError 连接仍处于事务中时抛出 / Raised when the connection still has an
+            active transaction.
+        """
+
+        if connection.in_transaction():
+            raise RuntimeError("atomic envelope requires a transaction-free connection")
+        async with connection.begin():
+            token = self._envelope_binding.set(_AtomicEnvelopeBinding(connection, owner_task))
+            try:
+                yield
+            finally:
+                self._envelope_binding.reset(token)
+
+    async def install_v2_request_scope(
+        self,
+        session: AsyncSession,
+        *,
+        actor_id: str,
+        workspace_id: str | None,
+    ) -> None:
+        """@brief 安装 API V2 RLS 与事务超时 / Install API V2 RLS scope and timeouts.
+
+        @param session 当前事务绑定 Session / Session bound to the current transaction.
+        @param actor_id 已验证 access token 的本地用户 ID / Local user ID from a verified token.
+        @param workspace_id URL 路径 Workspace；用户级操作为空 / URL-path Workspace, or null
+            for a user-scoped operation.
+        @return 无返回值 / No return value.
+        @raise ValueError actor 或 Workspace 不是规范非空值时抛出 / Raised for a
+            non-canonical actor or Workspace value.
+
+        @note API V2 不伪造历史 ``resource_owner_id``。``SET LOCAL`` 等价的
+            ``set_config(..., true)`` 随最外层事务结束清除，适用于独立事务和原子信封。
+            / API V2 never fabricates the legacy resource-owner axis. Transaction-local settings
+            are cleared with either an independent transaction or the outer atomic envelope.
+        """
+        if not actor_id or actor_id != actor_id.strip():
+            raise ValueError("API V2 actor_id must be a canonical non-empty value")
+        if workspace_id is not None and (not workspace_id or workspace_id != workspace_id.strip()):
+            raise ValueError("API V2 workspace_id must be a canonical non-empty value")
+        await session.execute(
+            text(
+                """
+                SELECT
+                    set_config('app.actor_id', :actor_id, true),
+                    set_config('app.workspace_id', :workspace_id, true),
+                    set_config('statement_timeout', CAST(:statement_timeout_ms AS text), true),
+                    set_config('lock_timeout', CAST(:lock_timeout_ms AS text), true)
+                """
+            ),
+            {
+                "actor_id": actor_id,
+                "workspace_id": "" if workspace_id is None else workspace_id,
+                "statement_timeout_ms": str(self._statement_timeout_ms),
+                "lock_timeout_ms": str(self._lock_timeout_ms),
+            },
+        )
+
     @asynccontextmanager
     async def transaction(self, scope: ActorScope) -> AsyncIterator[AsyncSession]:
         """@brief 打开一个租户受限的读写短事务 / Open a tenant-scoped read-write transaction.
@@ -198,7 +400,7 @@ class AsyncDatabase:
         @note 一个 ``asyncio.Task`` 应只使用一次此上下文；不要把 yield 出去的
         Session 传给并发子任务。
         """
-        async with self._session_factory() as session:
+        async with self.new_session() as session:
             async with session.begin():
                 await install_tenant_scope(
                     session,
@@ -218,9 +420,10 @@ class AsyncDatabase:
         @note PostgreSQL 的 ``SET TRANSACTION READ ONLY`` 是第二道保护；RLS 仍由
         migration 创建的策略执行。
         """
-        async with self._session_factory() as session:
+        async with self.new_session() as session:
             async with session.begin():
-                await session.execute(text("SET TRANSACTION READ ONLY"))
+                if not self.in_atomic_envelope:
+                    await session.execute(text("SET TRANSACTION READ ONLY"))
                 await install_tenant_scope(
                     session,
                     scope,
@@ -238,7 +441,7 @@ class AsyncDatabase:
         @note 仅允许由具有显式全 NULL-scope RLS policy 的基础设施表使用；业务
         Repository 不得通过此接口绕过 ActorScope。
         """
-        async with self._session_factory() as session:
+        async with self.new_session() as session:
             async with session.begin():
                 await session.execute(
                     text(

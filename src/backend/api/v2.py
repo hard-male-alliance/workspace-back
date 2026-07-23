@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
-import base64
-import json
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Query, Request
+from fastapi.responses import Response
 
 from backend.api.constants import (
     PROTECTED_RESOURCE_METADATA_URL,
     PUBLIC_ORIGIN,
     TEST_RESOURCE_SERVER_ORIGIN,
+)
+from backend.api.v2_http import CursorCodec, JsonValue, list_response
+from backend.api.v2_transport import (
+    DEFAULT_PAGE_LIMIT,
+    OpaquePath,
+    PageCursor,
+    PageLimit,
+    json_response,
+    require_no_body,
+    require_query,
 )
 from backend.composition import BackendContainer
 from backend.domain.common import DomainError, Problem
@@ -19,9 +28,11 @@ from backend.domain.templates import get_template_manifest, list_template_manife
 
 router_v2 = APIRouter(prefix="/api/v2")
 
-_DEFAULT_PAGE_LIMIT = 50
-_MAX_PAGE_LIMIT = 200
-PageLimit = Annotated[int, Query(ge=1, le=_MAX_PAGE_LIMIT)]
+_TEMPLATE_FILTERS: dict[str, JsonValue] = {"collection": "resume_templates"}
+"""@brief 公开模板 cursor 的冻结 filter 绑定 / Frozen public-template cursor filter binding."""
+
+_TEMPLATE_SORT = ("id", "version")
+"""@brief 公开模板的稳定 keyset 顺序 / Stable keyset ordering for public templates."""
 
 
 def is_public_v2_path(path: str) -> bool:
@@ -69,27 +80,35 @@ def _v2_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _encode_cursor(index: int) -> str:
-    serialized = json.dumps({"v": 2, "offset": index}, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(serialized).decode().rstrip("=")
+def _decode_template_position(
+    codec: CursorCodec,
+    cursor: str | None,
+) -> tuple[str, str] | None:
+    """@brief 验证公开模板 cursor 并取得 keyset 位置 / Verify a public-template cursor and return its keyset position.
 
-
-def _decode_cursor(cursor: str | None) -> int:
+    @param codec 共享 HMAC cursor codec / Shared HMAC cursor codec.
+    @param cursor 可选不透明 cursor / Optional opaque cursor.
+    @return ``(template_id, version)`` 或首页空位置 / ``(template_id, version)`` or no first-page position.
+    @raise DomainError cursor payload 不是模板位置时抛出 / Raised when the cursor payload is not
+        a template position.
+    """
     if cursor is None:
-        return 0
-    try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        payload = json.loads(base64.b64decode(padded, altchars=b"-_", validate=True))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise DomainError(
-            Problem("http.cursor_invalid", 400, "Pagination cursor is invalid")
-        ) from error
-    if not isinstance(payload, dict) or payload.get("v") != 2:
+        return None
+    decoded = codec.decode(
+        cursor,
+        principal=None,
+        workspace_id=None,
+        filters=_TEMPLATE_FILTERS,
+        sort=_TEMPLATE_SORT,
+    )
+    if (
+        not isinstance(decoded, dict)
+        or set(decoded) != {"id", "version"}
+        or not isinstance(decoded["id"], str)
+        or not isinstance(decoded["version"], str)
+    ):
         raise DomainError(Problem("http.cursor_invalid", 400, "Pagination cursor is invalid"))
-    offset = payload.get("offset")
-    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-        raise DomainError(Problem("http.cursor_invalid", 400, "Pagination cursor is invalid"))
-    return offset
+    return decoded["id"], decoded["version"]
 
 
 @router_v2.get(
@@ -98,26 +117,38 @@ def _decode_cursor(cursor: str | None) -> int:
 )
 async def list_resume_templates_v2(
     request: Request,
-    locale: Annotated[str | None, Query(min_length=2, max_length=32)] = None,
-    cursor: str | None = None,
-    limit: PageLimit = _DEFAULT_PAGE_LIMIT,
-) -> dict[str, Any]:
+    cursor: PageCursor = None,
+    limit: PageLimit = DEFAULT_PAGE_LIMIT,
+) -> Response:
     """List public immutable templates using the v2 collection and pagination shape."""
 
-    items = [_v2_manifest(item) for item in list_template_manifests(locale)]
-    offset = _decode_cursor(cursor)
-    selected = items[offset : offset + limit]
-    next_offset = offset + len(selected)
-    has_more = next_offset < len(items)
-    payload = {
-        "items": selected,
-        "page": {
-            "next_cursor": _encode_cursor(next_offset) if has_more else None,
-            "has_more": has_more,
-        },
-    }
-    _container(request).contracts_v2.validate_definition("TemplateList", payload)
-    return payload
+    require_query(request, "cursor", "limit")
+    await require_no_body(request)
+    container = _container(request)
+    items = sorted(
+        (_v2_manifest(item) for item in list_template_manifests(None)),
+        key=lambda item: (str(item["id"]), str(item["version"])),
+    )
+    position = _decode_template_position(container.v2_cursor, cursor)
+    remaining = [
+        item
+        for item in items
+        if position is None or (str(item["id"]), str(item["version"])) > position
+    ]
+    selected = remaining[:limit]
+    next_cursor: str | None = None
+    if len(remaining) > len(selected):
+        last = selected[-1]
+        next_cursor = container.v2_cursor.encode(
+            {"id": str(last["id"]), "version": str(last["version"])},
+            principal=None,
+            workspace_id=None,
+            filters=_TEMPLATE_FILTERS,
+            sort=_TEMPLATE_SORT,
+        )
+    payload = list_response(selected, next_cursor=next_cursor)
+    container.contracts_v2.validate_definition("TemplateList", payload)
+    return json_response(request, payload, cache_control="public, max-age=300")
 
 
 @router_v2.get(
@@ -126,11 +157,13 @@ async def list_resume_templates_v2(
 )
 async def get_resume_template_v2(
     request: Request,
-    template_id: str,
+    template_id: OpaquePath,
     version: Annotated[str, Query(min_length=1, max_length=80)],
-) -> dict[str, Any]:
+) -> Response:
     """Get the exact immutable template version required by the v2 canonical path."""
 
+    require_query(request, "version")
+    await require_no_body(request)
     manifest = get_template_manifest(template_id, version)
     if manifest is None:
         raise DomainError(
@@ -138,7 +171,11 @@ async def get_resume_template_v2(
         )
     payload = _v2_manifest(manifest)
     _container(request).contracts_v2.validate_definition("TemplateManifest", payload)
-    return payload
+    return json_response(
+        request,
+        payload,
+        cache_control="public, max-age=31536000, immutable",
+    )
 
 
 __all__ = [

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import stat
 from collections.abc import Mapping
@@ -34,12 +35,68 @@ def _container_environment() -> dict[str, str]:
 
     return {
         "AIWS_ENVIRONMENT": "production",
-        "AIWS_PUBLIC_BASE_URL": "https://workspace.example.test",
-        "AIWS_IDENTITY_MODE": "trusted_proxy_hmac",
-        "AIWS_TRUSTED_PROXY_HMAC_SECRET": "test-only-hmac-secret-with-at-least-32-bytes",
+        "AIWS_PUBLIC_BASE_URL": "https://api.hmalliances.org:8022",
+        "AIWS_IDENTITY_MODE": "disabled",
+        "AIWS_CURSOR_HMAC_SECRET": "test-only-cursor-secret-with-at-least-32-bytes",
+        "AIWS_SENSITIVE_IDEMPOTENCY_HMAC_SECRET": (
+            "test-only-sensitive-idempotency-secret-32-bytes"
+        ),
+        "AIWS_IDENTITY_EMAIL_ACTIVE_KEY_ID": "email-key-2026-07",
+        "AIWS_IDENTITY_EMAIL_ENCRYPTION_KEYS": (
+            '{"email-key-2026-07":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}'
+        ),
+        "AIWS_IDENTITY_EMAIL_RATE_LIMIT_HMAC_KEY": (
+            "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"
+        ),
+        "AIWS_IDENTITY_EMAIL_FROM_ADDRESS": "identity@example.test",
+        "AIWS_IDENTITY_EMAIL_SMTP_HOST": "smtp.example.test",
         "AIWS_TRUSTED_PROXY_CIDRS": '["172.30.0.0/24"]',
         "AIWS_DASHBOARD_OPERATOR_TOKEN": "test-only-dashboard-token",
+        "AIWS_AI_PROVIDER": "openai-compatible",
+        "AIWS_AI_MODEL": "production-chat-model",
+        "AIWS_AI_BASE_URL": "https://models.example.test/v1",
+        "AIWS_AI_DATA_REGION": "private_deployment",
+        "AIWS_AI_EMBEDDING_PROVIDER": "openai-compatible",
+        "AIWS_AI_EMBEDDING_MODEL": "production-embedding-model",
+        "AIWS_AI_EMBEDDING_MODEL_REVISION": "2026-07",
+        "AIWS_AI_EMBEDDING_DIMENSION": "1024",
         "AIWS_LLM_API_KEY": "test-only-model-key",
+        "AIWS_RESUME_RENDERER_ADAPTER": "xelatex",
+        "AIWS_RESUME_XELATEX_COMMAND": "xelatex",
+        "AIWS_KNOWLEDGE_PROVIDER_SESSION_ACTIVE_KEY_ID": "launch-key-2026-07",
+        "AIWS_KNOWLEDGE_PROVIDER_SESSION_KEYS": (
+            '{"launch-key-2026-07":"CgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgo"}'
+        ),
+        "AIWS_KNOWLEDGE_CREDENTIAL_ACTIVE_KEY_ID": "vault-key-2026-07",
+        "AIWS_KNOWLEDGE_CREDENTIAL_KEYS": (
+            '{"vault-key-2026-07":"CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws"}'
+        ),
+        "AIWS_KNOWLEDGE_CREDENTIAL_FINGERPRINT_HMAC_KEY": (
+            "DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw"
+        ),
+        "AIWS_KNOWLEDGE_CREDENTIAL_REFERENCE_HMAC_KEY": (
+            "DQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0"
+        ),
+        "AIWS_KNOWLEDGE_S3_ENDPOINT": "https://objects.example.test",
+        "AIWS_KNOWLEDGE_S3_REGION": "private-deployment-1",
+        "AIWS_KNOWLEDGE_S3_BUCKET": "aiws-knowledge",
+        "AIWS_KNOWLEDGE_S3_ACCESS_KEY_ID": "test-only-access-key",
+        "AIWS_KNOWLEDGE_S3_SECRET_ACCESS_KEY": "test-only-secret-access-key",
+        "AIWS_KNOWLEDGE_MALWARE_MODE": "reject",
+        "AIWS_KNOWLEDGE_SOURCE_ALLOWED_HOST_PATTERNS": (
+            '["example.test","*.example.test"]'
+        ),
+        "AIWS_INTERVIEW_REALTIME_ACTIVE_KEY_ID": "interview-key-2026-07",
+        "AIWS_INTERVIEW_REALTIME_SIGNING_KEYS": (
+            '{"interview-key-2026-07":"FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQ"}'
+        ),
+        "AIWS_INTERVIEW_SIGNALING_URL": (
+            "wss://realtime.hmalliances.org/v2/interview"
+        ),
+        "AIWS_INTERVIEW_ICE_URLS": (
+            '["stun:stun.hmalliances.org:3478",'
+            '"turns:turn.hmalliances.org:5349?transport=tcp"]'
+        ),
     }
 
 
@@ -99,17 +156,84 @@ def test_runtime_projection_preserves_dbctl_credentials(tmp_path: Path) -> None:
     assert backend.environment == "production"
     assert backend.database.mode == "postgresql"
     assert backend.network.bind_host == "0.0.0.0"
-    assert backend.security.identity_mode == "trusted_proxy_hmac"
-    assert backend.security.trusted_proxy_hmac_secret == (
-        "test-only-hmac-secret-with-at-least-32-bytes"
+    assert backend.network.bind_port == 9000
+    assert backend.network.public_base_url == "https://api.hmalliances.org:8022"
+    assert not backend.api.legacy_v1_enabled
+    assert backend.security.identity_mode == "disabled"
+    assert backend.security.trusted_proxy_hmac_secret is None
+    assert backend.security.cursor_hmac_secret == (
+        "test-only-cursor-secret-with-at-least-32-bytes"
     )
+    assert backend.security.sensitive_idempotency_hmac_secret == (
+        "test-only-sensitive-idempotency-secret-32-bytes"
+    )
+    assert backend.hosted_identity.email.outbox.active_key_id == "email-key-2026-07"
+    assert backend.hosted_identity.email.outbox.encryption_keys[0].key == bytes([7]) * 32
+    assert backend.hosted_identity.email.outbox.rate_limit_hmac_key == bytes([9]) * 32
+    assert backend.hosted_identity.email.mode == "smtp"
+    assert backend.hosted_identity.email.smtp_host == "smtp.example.test"
+    assert backend.hosted_identity.password_breach.mode == "pwned_passwords"
     assert backend.ai.api_key == "test-only-model-key"
+    assert backend.ai.provider == "openai-compatible"
+    assert backend.ai.embedding_provider == "openai-compatible"
+    assert backend.renderer.adapter == "xelatex"
+    assert backend.knowledge.connections.provider_session_keyring.active_key_id == (
+        "launch-key-2026-07"
+    )
+    assert backend.knowledge.connections.credential_keyring.active_key_id == "vault-key-2026-07"
+    assert backend.knowledge.uploads.storage.mode == "s3"
+    assert backend.knowledge.uploads.malware.mode == "reject"
+    assert backend.knowledge.source_network.allowed_host_patterns == (
+        "example.test",
+        "*.example.test",
+    )
+    assert backend.interview.realtime.signing_keyring.active_key_id == (
+        "interview-key-2026-07"
+    )
+    assert backend.interview.realtime.active_signing_key == bytes([20]) * 32
+    assert backend.interview.realtime.signaling_url == (
+        "wss://realtime.hmalliances.org/v2/interview"
+    )
+    assert backend.interview.realtime.ice_urls[1].startswith("turns:")
     assert dashboard.database.mode == "postgresql"
     assert dashboard.api.host == "0.0.0.0"
     assert dashboard.access.mode == "operator_token"
     assert dashboard.access.token == "test-only-dashboard-token"
     assert stat.S_IMODE(source_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(runtime_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("environment_name", "mock_value", "message"),
+    (
+        ("AIWS_RESUME_RENDERER_ADAPTER", "mock", r"resume_rendering\.adapter"),
+        ("AIWS_AI_PROVIDER", "mock", r"ai\.provider/model"),
+        ("AIWS_AI_EMBEDDING_PROVIDER", "mock", r"ai\.embedding_provider/model"),
+    ),
+)
+def test_production_projection_cannot_enable_mock_product_capabilities(
+    tmp_path: Path,
+    environment_name: str,
+    mock_value: str,
+    message: str,
+) -> None:
+    """@brief 投影后的生产配置拒绝返回假成功的 mock / Projected production config rejects mocks that manufacture success.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @param environment_name 被污染的环境变量 / Environment variable being corrupted.
+    @param mock_value 非法 mock 值 / Invalid mock value.
+    @param message 预期安全错误字段 / Expected safe error field.
+    """
+
+    source_path = _bootstrap_config(tmp_path)
+    environ = _container_environment()
+    environ[environment_name] = mock_value
+    runtime = build_runtime_config(source_path, environ)
+    runtime_path = tmp_path / f"runtime-{environment_name}.json"
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match=message):
+        BackendSettings.from_file(runtime_path)
 
 
 def test_container_entrypoint_requires_dbctl_bootstrap(tmp_path: Path) -> None:
@@ -601,13 +725,67 @@ def test_default_runtime_projection_keeps_development_mocks(tmp_path: Path) -> N
     """
 
     source_path = _bootstrap_config(tmp_path)
-    runtime = build_runtime_config(source_path, {})
+    runtime = build_runtime_config(
+        source_path,
+        {
+            "AIWS_KNOWLEDGE_LOCAL_UPLOAD_SIGNING_HMAC_KEY": (
+                "Dg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4"
+            )
+        },
+    )
 
     assert runtime["environment"] == "development"
     assert runtime["database"]["mode"] == "postgresql"
     assert runtime["security"]["identity_mode"] == "development_mock"
     assert runtime["ai"]["provider"] == "mock"
     assert runtime["resume_rendering"]["adapter"] == "mock"
+    assert runtime["interview"]["realtime"]["signing_keyring"] == {
+        "active_key_id": None,
+        "keys": {},
+    }
+    assert runtime["interview"]["realtime"]["signaling_url"] is None
+
+
+def test_development_projection_preserves_explicit_interview_realtime_config(
+    tmp_path: Path,
+) -> None:
+    """@brief development 投影不得丢失持久的 realtime key ID / Development projection preserves an explicit realtime key ID.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    """
+
+    source_path = _bootstrap_config(tmp_path)
+    source = _load_mapping(source_path)
+    source["interview"]["realtime"].update(
+        {
+            "signing_keyring": {
+                "active_key_id": "interview-dev-2026-07",
+                "keys": {
+                    "interview-dev-2026-07": (
+                        "FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQ"
+                    )
+                },
+            },
+            "signaling_url": "wss://realtime.hmalliances.org/v2/interview",
+        }
+    )
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+
+    runtime = build_runtime_config(
+        source_path,
+        {
+            "AIWS_KNOWLEDGE_LOCAL_UPLOAD_SIGNING_HMAC_KEY": (
+                "Dg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4"
+            )
+        },
+    )
+
+    assert runtime["interview"]["realtime"]["signing_keyring"][
+        "active_key_id"
+    ] == "interview-dev-2026-07"
+    assert runtime["interview"]["realtime"]["signaling_url"] == (
+        "wss://realtime.hmalliances.org/v2/interview"
+    )
 
 
 def test_docker_dbinit_only_changes_connection_endpoint() -> None:
@@ -620,12 +798,197 @@ def test_docker_dbinit_only_changes_connection_endpoint() -> None:
     assert docker["database_administration"] == local["database_administration"]
 
 
-def test_production_container_requires_hmac_secret(tmp_path: Path) -> None:
-    """@brief 生产容器缺少 HMAC secret 时必须 fail closed / Production container fails closed without HMAC."""
+def test_nginx_exposes_only_the_frozen_v2_tls_surface() -> None:
+    """@brief Nginx 对齐 :8022→:9000 且只公开 OAuth/Identity/API V2 / Nginx aligns :8022-to-:9000 and exposes only OAuth, Identity, and API V2."""
+
+    source = (PROJECT_ROOT / "deploy/nginx/ai-job-workspace.conf").read_text(
+        encoding="utf-8"
+    )
+
+    assert "listen 8022 ssl http2;" in source
+    assert "server_name api.hmalliances.org;" in source
+    assert "ssl_certificate /etc/aiws/tls/fullchain.pem;" in source
+    assert "ssl_certificate_key /etc/aiws/tls/privkey.pem;" in source
+    assert "ssl_protocols TLSv1.2 TLSv1.3;" in source
+    assert "Strict-Transport-Security" in source
+    assert "server 127.0.0.1:9000;" in source
+    for boundary in (
+        "location = /.well-known/openid-configuration",
+        "location = /.well-known/oauth-protected-resource",
+        "location /oauth/",
+        "location /identity/v2/",
+        "location = /userinfo",
+        "location /api/v2/",
+    ):
+        assert boundary in source
+    assert "location /api/v1/ { return 404; }" in source
+    assert "location ~ ^/api/v2/workspaces/[^/]+/events$" in source
+    assert "proxy_buffering off;" in source
+    assert "proxy_set_header Forwarded \"\";" in source
+    assert "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for" not in source
+
+
+def test_runtime_image_contains_the_declared_sandboxed_renderer_capability() -> None:
+    """@brief 生产镜像同时提供 XeLaTeX、CJK 字体与 OS sandbox / Runtime image ships XeLaTeX, CJK fonts, and the OS sandbox together."""
+
+    source = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    for package in ("bubblewrap", "fonts-noto-cjk", "libseccomp2", "texlive-xetex"):
+        assert package in source
+
+
+def test_runtime_services_bound_the_process_tree_with_cgroup_pids() -> None:
+    """@brief XeLaTeX 子进程树由容器 cgroup 限制 / Bound the XeLaTeX process tree with the container cgroup."""
+
+    source = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
+
+    assert "x-aiws-runtime-service: &aiws-runtime-service" in source
+    assert "  pids_limit: 256\n" in source
+    assert "  cap_drop:\n    - ALL\n" in source
+
+
+def test_runtime_image_builds_from_the_fixed_v2_contract_revision() -> None:
+    """@brief 镜像构建显式复制父仓库固定的 V2 契约 / Image build explicitly copies the parent-pinned V2 contract.
+
+    @return 无返回值 / No return value.
+    """
+
+    source = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY workspace-shared-docs/contracts/v2/schema.jsonc" in source
+    assert "./workspace-shared-docs/contracts/v2/schema.jsonc" in source
+
+
+@pytest.mark.parametrize("environment", ("staging", "production"))
+@pytest.mark.parametrize("identity_mode", ("development_mock", "trusted_proxy_hmac"))
+def test_deployed_container_rejects_non_disabled_legacy_identity(
+    tmp_path: Path,
+    environment: str,
+    identity_mode: str,
+) -> None:
+    """@brief 部署运行时只接受关闭的 legacy identity 端口 / Deployed runtimes accept only a disabled legacy-identity port.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @param environment 部署环境 / Deployed environment.
+    @param identity_mode 被拒绝的旧身份模式 / Rejected legacy identity mode.
+    """
 
     source_path = _bootstrap_config(tmp_path)
     environ = _container_environment()
-    del environ["AIWS_TRUSTED_PROXY_HMAC_SECRET"]
+    environ["AIWS_ENVIRONMENT"] = environment
+    environ["AIWS_IDENTITY_MODE"] = identity_mode
 
-    with pytest.raises(ConfigurationError, match="AIWS_TRUSTED_PROXY_HMAC_SECRET"):
+    with pytest.raises(ConfigurationError, match="AIWS_IDENTITY_MODE must be disabled"):
         build_runtime_config(source_path, environ)
+
+
+@pytest.mark.parametrize("environment", ("staging", "production"))
+def test_deployed_container_rejects_unconsumed_legacy_identity_hmac_secret(
+    tmp_path: Path,
+    environment: str,
+) -> None:
+    """@brief 部署投影拒绝已无消费者的 legacy HMAC secret / Deployment projection rejects an unconsumed legacy HMAC secret.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    @param environment 部署环境 / Deployed environment.
+    """
+
+    source_path = _bootstrap_config(tmp_path)
+    environ = _container_environment()
+    environ["AIWS_ENVIRONMENT"] = environment
+    environ["AIWS_TRUSTED_PROXY_HMAC_SECRET"] = (
+        "unused-legacy-proxy-secret-with-at-least-32-bytes"
+    )
+
+    with pytest.raises(ConfigurationError, match="is not consumed"):
+        build_runtime_config(source_path, environ)
+
+
+def test_production_container_requires_cursor_secret(tmp_path: Path) -> None:
+    """@brief 多 worker cursor 缺少共享密钥时必须 fail closed / Production fails closed without a shared cursor secret.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    """
+    source_path = _bootstrap_config(tmp_path)
+    environ = _container_environment()
+    del environ["AIWS_CURSOR_HMAC_SECRET"]
+
+    with pytest.raises(ConfigurationError, match="AIWS_CURSOR_HMAC_SECRET"):
+        build_runtime_config(source_path, environ)
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    (
+        "AIWS_SENSITIVE_IDEMPOTENCY_HMAC_SECRET",
+        "AIWS_IDENTITY_EMAIL_ACTIVE_KEY_ID",
+        "AIWS_IDENTITY_EMAIL_ENCRYPTION_KEYS",
+        "AIWS_IDENTITY_EMAIL_RATE_LIMIT_HMAC_KEY",
+        "AIWS_IDENTITY_EMAIL_FROM_ADDRESS",
+        "AIWS_IDENTITY_EMAIL_SMTP_HOST",
+        "AIWS_KNOWLEDGE_PROVIDER_SESSION_ACTIVE_KEY_ID",
+        "AIWS_KNOWLEDGE_PROVIDER_SESSION_KEYS",
+        "AIWS_KNOWLEDGE_CREDENTIAL_ACTIVE_KEY_ID",
+        "AIWS_KNOWLEDGE_CREDENTIAL_KEYS",
+        "AIWS_KNOWLEDGE_CREDENTIAL_FINGERPRINT_HMAC_KEY",
+        "AIWS_KNOWLEDGE_CREDENTIAL_REFERENCE_HMAC_KEY",
+        "AIWS_KNOWLEDGE_S3_ENDPOINT",
+        "AIWS_KNOWLEDGE_S3_REGION",
+        "AIWS_KNOWLEDGE_S3_BUCKET",
+        "AIWS_KNOWLEDGE_S3_ACCESS_KEY_ID",
+        "AIWS_KNOWLEDGE_S3_SECRET_ACCESS_KEY",
+        "AIWS_KNOWLEDGE_SOURCE_ALLOWED_HOST_PATTERNS",
+        "AIWS_INTERVIEW_REALTIME_ACTIVE_KEY_ID",
+        "AIWS_INTERVIEW_REALTIME_SIGNING_KEYS",
+        "AIWS_INTERVIEW_SIGNALING_URL",
+        "AIWS_AI_PROVIDER",
+        "AIWS_AI_MODEL",
+        "AIWS_AI_BASE_URL",
+        "AIWS_AI_DATA_REGION",
+        "AIWS_AI_EMBEDDING_PROVIDER",
+        "AIWS_AI_EMBEDDING_MODEL",
+        "AIWS_AI_EMBEDDING_MODEL_REVISION",
+        "AIWS_AI_EMBEDDING_DIMENSION",
+        "AIWS_LLM_API_KEY",
+        "AIWS_RESUME_RENDERER_ADAPTER",
+    ),
+)
+def test_production_container_requires_distributed_security_keys(
+    tmp_path: Path,
+    missing_name: str,
+) -> None:
+    """@brief production 缺任一多 worker key 都 fail closed / Production fails closed without any distributed key.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @param missing_name 本 case 删除的环境变量 / Environment variable removed in this case.
+    """
+
+    source_path = _bootstrap_config(tmp_path)
+    environ = _container_environment()
+    del environ[missing_name]
+
+    with pytest.raises(ConfigurationError, match=missing_name):
+        build_runtime_config(source_path, environ)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ('[]', '{}', '{"key":""}', 'not-json'),
+)
+def test_identity_email_keyring_environment_requires_nonempty_string_mapping(
+    tmp_path: Path,
+    malformed: str,
+) -> None:
+    """@brief keyring env 拒绝错误 JSON shape 且不回显内容 / Keyring env rejects malformed shapes without echoing values.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @param malformed 非法 keyring JSON / Invalid keyring JSON.
+    """
+
+    source_path = _bootstrap_config(tmp_path)
+    environ = _container_environment()
+    environ["AIWS_IDENTITY_EMAIL_ENCRYPTION_KEYS"] = malformed
+
+    with pytest.raises(ConfigurationError, match="must be a JSON string mapping") as error:
+        build_runtime_config(source_path, environ)
+    assert malformed not in str(error.value)
