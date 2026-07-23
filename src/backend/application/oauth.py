@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from backend.config import OAuthPublicClientSettings, OAuthSettings
 from backend.domain.oauth import (
+    ACCESS_TOKEN_USER_ID_CLAIM,
     AuthorizationRequestRecord,
     OAuthTokenValidationError,
     RefreshTokenReuseDetected,
@@ -162,11 +163,19 @@ class OAuthAuthorizationService:
         *,
         subject: str,
         user_id: str,
+        login_session_id: str,
         auth_time: datetime | None = None,
     ) -> str:
-        """Complete an authenticated hosted flow and return the verified client callback URL."""
+        """Complete an authenticated hosted flow and bind its code to the login session."""
 
-        if not subject or len(subject) > 320 or not user_id or len(user_id) > 128:
+        if (
+            not subject
+            or len(subject) > 320
+            or not user_id
+            or len(user_id) > 128
+            or not login_session_id
+            or len(login_session_id) > 128
+        ):
             raise OAuthAuthorizationError("server_error", "Authenticated subject is invalid")
         request = await self.get_pending_authorization(request_id)
         raw_code = f"code_{secrets.token_urlsafe(48)}"
@@ -175,6 +184,7 @@ class OAuthAuthorizationService:
             request_id,
             subject=subject,
             user_id=user_id,
+            login_session_id=login_session_id,
             code_hash=_secret_hash(raw_code),
             auth_time=authenticated_at,
             expires_at=authenticated_at
@@ -223,6 +233,7 @@ class OAuthAuthorizationService:
         if exchange is None:
             raise OAuthTokenError("invalid_grant", "Authorization code is invalid or expired")
         access_token, _, _ = self._token_signer.issue_access_token(
+            user_id=exchange.user_id,
             subject=exchange.subject,
             client_id=exchange.client_id,
             scopes=exchange.scopes,
@@ -276,6 +287,7 @@ class OAuthAuthorizationService:
         if rotation is None:
             raise OAuthTokenError("invalid_grant", "Refresh token is invalid or expired")
         access_token, _, _ = self._token_signer.issue_access_token(
+            user_id=rotation.user_id,
             subject=rotation.subject,
             client_id=rotation.client_id,
             scopes=rotation.scopes,
@@ -306,11 +318,23 @@ class OAuthAuthorizationService:
         )
 
     async def verify_access_token(self, token: str) -> dict[str, Any]:
-        """Verify a Resource Server Bearer token including the persistent revocation list."""
+        """@brief 验证 JTI 与用户级撤销 epoch / Verify both the JTI and user-level revocation epoch.
+
+        @param token Resource Server Bearer JWT / Resource Server Bearer JWT.
+        @return 已验证 claims / Verified claims.
+        @raise OAuthTokenValidationError token 签名、JTI 或用户 epoch 已失效 / Invalid signature,
+            revoked JTI, or revoked user epoch.
+        """
 
         claims = self._token_signer.verify_access_token(token)
         if await self._repository.access_token_is_revoked(claims["jti"]):
             raise OAuthTokenValidationError("access token was revoked")
+        issued_at = datetime.fromtimestamp(claims["iat"], UTC)
+        if await self._repository.user_access_tokens_are_revoked(
+            claims[ACCESS_TOKEN_USER_ID_CLAIM],
+            issued_at,
+        ):
+            raise OAuthTokenValidationError("access token was revoked for its user")
         return claims
 
     def _token_client_and_redirect(

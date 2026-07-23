@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import json5
@@ -21,6 +22,7 @@ from backend.infrastructure.identity import (
     HEADER_WORKSPACE_ID,
     IDENTITY_SIGNATURE_VERSION,
     DevelopmentMockIdentityResolver,
+    DisabledLegacyIdentityResolver,
     IdentityVerificationError,
     TrustedProxyHMACIdentityResolver,
     build_identity_resolver,
@@ -97,9 +99,26 @@ def _write_settings(
     payload = json5.loads((PROJECT_ROOT / "example.jsonc").read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
     payload["environment"] = environment
+    if environment not in {"development", "test"}:
+        payload["hosted_identity"]["email"].update(
+            {
+                "mode": "smtp",
+                "from_address": "identity@example.test",
+                "smtp_host": "smtp.example.test",
+            }
+        )
+        payload["hosted_identity"]["password_breach"]["mode"] = "pwned_passwords"
     if security is None:
         payload.pop("security", None)
     else:
+        security.setdefault(
+            "sensitive_idempotency_hmac_secret",
+            (
+                "test-sensitive-idempotency-secret-at-least-32-bytes"
+                if environment not in {"development", "test"}
+                else None
+            ),
+        )
         payload["security"] = security
     path = tmp_path / "config.jsonc"
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -114,33 +133,67 @@ def test_security_section_is_always_explicit(tmp_path: Path) -> None:
 
 
 def test_production_rejects_development_mock_identity_mode(tmp_path: Path) -> None:
-    """@brief production 配置必须选择可验证 HMAC / Production config must select verifiable HMAC."""
+    """@brief production 不得保留开发 mock 身份边界 / Production must not retain the development mock identity boundary."""
     path = _write_settings(
         tmp_path,
         environment="production",
         security={
             "identity_mode": "development_mock",
             "trusted_proxy_hmac_secret": None,
+            "cursor_hmac_secret": "test-cursor-secret-at-least-32-bytes",
             "trusted_proxy_max_clock_skew_seconds": 60,
         },
     )
-    with pytest.raises(ConfigurationError, match="trusted_proxy_hmac"):
+    with pytest.raises(ConfigurationError, match="only allowed in development/test"):
         BackendSettings.from_file(path)
 
 
-def test_production_requires_postgresql_even_with_trusted_identity(tmp_path: Path) -> None:
+def test_production_requires_postgresql_with_legacy_identity_disabled(tmp_path: Path) -> None:
     """@brief production 不能以 memory repository 启动 / Production cannot start with the memory repository."""
     path = _write_settings(
         tmp_path,
         environment="production",
         security={
-            "identity_mode": "trusted_proxy_hmac",
-            "trusted_proxy_hmac_secret": _TEST_SECRET,
+            "identity_mode": "disabled",
+            "trusted_proxy_hmac_secret": None,
+            "cursor_hmac_secret": "test-cursor-secret-at-least-32-bytes",
             "trusted_proxy_max_clock_skew_seconds": 60,
         },
     )
     with pytest.raises(ConfigurationError, match=r"database\.mode must be postgresql"):
         BackendSettings.from_file(path)
+
+
+def test_cursor_hmac_secret_is_explicit_and_production_safe(tmp_path: Path) -> None:
+    """@brief Cursor 密钥必须足够长且生产环境不得随机生成 / Cursor secrets are strong and explicit in production.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    """
+    short_path = _write_settings(
+        tmp_path,
+        environment="development",
+        security={
+            "identity_mode": "development_mock",
+            "trusted_proxy_hmac_secret": None,
+            "cursor_hmac_secret": "too-short",
+            "trusted_proxy_max_clock_skew_seconds": 60,
+        },
+    )
+    with pytest.raises(ConfigurationError, match="cursor_hmac_secret"):
+        BackendSettings.from_file(short_path)
+
+    production_path = _write_settings(
+        tmp_path,
+        environment="production",
+        security={
+            "identity_mode": "disabled",
+            "trusted_proxy_hmac_secret": None,
+            "cursor_hmac_secret": None,
+            "trusted_proxy_max_clock_skew_seconds": 60,
+        },
+    )
+    with pytest.raises(ConfigurationError, match="cursor_hmac_secret"):
+        BackendSettings.from_file(production_path)
 
 
 def test_configuration_rejects_unsafe_outbound_proxy_url(tmp_path: Path) -> None:
@@ -151,6 +204,7 @@ def test_configuration_rejects_unsafe_outbound_proxy_url(tmp_path: Path) -> None
         security={
             "identity_mode": "development_mock",
             "trusted_proxy_hmac_secret": None,
+            "cursor_hmac_secret": None,
             "trusted_proxy_max_clock_skew_seconds": 300,
         },
     )
@@ -209,6 +263,7 @@ def test_trusted_proxy_source_accepts_only_configured_ip_networks(tmp_path: Path
             security={
                 "identity_mode": "development_mock",
                 "trusted_proxy_hmac_secret": None,
+                "cursor_hmac_secret": None,
                 "trusted_proxy_max_clock_skew_seconds": 300,
             },
         )
@@ -233,28 +288,69 @@ def test_mock_resolver_cannot_be_constructed_for_production() -> None:
     ) == ActorScope("usr_test", "ws_local", "usr_local")
 
 
-def test_identity_factory_reads_direct_secret_without_exposing_it() -> None:
-    """@brief HMAC factory 只读直接配置且 repr 不泄密 / HMAC factory reads direct config without repr leakage."""
+def test_legacy_identity_factory_reads_direct_secret_without_exposing_it() -> None:
+    """@brief 显式 legacy HMAC factory 只读直接配置且 repr 不泄密 / Explicit legacy HMAC factory reads direct config without repr leakage."""
     security = SecuritySettings(
         identity_mode="trusted_proxy_hmac",
         trusted_proxy_hmac_secret=_TEST_SECRET,
+        cursor_hmac_secret="test-cursor-secret-at-least-32-bytes",
+        sensitive_idempotency_hmac_secret="test-sensitive-idempotency-secret-32-bytes",
         trusted_proxy_max_clock_skew_seconds=60,
     )
     default_scope = ActorScope("usr_local", "ws_local", "usr_local")
     resolver = build_identity_resolver(
-        environment="production",
+        environment="development",
         default_scope=default_scope,
         security=security,
     )
     assert isinstance(resolver, TrustedProxyHMACIdentityResolver)
     assert _TEST_SECRET not in repr(security)
+    assert "test-cursor-secret-at-least-32-bytes" not in repr(security)
+    assert "test-sensitive-idempotency-secret-32-bytes" not in repr(security)
 
 
-def test_http_middleware_rejects_unsigned_scope_headers_and_accepts_signed_scope(
+def test_disabled_legacy_identity_resolver_fails_closed() -> None:
+    """@brief V2-only 运行时的 legacy identity 端口始终拒绝 / The V2-only runtime's legacy identity port always fails closed."""
+
+    security = SecuritySettings(
+        identity_mode="disabled",
+        trusted_proxy_hmac_secret=None,
+        cursor_hmac_secret="test-cursor-secret-at-least-32-bytes",
+        sensitive_idempotency_hmac_secret="test-sensitive-idempotency-secret-32-bytes",
+        trusted_proxy_max_clock_skew_seconds=60,
+    )
+    resolver = build_identity_resolver(
+        environment="production",
+        default_scope=ActorScope("usr_local", "ws_local", "usr_local"),
+        security=security,
+    )
+
+    assert isinstance(resolver, DisabledLegacyIdentityResolver)
+    with pytest.raises(IdentityVerificationError, match=r"identity\.legacy_disabled"):
+        resolver.resolve(
+            method="GET",
+            path="/api/v1/resumes",
+            headers=_signed_headers(method="GET"),
+        )
+
+
+def test_legacy_v1_http_surface_is_closed_by_default() -> None:
+    """@brief 默认应用工厂不挂载 API V1 路由 / The default application factory does not mount API V1 routes."""
+
+    settings = BackendSettings.from_file(PROJECT_ROOT / "example.jsonc")
+
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/api/v1/resumes")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
+
+
+def test_explicit_legacy_v1_migration_rejects_unsigned_and_untrusted_scope(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """@brief HTTP 中间件只能接受经可信代理签名的生产身份 / HTTP middleware accepts production identity only when proxy-signed."""
+    """@brief 显式 V1 迁移边界只接受可信对端签名的身份 / The explicit V1 migration boundary accepts only trusted-peer-signed identity."""
     settings = BackendSettings.from_file(
         _write_settings(
             tmp_path,
@@ -262,10 +358,12 @@ def test_http_middleware_rejects_unsigned_scope_headers_and_accepts_signed_scope
             security={
                 "identity_mode": "trusted_proxy_hmac",
                 "trusted_proxy_hmac_secret": _TEST_SECRET,
+                "cursor_hmac_secret": "test-cursor-secret-at-least-32-bytes",
                 "trusted_proxy_max_clock_skew_seconds": 300,
             },
         )
     )
+    settings = replace(settings, api=replace(settings.api, legacy_v1_enabled=True))
     with TestClient(create_app(settings), client=("127.0.0.1", 50_000)) as client:
         rejected = client.get(
             "/api/v1/resumes",

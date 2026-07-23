@@ -193,6 +193,31 @@ class DevelopmentMockIdentityResolver:
         )
 
 
+class DisabledLegacyIdentityResolver:
+    """@brief 生产 V2 运行时的关闭式 legacy 身份端口 / Closed legacy-identity port for the production V2 runtime."""
+
+    def resolve(
+        self,
+        *,
+        method: str,
+        path: str | bytes,
+        headers: IdentityHeaders,
+        query_string: str | bytes = b"",
+    ) -> ActorScope:
+        """@brief 拒绝任何意外到达的 legacy 身份请求 / Reject every unexpected legacy identity request.
+
+        @param method 未使用的请求方法 / Unused request method.
+        @param path 未使用的原始路径 / Unused raw path.
+        @param headers 未使用的请求头 / Unused request headers.
+        @param query_string 未使用的原始查询 / Unused raw query.
+        @return 永不返回 / Never returns.
+        @raise IdentityVerificationError 始终抛出 / Always raised.
+        """
+
+        del method, path, headers, query_string
+        raise IdentityVerificationError("identity.legacy_disabled")
+
+
 class TrustedProxyHMACIdentityResolver:
     """@brief 验证可信代理 HMAC 断言 / Verify trusted-proxy HMAC assertions.
 
@@ -298,6 +323,8 @@ def build_identity_resolver(
     @raise ConfigurationError HMAC 密钥缺失或 mock 被用于非开发环境时抛出 /
         Raised when the HMAC secret is absent or mock identity is used outside development.
     """
+    if security.identity_mode == "disabled":
+        return DisabledLegacyIdentityResolver()
     if security.identity_mode == "development_mock":
         return DevelopmentMockIdentityResolver(default_scope, environment=environment)
     if security.identity_mode == "trusted_proxy_hmac":

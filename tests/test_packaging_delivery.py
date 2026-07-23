@@ -53,6 +53,7 @@ def test_built_wheel_contains_layered_dbctl_and_all_resources(tmp_path: Path) ->
 
     expected_entries = {
         "backend/resources/ai-job-workspace.contract.schema.json",
+        "backend/resources/api-v2.schema.jsonc",
         "dbctl/resources/example.jsonc",
         "dbctl/resources/dbinit.jsonc",
         "dbctl/resources/alembic/versions/20260721_0007_protect_alembic_version_table.py",
@@ -97,6 +98,7 @@ from fastapi.testclient import TestClient
 
 assert str(wheel) in str(dbctl.__file__)
 ContractValidator.from_json(read_contract_schema_text())
+ContractValidator.from_jsonc(read_contract_schema_text('v2'))
 assert 'database_administration' in read_default_text('dbinit.jsonc')
 with alembic_script_location() as scripts:
     assert (scripts / 'env.py').is_file()

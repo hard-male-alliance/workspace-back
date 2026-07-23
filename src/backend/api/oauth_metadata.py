@@ -8,6 +8,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from backend.api.v2 import PUBLIC_ORIGIN
+from backend.domain.oauth_scopes import RESOURCE_OAUTH_SCOPES, SUPPORTED_OAUTH_SCOPES
 
 OPENID_CONFIGURATION_PATH = "/.well-known/openid-configuration"
 PROTECTED_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource"
@@ -18,18 +19,11 @@ REVOCATION_ENDPOINT = f"{PUBLIC_ORIGIN}/oauth/revoke"
 JWKS_URI = f"{PUBLIC_ORIGIN}/oauth/jwks"
 USERINFO_ENDPOINT = f"{PUBLIC_ORIGIN}/userinfo"
 
-# Keep this list tied to scopes already published by the v2 contract examples. New scopes may be
-# added only when their authorization policy and protected routes are implemented together.
-SUPPORTED_SCOPES = (
-    "openid",
-    "profile",
-    "offline_access",
-    "workspace.read",
-    "resume.read",
-    "resume.write",
-    "resume.render",
-)
-RESOURCE_SCOPES = tuple(scope for scope in SUPPORTED_SCOPES if "." in scope)
+SUPPORTED_SCOPES = SUPPORTED_OAUTH_SCOPES
+"""@brief OAuth discovery 暴露的领域唯一 scope 目录 / Domain-owned scope catalog exposed by OAuth discovery."""
+
+RESOURCE_SCOPES = RESOURCE_OAUTH_SCOPES
+"""@brief Protected Resource metadata 暴露的资源 scope / Resource scopes exposed by Protected Resource metadata."""
 
 router_oauth_metadata = APIRouter()
 
@@ -77,6 +71,8 @@ async def openid_configuration() -> JSONResponse:
                 "nonce",
                 "name",
                 "locale",
+                "email",
+                "email_verified",
             ],
             "request_parameter_supported": False,
             "request_uri_parameter_supported": False,

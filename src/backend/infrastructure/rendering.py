@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
+import json
 import os
 import shutil
 import signal
+import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from pypdf import PdfReader
+
 from backend.config import RendererSettings
 from backend.domain.common import DomainError, Problem
+from backend.infrastructure.process_confinement import (
+    ProcessConfinementPlan,
+    ProcessConfinementUnavailable,
+    confinement_plan_for,
+)
 from workspace_shared.ids import new_opaque_id
-
-_resource: Any = importlib.import_module("resource") if os.name == "posix" else None
-"""@brief POSIX resource 模块；非 POSIX 平台保持为空 / POSIX resource module, absent elsewhere."""
 
 _killpg: Callable[[int, int], None] | None = getattr(os, "killpg", None)
 """@brief POSIX 进程组信号函数 / POSIX process-group signal function."""
@@ -85,17 +91,9 @@ class MockRenderer:
         """
         await asyncio.sleep(0)
         pdf = _minimal_pdf(document["title"])
-        artifact_id = new_opaque_id("art")
-        nodes = [
-            {
-                "node_kind": "section",
-                "node_id": section["section_id"],
-                "field_path": [],
-                "page": 1,
-                "rects": [{"x": 36.0, "y": 760.0 - index * 36.0, "width": 520.0, "height": 24.0, "unit": "pt"}],
-            }
-            for index, section in enumerate(document["sections"])
-        ]
+        worker_bound = "artifact_id" in document
+        artifact_id = _required_artifact_id(document)
+        nodes = _mock_source_nodes(document, worker_bound=worker_bound)
         source_map = {
             "schema_version": "1.0",
             "resume_id": document["id"],
@@ -107,18 +105,89 @@ class MockRenderer:
         return pdf, source_map
 
 
-class SandboxedXeLaTeXRenderer:
-    """@brief 仅在 OS sandbox 内运行的 XeLaTeX renderer / XeLaTeX renderer that runs only inside an OS sandbox.
+def _mock_source_nodes(
+    document: dict[str, Any],
+    *,
+    worker_bound: bool,
+) -> list[dict[str, Any]]:
+    """@brief 分别投影 V2 canonical 与旧版 mock source nodes / Project V2-canonical and legacy mock source nodes.
 
-    @note 若 bubblewrap 不可用则 fail closed；`-no-shell-escape` 自身不是安全边界。
+    @param document renderer 输入 SIR / Renderer-input SIR.
+    @param worker_bound 是否由 V2 worker 预绑定 Artifact ID / Whether the V2 worker pre-bound the Artifact ID.
+    @return 对应调用边界的 source nodes / Source nodes for the calling boundary.
+    """
+    sections = document["sections"]
+    if not isinstance(sections, list):
+        raise DomainError(
+            Problem("resume.invalid_render_input", 422, "Resume sections must be an array")
+        )
+    nodes: list[dict[str, Any]] = []
+    if worker_bound:
+        nodes.append(
+            {
+                "entity_id": document["id"],
+                "field_path": ["title"],
+                "page": 1,
+                "rects": [
+                    {
+                        "x": 36.0,
+                        "y": 760.0,
+                        "width": 520.0,
+                        "height": 24.0,
+                        "unit": "pt",
+                    }
+                ],
+            }
+        )
+    for index, section in enumerate(sections, start=1):
+        if not isinstance(section, dict) or not isinstance(section.get("section_id"), str):
+            raise DomainError(
+                Problem("resume.invalid_render_input", 422, "Resume section identity is invalid")
+            )
+        rect = {
+            "x": 36.0,
+            "y": 760.0 - index * 36.0,
+            "width": 520.0,
+            "height": 24.0,
+            "unit": "pt",
+        }
+        nodes.append(
+            {
+                **(
+                    {"entity_id": section["section_id"]}
+                    if worker_bound
+                    else {"node_kind": "section", "node_id": section["section_id"]}
+                ),
+                "field_path": [],
+                "page": 1,
+                "rects": [rect],
+            }
+        )
+    return nodes
+
+
+class SandboxedXeLaTeXRenderer:
+    """@brief 仅在已 probe OS confinement 内运行的 XeLaTeX renderer / XeLaTeX renderer running only inside probed OS confinement.
+
+    @note 生产必需边界是无特权 Landlock/libseccomp；Bubblewrap 仅为真实 probe 后的额外层。
     """
 
-    def __init__(self, settings: RendererSettings) -> None:
+    def __init__(
+        self,
+        settings: RendererSettings,
+        *,
+        confinement_plan: ProcessConfinementPlan | None = None,
+        xelatex_path: str | None = None,
+    ) -> None:
         """@brief 初始化受限 renderer / Initialize the restricted renderer.
 
         @param settings 编译约束 / Compilation constraints.
+        @param confinement_plan 已完成 capability probe 的隔离计划 / Capability-probed confinement plan.
+        @param xelatex_path 已解析的 XeLaTeX executable / Resolved XeLaTeX executable.
         """
         self._settings = settings
+        self._confinement_plan = confinement_plan or confinement_plan_for("development")
+        self._xelatex_path = xelatex_path or shutil.which(settings.xelatex_command)
 
     async def render(self, document: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
         """@brief 在隔离进程中编译固定模板 / Compile a fixed template in an isolated process.
@@ -127,23 +196,13 @@ class SandboxedXeLaTeXRenderer:
         @return PDF bytes and semantic source map / PDF 字节与语义 source map.
         @raise DomainError sandbox 缺失、超时或编译失败时抛出 / Raised for a missing sandbox, timeout, or compilation failure.
         """
-        if _resource is None or _killpg is None or _sigkill is None:
+        if _killpg is None or _sigkill is None or self._xelatex_path is None:
             raise DomainError(
                 Problem(
                     "resume.renderer_sandbox_unavailable",
                     503,
                     "Secure XeLaTeX sandbox is unavailable",
                     detail="Real XeLaTeX rendering requires a POSIX process sandbox.",
-                )
-            )
-        bubblewrap = shutil.which("bwrap")
-        if bubblewrap is None:
-            raise DomainError(
-                Problem(
-                    "resume.renderer_sandbox_unavailable",
-                    503,
-                    "Secure XeLaTeX sandbox is unavailable",
-                    detail="Real XeLaTeX rendering is disabled until an OS sandbox is installed.",
                 )
             )
         latex = _safe_template(document)
@@ -153,15 +212,20 @@ class SandboxedXeLaTeXRenderer:
             workdir = Path(temporary_directory)
             source_path = workdir / "resume.tex"
             source_path.write_text(latex, encoding="utf-8")
-            argv = _bubblewrap_argv(bubblewrap, self._settings, workdir)
+            argv = _renderer_process_argv(
+                self._xelatex_path,
+                self._settings,
+                workdir,
+                self._confinement_plan,
+            )
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=workdir,
+                env=_renderer_process_environment(workdir),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
-                preexec_fn=_resource_limiter(self._settings),
             )
             process_group_cleaned = False
             try:
@@ -190,6 +254,15 @@ class SandboxedXeLaTeXRenderer:
                         )
                     ) from error
                 output_path = workdir / "resume.pdf"
+                if process.returncode == 70:
+                    raise DomainError(
+                        Problem(
+                            "resume.renderer_sandbox_unavailable",
+                            503,
+                            "Secure XeLaTeX sandbox is unavailable",
+                            retryable=True,
+                        )
+                    )
                 if process.returncode != 0 or not output_path.is_file():
                     raise DomainError(
                         Problem(
@@ -205,25 +278,87 @@ class SandboxedXeLaTeXRenderer:
             finally:
                 if not process_group_cleaned:
                     await _terminate_process_group(process)
-        artifact_id = new_opaque_id("art")
+        artifact_id = _required_artifact_id(document)
+        page_count = _pdf_page_count(content)
         source_map = {
             "schema_version": "1.0",
             "resume_id": document["id"],
             "resume_revision": document["revision"],
             "artifact_id": artifact_id,
-            "page_count": 1,
+            "page_count": page_count,
             "nodes": [],
         }
         return content, source_map
 
 
-def renderer_for(settings: RendererSettings) -> MockRenderer | SandboxedXeLaTeXRenderer:
+def renderer_for(
+    settings: RendererSettings,
+    *,
+    environment: str,
+) -> MockRenderer | SandboxedXeLaTeXRenderer:
     """@brief 按配置选择 renderer / Select a renderer from configuration.
 
     @param settings 渲染设置 / Renderer settings.
+    @param environment 已验证部署环境 / Validated deployment environment.
     @return 私有 renderer 实现 / Private renderer implementation.
     """
-    return MockRenderer() if settings.adapter == "mock" else SandboxedXeLaTeXRenderer(settings)
+    if settings.adapter == "mock":
+        return MockRenderer()
+    if _killpg is None or _sigkill is None:
+        raise RuntimeError("configured XeLaTeX rendering requires POSIX process controls")
+    xelatex_path = shutil.which(settings.xelatex_command)
+    if xelatex_path is None:
+        raise RuntimeError("configured XeLaTeX executable is unavailable")
+    try:
+        confinement_plan = confinement_plan_for(environment)
+    except ProcessConfinementUnavailable as error:
+        raise RuntimeError("configured XeLaTeX rendering requires strong confinement") from error
+    return SandboxedXeLaTeXRenderer(
+        settings,
+        confinement_plan=confinement_plan,
+        xelatex_path=xelatex_path,
+    )
+
+
+def _required_artifact_id(document: dict[str, Any]) -> str:
+    """@brief 优先读取 worker 预分配 ID，否则为旧调用生成 ID / Prefer the worker-preallocated ID, otherwise generate one for legacy callers.
+
+    @param document renderer 输入 envelope / Renderer input envelope.
+    @return 非空 Artifact ID；V2 worker 路径始终稳定 / Non-empty Artifact ID, always stable on the V2 worker path.
+    @raise DomainError 显式 ID 非字符串或为空 / Raised when an explicit ID is non-string or empty.
+    """
+    value = document.get("artifact_id")
+    if value is None:
+        return new_opaque_id("art")
+    if not isinstance(value, str) or not value:
+        raise DomainError(
+            Problem(
+                "resume.artifact_identity_missing",
+                500,
+                "Renderer input is missing its Artifact identity",
+            )
+        )
+    return value
+
+
+def _pdf_page_count(content: bytes) -> int:
+    """@brief 为 renderer source map 读取实际 PDF 页数 / Read the actual PDF page count for the renderer source map.
+
+    @param content 受输出大小限制的 PDF / Output-size-bounded PDF.
+    @return 至少为一的页数 / Page count of at least one.
+    @raise DomainError PDF 结构无效或没有页面 / Raised when the PDF structure is invalid or empty.
+    """
+    try:
+        page_count = len(PdfReader(BytesIO(content)).pages)
+    except Exception as error:
+        raise DomainError(
+            Problem("resume.invalid_pdf", 422, "Renderer produced an invalid PDF")
+        ) from error
+    if page_count < 1:
+        raise DomainError(
+            Problem("resume.invalid_pdf", 422, "Renderer produced a PDF without pages")
+        )
+    return page_count
 
 
 def _minimal_pdf(title: object) -> bytes:
@@ -261,7 +396,16 @@ def _safe_template(document: dict[str, Any]) -> str:
     """
     title = _latex_escape(str(document.get("title", "")))
     full_name = _latex_escape(str(document.get("profile", {}).get("full_name", "")))
-    return "\\documentclass[10pt]{article}\n\\usepackage{fontspec}\n\\pagestyle{empty}\n\\begin{document}\n\\section*{" + title + "}\n" + full_name + "\n\\end{document}\n"
+    return (
+        "\\documentclass[10pt]{article}\n"
+        "\\usepackage{fontspec}\n"
+        "\\setmainfont{Noto Sans CJK SC}\n"
+        "\\pagestyle{empty}\n"
+        "\\begin{document}\n"
+        f"\\section*{{{title}}}\n"
+        f"{full_name}\n"
+        "\\end{document}\n"
+    )
 
 
 def _latex_escape(value: str) -> str:
@@ -274,20 +418,120 @@ def _latex_escape(value: str) -> str:
     return "".join(replacements.get(character, character) for character in value)
 
 
-def _bubblewrap_argv(bubblewrap: str, settings: RendererSettings, workdir: Path) -> list[str]:
-    """@brief 生成固定 bubblewrap 参数 / Build fixed bubblewrap arguments.
+def _renderer_process_argv(
+    xelatex_path: str,
+    settings: RendererSettings,
+    workdir: Path,
+    confinement_plan: ProcessConfinementPlan,
+) -> list[str]:
+    """@brief 构造 direct strong 或经 probe Bubblewrap 的 launcher / Build a direct-strong or probed-Bubblewrap launcher.
+
+    @param xelatex_path 已解析 XeLaTeX executable / Resolved XeLaTeX executable.
+    @param settings 渲染限制 / Render limits.
+    @param workdir 私有工作目录 / Private work directory.
+    @param confinement_plan 已 probe 的隔离计划 / Probed confinement plan.
+    @return 可直接 exec 的 argv / Directly executable argv.
+    """
+
+    direct = _renderer_child_argv(xelatex_path, settings, workdir, confinement_plan)
+    if confinement_plan.bubblewrap is None:
+        return direct
+    confined = _renderer_child_argv(
+        xelatex_path,
+        settings,
+        Path("/work"),
+        confinement_plan,
+    )
+    return _bubblewrap_argv(
+        confinement_plan.bubblewrap,
+        settings,
+        workdir,
+        child_argv=confined,
+        xelatex_path=xelatex_path,
+    )
+
+
+def _renderer_child_argv(
+    xelatex_path: str,
+    settings: RendererSettings,
+    workdir: Path,
+    confinement_plan: ProcessConfinementPlan,
+) -> list[str]:
+    """@brief 构造先限制再 exec XeLaTeX 的 fresh Python child / Build a fresh Python child that confines before execing XeLaTeX.
+
+    @param xelatex_path 已解析 XeLaTeX executable / Resolved XeLaTeX executable.
+    @param settings 渲染限制 / Render limits.
+    @param workdir child 可见的工作目录 / Child-visible work directory.
+    @param confinement_plan 必须实施的隔离计划 / Confinement plan that must be enforced.
+    @return renderer sandbox argv / Renderer-sandbox argv.
+    """
+
+    font_directories = [
+        str(Path(directory).resolve())
+        for directory in settings.allowed_font_directories
+        if Path(directory).is_dir()
+    ]
+    return [
+        sys.executable,
+        "-I",
+        "-B",
+        "-m",
+        "backend.infrastructure.resume_render_sandbox",
+        confinement_plan.mode.value,
+        str(workdir),
+        xelatex_path,
+        str(settings.memory_limit_bytes),
+        str(settings.max_output_bytes),
+        str(settings.timeout_ms),
+        json.dumps(font_directories, separators=(",", ":")),
+    ]
+
+
+def _bubblewrap_argv(
+    bubblewrap: str,
+    settings: RendererSettings,
+    workdir: Path,
+    *,
+    child_argv: Sequence[str],
+    xelatex_path: str,
+) -> list[str]:
+    """@brief 生成真实 probe 后才使用的额外 Bubblewrap 层 / Build the extra Bubblewrap layer used only after a real probe.
 
     @param bubblewrap bwrap 可执行路径 / bwrap executable path.
     @param settings 渲染限制 / Render limits.
     @param workdir 临时工作目录 / Temporary work directory.
+    @param child_argv 内层 Landlock/libseccomp launcher / Inner Landlock/libseccomp launcher.
+    @param xelatex_path XeLaTeX executable path / XeLaTeX executable 路径.
     @return 不含 shell 的 argv / Shell-free argv.
     """
     argv = [
         bubblewrap,
         "--die-with-parent",
         "--new-session",
+        "--unshare-user",
+        "--unshare-ipc",
         "--unshare-net",
         "--unshare-pid",
+        "--unshare-uts",
+        "--clearenv",
+        "--setenv",
+        "HOME",
+        "/work",
+        "--setenv",
+        "LANG",
+        "C.UTF-8",
+        "--setenv",
+        "LC_ALL",
+        "C.UTF-8",
+        "--setenv",
+        "PATH",
+        f"{sys.prefix}/bin:{os.defpath}",
+        "--setenv",
+        "PYTHONHASHSEED",
+        "0",
+        "--setenv",
+        "TMPDIR",
+        "/work/tmp",
         "--proc",
         "/proc",
         "--dev",
@@ -303,46 +547,94 @@ def _bubblewrap_argv(bubblewrap: str, settings: RendererSettings, workdir: Path)
         "--ro-bind-try",
         "/lib64",
         "/lib64",
+        "--dir",
+        "/etc",
+        "--ro-bind-try",
+        "/etc/fonts",
+        "/etc/fonts",
+        "--ro-bind-try",
+        "/etc/texmf",
+        "/etc/texmf",
+        "--dir",
+        "/var",
+        "--dir",
+        "/var/cache",
+        "--ro-bind-try",
+        "/var/cache/fontconfig",
+        "/var/cache/fontconfig",
+        "--dir",
+        "/var/lib",
+        "--ro-bind-try",
+        "/var/lib/texmf",
+        "/var/lib/texmf",
         "--bind",
         str(workdir),
         "/work",
         "--chdir",
         "/work",
     ]
+    for runtime_root in _renderer_runtime_roots(xelatex_path):
+        argv.extend(_bubblewrap_destination_directories(runtime_root))
+        argv.extend(["--ro-bind", str(runtime_root), str(runtime_root)])
     for font_directory in settings.allowed_font_directories:
         source = Path(font_directory)
         if source.is_dir():
             argv.extend(["--ro-bind", str(source.resolve()), str(source.resolve())])
-    argv.extend(
-        [
-            settings.xelatex_command,
-            "-no-shell-escape",
-            "-halt-on-error",
-            "-file-line-error",
-            "-interaction=nonstopmode",
-            "-output-directory=/work",
-            "resume.tex",
-        ]
-    )
+    argv.extend(child_argv)
     return argv
 
 
-def _resource_limiter(settings: RendererSettings) -> Any:
-    """@brief 返回子进程资源限制器 / Return a child-process resource limiter.
+def _renderer_runtime_roots(xelatex_path: str) -> tuple[Path, ...]:
+    """@brief 返回 Bubblewrap 中 `/usr` 外的 runtime roots / Return runtime roots outside `/usr` for Bubblewrap.
 
-    @param settings 渲染限制 / Render limits.
-    @return POSIX pre-exec callable / POSIX pre-exec callable.
+    @param xelatex_path XeLaTeX executable / XeLaTeX executable.
+    @return 稳定去重的额外只读 roots / Stable deduplicated extra read-only roots.
     """
-    if _resource is None:
-        raise RuntimeError("POSIX resource limits are unavailable on this platform")
 
-    def limit_resources() -> None:
-        """@brief 在 child 中设置 rlimit / Set rlimits in the child."""
-        _resource.setrlimit(_resource.RLIMIT_AS, (settings.memory_limit_bytes, settings.memory_limit_bytes))
-        _resource.setrlimit(_resource.RLIMIT_FSIZE, (settings.max_output_bytes, settings.max_output_bytes))
-        _resource.setrlimit(_resource.RLIMIT_NPROC, (32, 32))
+    roots: set[Path] = set()
+    for candidate in (
+        Path(sys.prefix).resolve(),
+        Path(sys.base_prefix).resolve(),
+        Path(xelatex_path).resolve().parent,
+    ):
+        try:
+            candidate.relative_to("/usr")
+        except ValueError:
+            roots.add(candidate)
+    return tuple(sorted(roots, key=str))
 
-    return limit_resources
+
+def _bubblewrap_destination_directories(path: Path) -> list[str]:
+    """@brief 在空 mount namespace 中创建 mount parent / Create mount parents in an empty namespace.
+
+    @param path 待挂载绝对路径 / Absolute path to mount.
+    @return 从根到叶的 ``--dir`` argv / Root-to-leaf ``--dir`` argv.
+    """
+
+    arguments: list[str] = []
+    for parent in reversed(path.parents):
+        if parent == Path("/"):
+            continue
+        arguments.extend(["--dir", str(parent)])
+    return arguments
+
+
+def _renderer_process_environment(workdir: Path) -> dict[str, str]:
+    """@brief 为 launcher 构造不含 backend secrets 的 environment / Build a launcher environment without backend secrets.
+
+    @param workdir 私有工作目录 / Private work directory.
+    @return 最小 Python launcher environment / Minimal Python-launcher environment.
+    """
+
+    private_directory = str(workdir)
+    return {
+        "HOME": private_directory,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": os.defpath,
+        "PYTHONHASHSEED": "0",
+        "TMPDIR": private_directory,
+    }
 
 
 async def _collect_bounded_process_output(

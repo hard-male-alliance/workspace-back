@@ -5,7 +5,7 @@ import os
 import secrets
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import json5
 
@@ -27,7 +27,9 @@ from dbctl.domain.database import (
     ConnectionCatalog,
     DatabaseBlueprint,
     DatabaseTarget,
+    DataRegion,
     DbctlSettings,
+    WorkspacePlan,
 )
 from dbctl.domain.errors import DomainError
 from dbctl.domain.names import DatabaseName, RoleName, SchemaName
@@ -427,7 +429,34 @@ def _decode_database_declaration(
         raise DbctlConfigurationError(
             "observability_schema 已由 migration 固定为 observability，不能重命名。"
         )
-    blueprint = DatabaseBlueprint(database=database, roles=roles, schemas=schemas)
+    data_region = _required_text(administration, "v2_default_data_region")
+    if data_region not in {"cn", "global", "private_deployment"}:
+        raise DbctlConfigurationError(
+            "database_administration.v2_default_data_region 必须是 cn、global 或 private_deployment。"
+        )
+    raw_workspace_plans = _require_mapping(
+        administration.get("v2_legacy_workspace_plans"),
+        "database_administration.v2_legacy_workspace_plans",
+    )
+    workspace_plans: list[tuple[str, WorkspacePlan]] = []
+    for workspace_id, plan in raw_workspace_plans.items():
+        if (
+            not isinstance(workspace_id, str)
+            or not workspace_id
+            or workspace_id.strip() != workspace_id
+            or plan not in {"personal", "team", "enterprise"}
+        ):
+            raise DbctlConfigurationError(
+                "database_administration.v2_legacy_workspace_plans 必须将非空 Workspace ID 映射到 personal、team 或 enterprise。"
+            )
+        workspace_plans.append((workspace_id, cast(WorkspacePlan, plan)))
+    blueprint = DatabaseBlueprint(
+        database=database,
+        roles=roles,
+        v2_default_data_region=cast(DataRegion, data_region),
+        v2_legacy_workspace_plans=tuple(sorted(workspace_plans)),
+        schemas=schemas,
+    )
     maintenance_database = DatabaseName(
         _text_with_default(administration, "maintenance_database", "postgres")
     )

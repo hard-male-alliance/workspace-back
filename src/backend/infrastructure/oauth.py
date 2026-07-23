@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 
 from backend.domain.oauth import (
@@ -34,6 +34,16 @@ from backend.infrastructure.persistence.models import (
     OAuthRevokedAccessTokenRecord as OAuthRevokedAccessTokenOrmRecord,
 )
 
+_USER_REVOCATION_WRITE_SQL = text(
+    "SELECT identity.revoke_user_access_tokens(:user_id, :revoked_before)"
+)
+"""@brief 用户级 access-token epoch 写入窄函数 / Narrow user-level access-token epoch write."""
+
+_USER_REVOCATION_CHECK_SQL = text(
+    "SELECT identity.user_access_tokens_revoked(:user_id, :issued_at)"
+)
+"""@brief 用户级 access-token epoch 检查窄函数 / Narrow user-level access-token epoch check."""
+
 
 class InMemoryOAuthAuthorizationRequestRepository:
     """Process-local deterministic adapter used only in development and tests."""
@@ -44,6 +54,7 @@ class InMemoryOAuthAuthorizationRequestRepository:
         self._families: dict[str, dict[str, Any]] = {}
         self._refresh_tokens: dict[str, dict[str, Any]] = {}
         self._revoked_access: dict[str, datetime] = {}
+        self._revoked_users: dict[str, datetime] = {}
         self._lock = asyncio.Lock()
 
     async def create_authorization_request(self, record: AuthorizationRequestRecord) -> None:
@@ -63,6 +74,7 @@ class InMemoryOAuthAuthorizationRequestRepository:
         *,
         subject: str,
         user_id: str,
+        login_session_id: str,
         code_hash: str,
         auth_time: datetime,
         expires_at: datetime,
@@ -81,6 +93,7 @@ class InMemoryOAuthAuthorizationRequestRepository:
                 "request": request,
                 "subject": subject,
                 "user_id": user_id,
+                "login_session_id": login_session_id,
                 "auth_time": auth_time,
                 "expires_at": expires_at,
                 "consumed_at": None,
@@ -126,6 +139,7 @@ class InMemoryOAuthAuthorizationRequestRepository:
                     "subject": code["subject"],
                     "user_id": code["user_id"],
                     "client_id": client_id,
+                    "login_session_id": code["login_session_id"],
                     "scopes": request.scopes,
                     "revoked_at": None,
                     "reuse_detected_at": None,
@@ -203,6 +217,28 @@ class InMemoryOAuthAuthorizationRequestRepository:
             if token is not None:
                 self._families[token["family_id"]]["revoked_at"] = datetime.now(UTC)
 
+    async def revoke_families_for_login_session(
+        self,
+        user_id: str,
+        login_session_id: str,
+        now: datetime,
+    ) -> None:
+        """@brief 撤销一个登录会话的精确内存 token families / Revoke exact in-memory token families for one login session.
+
+        @param user_id 会话所属用户 / User owning the session.
+        @param login_session_id 被撤销登录会话 / Revoked login session.
+        @param now 撤销时刻 / Revocation instant.
+        """
+
+        async with self._lock:
+            for family in self._families.values():
+                if (
+                    family["user_id"] == user_id
+                    and family["login_session_id"] == login_session_id
+                    and family["revoked_at"] is None
+                ):
+                    family["revoked_at"] = now
+
     async def revoke_access_token(self, jti: str, expires_at: datetime) -> None:
         async with self._lock:
             self._revoked_access[_sha256(jti)] = expires_at
@@ -211,6 +247,31 @@ class InMemoryOAuthAuthorizationRequestRepository:
         async with self._lock:
             expires_at = self._revoked_access.get(_sha256(jti))
             return expires_at is not None and expires_at > datetime.now(UTC)
+
+    async def revoke_access_tokens_for_user(
+        self,
+        user_id: str,
+        revoked_before: datetime,
+    ) -> None:
+        """@brief 单调推进内存用户 token epoch / Monotonically advance the in-memory user token epoch."""
+
+        _require_aware(revoked_before, "user access-token revocation")
+        async with self._lock:
+            current = self._revoked_users.get(user_id)
+            if current is None or current < revoked_before:
+                self._revoked_users[user_id] = revoked_before
+
+    async def user_access_tokens_are_revoked(
+        self,
+        user_id: str,
+        issued_at: datetime,
+    ) -> bool:
+        """@brief 以内存 epoch 判断用户 token / Check a user token against the in-memory epoch."""
+
+        _require_aware(issued_at, "access-token issue")
+        async with self._lock:
+            cutoff = self._revoked_users.get(user_id)
+            return cutoff is not None and issued_at <= cutoff
 
 
 class PostgresOAuthAuthorizationRequestRepository:
@@ -254,6 +315,7 @@ class PostgresOAuthAuthorizationRequestRepository:
         *,
         subject: str,
         user_id: str,
+        login_session_id: str,
         code_hash: str,
         auth_time: datetime,
         expires_at: datetime,
@@ -278,6 +340,7 @@ class PostgresOAuthAuthorizationRequestRepository:
                     authorization_request_id=request.id,
                     subject=subject,
                     user_id=user_id,
+                    login_session_id=login_session_id,
                     client_id=request.client_id,
                     redirect_uri=request.redirect_uri,
                     scope=request.scope,
@@ -334,6 +397,7 @@ class PostgresOAuthAuthorizationRequestRepository:
                         subject=code.subject,
                         user_id=code.user_id,
                         client_id=client_id,
+                        login_session_id=code.login_session_id,
                         scope=code.scope,
                     )
                 )
@@ -449,6 +513,39 @@ class PostgresOAuthAuthorizationRequestRepository:
             )
             return expires_at is not None and expires_at > datetime.now(UTC)
 
+    async def revoke_access_tokens_for_user(
+        self,
+        user_id: str,
+        revoked_before: datetime,
+    ) -> None:
+        """@brief 经窄函数单调推进用户 token epoch / Monotonically advance the user token epoch via a narrow function."""
+
+        _require_aware(revoked_before, "user access-token revocation")
+        async with self._database.unscoped_transaction() as session:
+            value = await session.scalar(
+                _USER_REVOCATION_WRITE_SQL,
+                {"user_id": user_id, "revoked_before": revoked_before},
+            )
+        if not isinstance(value, bool) or not value:
+            raise RuntimeError("user access-token revocation function returned an invalid result")
+
+    async def user_access_tokens_are_revoked(
+        self,
+        user_id: str,
+        issued_at: datetime,
+    ) -> bool:
+        """@brief 经窄函数检查用户 token epoch / Check the user token epoch via a narrow function."""
+
+        _require_aware(issued_at, "access-token issue")
+        async with self._database.unscoped_transaction() as session:
+            value = await session.scalar(
+                _USER_REVOCATION_CHECK_SQL,
+                {"user_id": user_id, "issued_at": issued_at},
+            )
+        if not isinstance(value, bool):
+            raise RuntimeError("user access-token revocation check returned a non-boolean result")
+        return value
+
 
 def _authorization_request_from_orm(
     record: OAuthAuthorizationRequestOrmRecord | None,
@@ -473,7 +570,25 @@ def _authorization_request_from_orm(
 
 
 def _sha256(value: str) -> str:
+    """@brief 摘要不透明 OAuth secret 标识 / Digest an opaque OAuth secret identifier.
+
+    @param value 不可持久化原值 / Plain value that must not be persisted.
+    @return SHA-256 hex / SHA-256 hex.
+    """
+
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _require_aware(value: datetime, label: str) -> None:
+    """@brief 要求带时区 OAuth 时刻 / Require a timezone-aware OAuth instant.
+
+    @param value 待校验时间 / Timestamp to validate.
+    @param label 安全错误标签 / Safe error label.
+    @raise ValueError 时间无 UTC offset 时抛出 / Raised when no UTC offset is available.
+    """
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{label} must be timezone-aware")
 
 
 __all__ = [

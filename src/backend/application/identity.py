@@ -35,7 +35,14 @@ from backend.domain.identity import (
     IdentitySessionRecord,
     IdentityUserRecord,
 )
-from backend.domain.ports import HostedIdentityRepository, IdentityEmailSender
+from backend.domain.ports import (
+    BreachedPasswordChecker,
+    HostedIdentityRepository,
+    IdentityEmailEnqueueError,
+    IdentityEmailRateLimitExceeded,
+    IdentityEmailSender,
+)
+from backend.domain.principals import UserId
 from workspace_shared.ids import new_opaque_id
 
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -72,6 +79,7 @@ class HostedIdentityService:
         oauth: OAuthAuthorizationService,
         email_sender: IdentityEmailSender,
         *,
+        breached_password_checker: BreachedPasswordChecker | None = None,
         lifetime_seconds: int = 600,
         email_code_ttl_seconds: int = 600,
         email_code_max_attempts: int = 5,
@@ -84,6 +92,7 @@ class HostedIdentityService:
         self._repository = repository
         self._oauth = oauth
         self._email_sender = email_sender
+        self._breached_password_checker = breached_password_checker
         self._lifetime_seconds = lifetime_seconds
         self._email_code_ttl_seconds = email_code_ttl_seconds
         self._email_code_max_attempts = email_code_max_attempts
@@ -93,8 +102,42 @@ class HostedIdentityService:
         self._recent_reauthentication_seconds = recent_reauthentication_seconds
         self._allow_test_email_codes = allow_test_email_codes
         self._test_email_codes: dict[str, str] = {}
-        self._email_send_buckets: dict[str, tuple[int, int]] = {}
         self._step_lock = asyncio.Lock()
+
+    async def verify_recent(
+        self,
+        user_id: UserId,
+        flow_id: str,
+        verified_at: datetime,
+    ) -> bool:
+        """@brief 验证绑定用户的近期重新认证证明 / Verify a recent user-bound reauth proof.
+
+        @param user_id 已由 access token 认证的本地用户 / Local user authenticated by the
+            access token.
+        @param flow_id 客户端提交的重新认证流程标识 / Submitted reauthentication-flow ID.
+        @param verified_at 应用判定证明的时刻 / Instant at which the application evaluates
+            the proof.
+        @return 仅当流程已完成、属于该用户且完成证明仍在窗口内时为真 / True only when
+            the flow is completed, belongs to the user, and its completion proof is still recent.
+
+        @note 无效、旧版无完成时刻或未来完成时刻的记录均 fail closed / Invalid records,
+            legacy records without a completion instant, and future completion instants fail closed.
+        """
+        if verified_at.tzinfo is None or verified_at.utcoffset() is None:
+            return False
+        flow = await self._repository.get_flow(flow_id)
+        if (
+            flow is None
+            or flow.purpose != "reauthenticate"
+            or flow.status != "completed"
+            or flow.user_id != str(user_id)
+            or flow.completed_at is None
+            or flow.completed_at > verified_at
+        ):
+            return False
+        return verified_at < flow.completed_at + timedelta(
+            seconds=self._recent_reauthentication_seconds
+        )
 
     async def begin_browser_session(self, authorization_request_id: str) -> BrowserBinding:
         """Create an opaque HttpOnly-cookie binding and one-time CSRF capability."""
@@ -244,7 +287,7 @@ class HostedIdentityService:
                 )
             if kind == "set_password":
                 password = str(body["password"])
-                _validate_new_password(password)
+                await _validate_new_password(password, self._breached_password_checker)
                 next_steps = ("complete",) if flow.purpose == "recover" else ("send_email_code",)
                 return IdentityStepResult(
                     await self._transition(
@@ -266,31 +309,46 @@ class HostedIdentityService:
                     raise HostedIdentityError(
                         "identity.flow_invalid", 409, "Identity flow is incomplete"
                     )
-                self._consume_email_send_budget(recipient, browser.id, network_identifier)
-                updated = await self._transition(
-                    flow,
-                    browser,
-                    step_id,
-                    kind,
-                    allowed_steps=("send_email_code", "verify_email_code"),
-                    state_updates={
-                        "email_code_hash": _secret_hash(code),
-                        "email_code_expires_at": int(
-                            (now + timedelta(seconds=self._email_code_ttl_seconds)).timestamp()
-                        ),
-                        "email_code_attempts": attempts,
-                    },
-                )
-                if self._allow_test_email_codes:
-                    self._test_email_codes[flow.id] = code
                 try:
-                    await self._email_sender.send_verification_code(recipient, code)
-                except Exception as error:
+                    async with self._email_sender.atomic():
+                        updated = await self._transition(
+                            flow,
+                            browser,
+                            step_id,
+                            kind,
+                            allowed_steps=("send_email_code", "verify_email_code"),
+                            state_updates={
+                                "email_code_hash": _secret_hash(code),
+                                "email_code_expires_at": int(
+                                    (
+                                        now
+                                        + timedelta(seconds=self._email_code_ttl_seconds)
+                                    ).timestamp()
+                                ),
+                                "email_code_attempts": attempts,
+                            },
+                        )
+                        await self._email_sender.send_verification_code(
+                            recipient,
+                            code,
+                            browser_session_id=browser.id,
+                            network_identifier=network_identifier,
+                            limit_per_hour=self._email_send_limit_per_hour,
+                        )
+                except IdentityEmailRateLimitExceeded as error:
+                    raise HostedIdentityError(
+                        "identity.rate_limited",
+                        429,
+                        "Verification delivery is temporarily limited",
+                    ) from error
+                except IdentityEmailEnqueueError as error:
                     raise HostedIdentityError(
                         "identity.delivery_unavailable",
                         503,
                         "Verification delivery is temporarily unavailable",
                     ) from error
+                if self._allow_test_email_codes:
+                    self._test_email_codes[flow.id] = code
                 return IdentityStepResult(updated)
             if kind == "verify_email_code":
                 return IdentityStepResult(
@@ -330,36 +388,6 @@ class HostedIdentityService:
             raise RuntimeError("test email delivery is unavailable")
         return self._test_email_codes[flow_id]
 
-    def _consume_email_send_budget(
-        self, recipient: str, browser_session_id: str, network_identifier: str
-    ) -> None:
-        """Apply bounded per-account, per-device and per-network hourly budgets."""
-
-        window = int(datetime.now(UTC).timestamp()) // 3_600
-        dimensions = (
-            "account:" + _secret_hash(recipient),
-            "device:" + _secret_hash(browser_session_id),
-            "network:" + _secret_hash(network_identifier),
-        )
-        for key in dimensions:
-            prior_window, count = self._email_send_buckets.get(key, (window, 0))
-            if prior_window != window:
-                count = 0
-            if count >= self._email_send_limit_per_hour:
-                raise HostedIdentityError(
-                    "identity.rate_limited", 429, "Verification delivery is temporarily limited"
-                )
-        for key in dimensions:
-            prior_window, count = self._email_send_buckets.get(key, (window, 0))
-            self._email_send_buckets[key] = (
-                window,
-                1 if prior_window != window else count + 1,
-            )
-        if len(self._email_send_buckets) > 30_000:
-            self._email_send_buckets = {
-                key: value for key, value in self._email_send_buckets.items() if value[0] == window
-            }
-
     async def authenticate_login_cookie(
         self, cookie_value: str | None, *, expected_client_id: str | None = None
     ) -> IdentitySessionRecord:
@@ -397,6 +425,7 @@ class HostedIdentityService:
             request_id,
             subject=user.subject,
             user_id=user.id,
+            login_session_id=session.id,
             auth_time=session.created_at,
         )
 
@@ -435,15 +464,8 @@ class HostedIdentityService:
         """Rotate recovery codes after a completed, recent reauthentication flow."""
 
         current = await self.authenticate_login_cookie(cookie_value)
-        flow = await self._repository.get_flow(reauthentication_flow_id)
         now = datetime.now(UTC)
-        if (
-            flow is None
-            or flow.purpose != "reauthenticate"
-            or flow.status != "completed"
-            or flow.user_id != current.user_id
-            or flow.created_at + timedelta(seconds=self._recent_reauthentication_seconds) <= now
-        ):
+        if not await self.verify_recent(UserId(current.user_id), reauthentication_flow_id, now):
             raise HostedIdentityError(
                 "identity.reauthentication_required", 403, "Recent reauthentication is required"
             )
@@ -471,21 +493,12 @@ class HostedIdentityService:
         """Revoke one authenticator with recent reauth and last-path protection."""
 
         current = await self.authenticate_login_cookie(cookie_value)
-        flow = await self._repository.get_flow(reauthentication_flow_id)
-        if (
-            flow is None
-            or flow.purpose != "reauthenticate"
-            or flow.status != "completed"
-            or flow.user_id != current.user_id
-            or flow.created_at + timedelta(seconds=self._recent_reauthentication_seconds)
-            <= datetime.now(UTC)
-        ):
+        now = datetime.now(UTC)
+        if not await self.verify_recent(UserId(current.user_id), reauthentication_flow_id, now):
             raise HostedIdentityError(
                 "identity.reauthentication_required", 403, "Recent reauthentication is required"
             )
-        return await self._repository.revoke_authenticator(
-            current.user_id, authenticator_id, datetime.now(UTC)
-        )
+        return await self._repository.revoke_authenticator(current.user_id, authenticator_id, now)
 
     async def _identify(
         self,
@@ -800,6 +813,40 @@ class HostedIdentityService:
         *,
         device_name: str | None,
     ) -> IdentityStepResult:
+        """@brief 完成 flow，并让恢复状态与通知入队同一提交 / Complete a flow with atomic recovery notification enqueue."""
+
+        if flow.purpose != "recover":
+            return await self._complete_transaction(
+                flow,
+                browser,
+                step_id,
+                device_name=device_name,
+            )
+        try:
+            async with self._email_sender.atomic():
+                return await self._complete_transaction(
+                    flow,
+                    browser,
+                    step_id,
+                    device_name=device_name,
+                )
+        except IdentityEmailEnqueueError as error:
+            raise HostedIdentityError(
+                "identity.delivery_unavailable",
+                503,
+                "Security notification delivery is temporarily unavailable",
+            ) from error
+
+    async def _complete_transaction(
+        self,
+        flow: IdentityFlowRecord,
+        browser: IdentityBrowserSessionRecord,
+        step_id: str,
+        *,
+        device_name: str | None,
+    ) -> IdentityStepResult:
+        """@brief 执行可加入外部事务的完整状态推进 / Run all completion transitions inside a joinable transaction."""
+
         state = flow.internal_state or {}
         user_id = flow.user_id
         if flow.purpose == "register":
@@ -849,14 +896,7 @@ class HostedIdentityService:
                 )
             recovered_user = await self._repository.get_identity_user(user_id)
             if recovered_user is not None and recovered_user.email is not None:
-                try:
-                    await self._email_sender.send_recovery_notification(recovered_user.email)
-                except Exception as error:
-                    raise HostedIdentityError(
-                        "identity.delivery_unavailable",
-                        503,
-                        "Security notification delivery is temporarily unavailable",
-                    ) from error
+                await self._email_sender.send_recovery_notification(recovered_user.email)
         if user_id is None:
             raise HostedIdentityError("identity.flow_invalid", 409, "Identity flow is incomplete")
         now = datetime.now(UTC)
@@ -890,6 +930,7 @@ class HostedIdentityService:
             state_updates={"password_verifier": "consumed", "email_code_hash": "consumed"},
             user_id=user_id,
             authorization_resume_uri=resume_uri,
+            completed_at=now,
         )
         return IdentityStepResult(updated, f"{session_id}.{session_secret}")
 
@@ -906,6 +947,7 @@ class HostedIdentityService:
         user_id: str | None = None,
         authorization_resume_uri: str | None = None,
         webauthn_options: dict[str, object] | None = None,
+        completed_at: datetime | None = None,
     ) -> IdentityFlowRecord:
         updated = await self._repository.transition_flow(
             flow.id,
@@ -918,6 +960,7 @@ class HostedIdentityService:
             user_id=user_id,
             authorization_resume_uri=authorization_resume_uri,
             webauthn_options=webauthn_options,
+            completed_at=completed_at,
         )
         if updated is None:
             raise HostedIdentityError(
@@ -963,12 +1006,39 @@ def _secret_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _validate_new_password(password: str) -> None:
+async def _validate_new_password(
+    password: str,
+    checker: BreachedPasswordChecker | None,
+) -> None:
+    """@brief 校验长度并查询泄露密码语料 / Validate length and query breached-password corpora.
+
+    @param password 仅用于当前身份步骤的候选密码 / Candidate password for the current identity step.
+    @param checker 可选生产泄露语料检查端口 / Optional production breach-corpus checking port.
+    @raise HostedIdentityError 密码策略不满足、已泄露或检查不可用时抛出 / Raised when the
+        password violates policy, is breached, or cannot be checked safely.
+    @note 本地极小 denylist 只用于快速拒绝，不能替代生产语料检查。 / The tiny local denylist
+        is only a fast rejection path and does not replace the production corpus check.
+    """
+
     if len(password) < 15 or len(password) > 1024:
         raise HostedIdentityError(
             "identity.password_policy", 400, "Password does not satisfy the length policy"
         )
     if password.casefold() in _COMMON_BREACHED_PASSWORDS:
+        raise HostedIdentityError(
+            "identity.password_breached", 400, "Password appears in the breached-password set"
+        )
+    if checker is None:
+        return
+    try:
+        breached = await checker.is_breached(password)
+    except RuntimeError as error:
+        raise HostedIdentityError(
+            "identity.password_safety_unavailable",
+            503,
+            "Password safety verification is temporarily unavailable",
+        ) from error
+    if breached:
         raise HostedIdentityError(
             "identity.password_breached", 400, "Password appears in the breached-password set"
         )

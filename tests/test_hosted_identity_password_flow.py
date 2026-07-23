@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
 from urllib.parse import parse_qs, urlsplit
 
@@ -12,19 +14,46 @@ from backend.api.identity import IDENTITY_BROWSER_COOKIE, IDENTITY_LOGIN_COOKIE
 
 _CSRF_PATTERN = re.compile(r'data-csrf-token="([A-Za-z0-9_-]+)"')
 _PASSWORD = "correct horse battery staple"
+_PKCE_VERIFIER = "v" * 43
 
 
-def _begin(client: TestClient, screen_hint: str) -> tuple[str, str, str]:
+def _pkce_challenge(verifier: str) -> str:
+    """@brief 生成 S256 PKCE challenge / Generate an S256 PKCE challenge.
+
+    @param verifier 测试 verifier / Test verifier.
+    @return 无 padding 的 base64url challenge / Unpadded base64url challenge.
+    """
+
+    return (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .decode("ascii")
+        .rstrip("=")
+    )
+
+
+def _begin(
+    client: TestClient,
+    screen_hint: str,
+    *,
+    scopes: str = "openid profile workspace.read",
+) -> tuple[str, str, str]:
+    """@brief 发起绑定 PKCE 的授权请求 / Begin a PKCE-bound authorization request.
+
+    @param client 活跃测试客户端 / Active test client.
+    @param screen_hint Hosted Identity 流程提示 / Hosted-identity flow hint.
+    @param scopes 本次授权请求的显式 scopes / Explicit scopes requested by this authorization.
+    @return authorization request、CSRF 与 browser cookie / Authorization request, CSRF token, and browser cookie.
+    """
     response = client.get(
         "/oauth/authorize",
         params={
             "response_type": "code",
             "client_id": "aiws-web-local",
             "redirect_uri": "https://app.hmalliances.org/oauth/callback",
-            "scope": "openid profile workspace.read",
+            "scope": scopes,
             "state": f"state-{screen_hint}-012345",
             "nonce": f"nonce-{screen_hint}-012345",
-            "code_challenge": "A" * 43,
+            "code_challenge": _pkce_challenge(_PKCE_VERIFIER),
             "code_challenge_method": "S256",
             "screen_hint": screen_hint,
         },
@@ -63,10 +92,49 @@ def _step(
     )
 
 
+def _interview_scenario_body() -> dict[str, object]:
+    """@brief 构造最小契约有效 Interview Scenario / Build a minimal contract-valid Interview Scenario."""
+
+    return {
+        "name": "OAuth scope integration",
+        "description": "Exercises the issued Interview scopes",
+        "locale": "zh-CN",
+        "interview_type": "system_design",
+        "difficulty": "advanced",
+        "duration_minutes": 30,
+        "target_question_count": 5,
+        "focus_areas": ["authorization"],
+        "allow_followups": True,
+        "allow_barge_in": True,
+        "rubric": {
+            "rubric_id": "rubric_oauth_interview01",
+            "rubric_version": "1",
+            "name": "Authorization",
+            "dimensions": [
+                {
+                    "dimension_id": "dimension_oauth_interview01",
+                    "name": "Least privilege",
+                    "description": "Explain scope and role intersections",
+                    "weight": 1,
+                    "observable_indicators": ["Uses a closed scope catalog"],
+                    "scoring_scale": {"minimum": 0, "maximum": 100},
+                }
+            ],
+            "overall_scale": {"minimum": 0, "maximum": 100},
+        },
+    }
+
+
 def test_registration_login_and_oauth_resume_are_complete_and_secret_safe(
     backend_client: TestClient,
 ) -> None:
-    request_id, csrf, browser_cookie = _begin(backend_client, "signup")
+    request_id, csrf, browser_cookie = _begin(
+        backend_client,
+        "signup",
+        scopes=(
+            "openid profile workspace.read interview.read interview.write"
+        ),
+    )
     created = backend_client.post(
         "/identity/v2/flows",
         headers=_headers(csrf, browser_cookie),
@@ -123,6 +191,57 @@ def test_registration_login_and_oauth_resume_are_complete_and_secret_safe(
     query = parse_qs(urlsplit(resumed.headers["location"]).query)
     assert query["state"] == ["state-signup-012345"]
     assert query["code"][0].startswith("code_")
+
+    token = backend_client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "client_id": "aiws-web-local",
+            "code": query["code"][0],
+            "redirect_uri": "https://app.hmalliances.org/oauth/callback",
+            "code_verifier": _PKCE_VERIFIER,
+        },
+    )
+    assert token.status_code == 200, token.text
+    assert {"interview.read", "interview.write"} <= set(
+        token.json()["scope"].split()
+    )
+    authorization = {"Authorization": f"Bearer {token.json()['access_token']}"}
+    me = backend_client.get(
+        "/api/v2/me",
+        headers={**authorization, "X-Request-Id": "req_registered_me_0001"},
+    )
+    assert me.status_code == 200, me.text
+    assert me.json()["display_name"] == "New User"
+    assert me.json()["default_workspace_id"] is not None
+    workspaces = backend_client.get(
+        "/api/v2/workspaces",
+        headers={**authorization, "X-Request-Id": "req_registered_workspaces_0001"},
+    )
+    assert workspaces.status_code == 200, workspaces.text
+    assert len(workspaces.json()["items"]) == 1
+    assert workspaces.json()["items"][0]["workspace"]["id"] == me.json()[
+        "default_workspace_id"
+    ]
+    workspace_id = me.json()["default_workspace_id"]
+    interview_headers = {
+        **authorization,
+        "X-Request-Id": "req_oauth_interview_0001",
+    }
+    scenarios = backend_client.get(
+        f"/api/v2/workspaces/{workspace_id}/interview-scenarios",
+        headers=interview_headers,
+    )
+    assert scenarios.status_code == 200, scenarios.text
+    created_scenario = backend_client.post(
+        f"/api/v2/workspaces/{workspace_id}/interview-scenarios",
+        headers={
+            **interview_headers,
+            "Idempotency-Key": "oauth-interview-scenario-0001",
+        },
+        json=_interview_scenario_body(),
+    )
+    assert created_scenario.status_code == 201, created_scenario.text
 
     login_request_id, login_csrf, login_browser = _begin(backend_client, "login")
     login_flow = backend_client.post(
@@ -202,6 +321,66 @@ def test_identity_step_schema_password_policy_and_step_id_dedupe(
         {"kind": "set_password", "step_id": "breached-password", "password": "passwordpassword"},
     )
     assert breached.status_code == 400
+
+
+def test_verification_delivery_preserves_public_three_axis_rate_limit(
+    backend_client: TestClient,
+) -> None:
+    """@brief 频控耗尽仍返回稳定 429 且不推进 flow / Exhausted delivery budgets return stable 429 without advancing the flow."""
+
+    request_id, csrf, browser_cookie = _begin(backend_client, "signup")
+    flow_id = backend_client.post(
+        "/identity/v2/flows",
+        headers=_headers(csrf, browser_cookie),
+        json={"purpose": "register", "authorization_request_id": request_id},
+    ).json()["id"]
+    prerequisites = (
+        {"kind": "identify", "step_id": "rate-identify", "identifier": "rate@example.test"},
+        {
+            "kind": "set_profile",
+            "step_id": "rate-profile",
+            "display_name": "Rate Limit",
+            "locale": "en-US",
+            "terms_version": "v1",
+            "privacy_version": "v1",
+        },
+        {
+            "kind": "set_password",
+            "step_id": "rate-password",
+            "password": _PASSWORD,
+        },
+    )
+    for body in prerequisites:
+        assert _step(backend_client, flow_id, csrf, browser_cookie, body).status_code == 200
+    for index in range(5):
+        accepted = _step(
+            backend_client,
+            flow_id,
+            csrf,
+            browser_cookie,
+            {"kind": "send_email_code", "step_id": f"rate-send-{index}"},
+        )
+        assert accepted.status_code == 200
+
+    limited = _step(
+        backend_client,
+        flow_id,
+        csrf,
+        browser_cookie,
+        {"kind": "send_email_code", "step_id": "rate-send-rejected"},
+    )
+
+    assert limited.status_code == 429
+    assert limited.json() == {
+        "error": "identity.rate_limited",
+        "error_description": "Verification delivery is temporarily limited",
+    }
+    restored = backend_client.get(
+        f"/identity/v2/flows/{flow_id}",
+        headers={"Cookie": f"{IDENTITY_BROWSER_COOKIE}={browser_cookie}"},
+    )
+    assert restored.status_code == 200
+    assert restored.json()["allowed_steps"] == ["send_email_code", "verify_email_code"]
 
 
 def test_account_recovery_rotates_password_and_revokes_old_login_session(

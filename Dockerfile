@@ -26,6 +26,8 @@ COPY example.jsonc dbinit.jsonc ./
 COPY deploy/docker/dbinit.jsonc ./deploy/docker/dbinit.jsonc
 COPY workspace-shared-docs/contracts/v1/ai-job-workspace.contract.schema.json \
     ./workspace-shared-docs/contracts/v1/ai-job-workspace.contract.schema.json
+COPY workspace-shared-docs/contracts/v2/schema.jsonc \
+    ./workspace-shared-docs/contracts/v2/schema.jsonc
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable
@@ -33,7 +35,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 FROM ${PYTHON_IMAGE} AS runtime
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates postgresql-client \
+    && apt-get install --yes --no-install-recommends \
+        bubblewrap \
+        ca-certificates \
+        fonts-noto-cjk \
+        libseccomp2 \
+        postgresql-client \
+        texlive-xetex \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 aiws \
     && useradd --uid 10001 --gid aiws --no-create-home --shell /usr/sbin/nologin aiws \
@@ -53,7 +61,7 @@ COPY --from=builder --chown=aiws:aiws \
 
 USER 10001:10001
 
-EXPOSE 8000 8010
+EXPOSE 9000 8010
 
 ENTRYPOINT ["python", "-m", "dbctl.interfaces.container"]
 CMD ["backend"]

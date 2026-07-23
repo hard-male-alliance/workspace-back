@@ -141,6 +141,22 @@ def test_dbinit_rejects_bootstrap_user_colliding_with_managed_role(
         DbctlConfigStore(tmp_path / "config.jsonc", dbinit_path).initialize()
 
 
+def test_dbinit_requires_typed_legacy_workspace_plan_mapping(tmp_path: Path) -> None:
+    """@brief 旧 Workspace entitlement 映射不得缺失或猜测 / Legacy Workspace entitlements must be explicit and typed.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    """
+    dbinit = load_jsonc(PROJECT_ROOT / "dbinit.jsonc")
+    dbinit["database_administration"]["v2_legacy_workspace_plans"] = {
+        "ws_legacy_0001": "unknown"
+    }
+    dbinit_path = tmp_path / "dbinit.jsonc"
+    dbinit_path.write_text(json.dumps(dbinit), encoding="utf-8")
+
+    with pytest.raises(DbctlConfigurationError, match="v2_legacy_workspace_plans"):
+        DbctlConfigStore(tmp_path / "config.jsonc", dbinit_path).initialize()
+
+
 def test_secret_repr_and_retention_cross_bounds_make_illegal_states_unrepresentable() -> None:
     """@brief secret 与 timeout 非法状态在构造时失败 / Secret and timeout illegal states fail at construction.
 

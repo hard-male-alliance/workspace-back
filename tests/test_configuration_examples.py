@@ -33,8 +33,116 @@ def test_public_runtime_example_loads_in_product_applications() -> None:
     dashboard = DashboardSettings.from_root_mapping(root)
 
     assert backend.environment == "development"
+    assert not backend.api.legacy_v1_enabled
+    assert backend.hosted_identity.password_breach.mode == "disabled"
+    assert backend.security.sensitive_idempotency_hmac_secret is None
     assert dashboard.default_workspace_id == "ws_local_demo"
     assert dashboard.database.mode == "memory"
+    assert all(
+        {"interview.read", "interview.write"} <= set(client.allowed_scopes)
+        for client in backend.oauth.public_clients
+    )
+
+
+def test_legacy_v1_requires_an_explicit_non_deployed_migration_switch(
+    tmp_path: Path,
+) -> None:
+    """@brief V1 默认关闭且不能进入部署环境 / V1 is opt-in and cannot enter deployed environments.
+
+    @param tmp_path pytest 私有目录 / Pytest-private directory.
+    """
+
+    root = load_jsonc(PROJECT_ROOT / "example.jsonc")
+    root["api"]["legacy_v1_enabled"] = True
+    development_path = tmp_path / "development-v1.json"
+    development_path.write_text(json.dumps(root), encoding="utf-8")
+    assert BackendSettings.from_file(development_path).api.legacy_v1_enabled
+
+    disabled_identity = load_jsonc(PROJECT_ROOT / "example.jsonc")
+    disabled_identity["api"]["legacy_v1_enabled"] = True
+    disabled_identity["security"].update(
+        {
+            "identity_mode": "disabled",
+            "trusted_proxy_hmac_secret": None,
+        }
+    )
+    disabled_path = tmp_path / "development-v1-without-identity.json"
+    disabled_path.write_text(json.dumps(disabled_identity), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="must authenticate explicitly enabled API V1"):
+        BackendSettings.from_file(disabled_path)
+
+    root["environment"] = "production"
+    production_path = tmp_path / "production-v1.json"
+    production_path.write_text(json.dumps(root), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=r"api\.legacy_v1_enabled"):
+        BackendSettings.from_file(production_path)
+
+
+def test_oauth_client_registration_rejects_scopes_outside_the_product_catalog(
+    tmp_path: Path,
+) -> None:
+    """@brief public client 不得签发 discovery 未声明的 scope / Public clients cannot issue scopes absent from discovery.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    """
+
+    root = load_jsonc(PROJECT_ROOT / "example.jsonc")
+    root["oauth"]["public_clients"][0]["allowed_scopes"].append("shadow.admin")
+    path = tmp_path / "unsupported-oauth-scope.json"
+    path.write_text(json.dumps(root), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="outside the supported catalog"):
+        BackendSettings.from_file(path)
+
+
+def test_deployed_identity_requires_smtp_and_breach_checks(
+    tmp_path: Path,
+) -> None:
+    """@brief 部署环境强制真实邮件与泄漏密码检查 / Deployed environments require real email and breached-password adapters.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    """
+
+    root = load_jsonc(PROJECT_ROOT / "example.jsonc")
+    root["environment"] = "production"
+    root["hosted_identity"]["email"].update(
+        {
+            "mode": "smtp",
+            "from_address": "identity@example.test",
+            "smtp_host": "smtp.example.test",
+        }
+    )
+    root["hosted_identity"]["password_breach"]["mode"] = "disabled"
+    root["security"].update(
+        {
+            "identity_mode": "disabled",
+            "trusted_proxy_hmac_secret": None,
+            "cursor_hmac_secret": "cursor-signing-secret-that-has-32-bytes",
+            "sensitive_idempotency_hmac_secret": (
+                "sensitive-idempotency-secret-that-has-32-bytes"
+            ),
+        }
+    )
+    path = tmp_path / "production.json"
+    path.write_text(json.dumps(root), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=r"password_breach\.mode"):
+        BackendSettings.from_file(path)
+
+
+def test_general_security_hmac_purposes_must_be_distinct(tmp_path: Path) -> None:
+    """@brief Cursor 与敏感幂等键不得复用 HMAC 密钥 / Cursor and sensitive-idempotency purposes cannot reuse an HMAC secret.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    """
+
+    root = load_jsonc(PROJECT_ROOT / "example.jsonc")
+    shared_key = "one-shared-security-key-that-is-not-allowed"
+    root["security"]["cursor_hmac_secret"] = shared_key
+    root["security"]["sensitive_idempotency_hmac_secret"] = shared_key
+    path = tmp_path / "shared-general-security-key.json"
+    path.write_text(json.dumps(root), encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="must be distinct"):
+        BackendSettings.from_file(path)
 
 
 def test_legacy_environment_indirection_fields_are_rejected(tmp_path: Path) -> None:
@@ -100,6 +208,7 @@ def test_dbctl_creates_private_config_and_loads_separate_dbinit(
     assert parse_postgres_dsn(dashboard.database.dsn).user.value == "workspace_dashboard"
     assert os.stat(config_path).st_mode & 0o777 == 0o600
     assert dbctl.blueprint.observability_schema.value == "observability"
+    assert dbctl.blueprint.v2_legacy_workspace_plans == ()
 
 
 def test_dbctl_rejects_legacy_password_mapping_without_rewriting_config(tmp_path: Path) -> None:
@@ -171,6 +280,20 @@ def test_backend_logging_shutdown_budget_has_a_hard_cap(tmp_path: Path) -> None:
     path.write_text(json.dumps(root), encoding="utf-8")
 
     with pytest.raises(ConfigurationError, match=r"logging\.shutdown_timeout_ms"):
+        BackendSettings.from_file(path)
+
+
+def test_backend_maintenance_batches_have_a_hard_cap(tmp_path: Path) -> None:
+    """@brief 配置不能把维护事务扩成无界扫描 / Config cannot turn maintenance into an unbounded scan.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    """
+    root = load_jsonc(PROJECT_ROOT / "example.jsonc")
+    root["runtime"]["maintenance_invitation_batch_size"] = 1_001
+    path = tmp_path / "config.jsonc"
+    path.write_text(json.dumps(root), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="must not exceed 1000"):
         BackendSettings.from_file(path)
 
 

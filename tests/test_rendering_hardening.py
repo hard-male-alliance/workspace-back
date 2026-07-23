@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,13 @@ import pytest
 import backend.infrastructure.rendering as rendering
 from backend.config import RendererSettings
 from backend.domain.common import DomainError
+from backend.infrastructure.process_confinement import (
+    ProcessConfinementMode,
+    ProcessConfinementPlan,
+    ProcessConfinementUnavailable,
+    clear_confinement_probe_cache,
+    confinement_plan_for,
+)
 
 
 def _renderer_settings(tmp_path: Path, *, max_output_bytes: int = 512) -> RendererSettings:
@@ -30,7 +38,7 @@ def _renderer_settings(tmp_path: Path, *, max_output_bytes: int = 512) -> Render
         timeout_ms=5_000,
         max_input_bytes=8_192,
         max_output_bytes=max_output_bytes,
-        memory_limit_bytes=256 * 1024 * 1024,
+        memory_limit_bytes=512 * 1024 * 1024,
         allowed_font_directories=(),
         artifact_directory=tmp_path,
     )
@@ -50,13 +58,83 @@ def _resume_document() -> dict[str, Any]:
     }
 
 
-def _install_fake_sandbox_command(
+def test_renderer_factory_fails_at_startup_when_sandbox_capability_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief 配置真实渲染时在启动期验证能力 / Validate real-rendering capability during startup.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @param monkeypatch pytest 补丁器 / pytest patch controller.
+    """
+
+    monkeypatch.setattr(rendering, "_killpg", lambda _pid, _signal: None)
+    monkeypatch.setattr(rendering, "_sigkill", 9)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/xelatex")
+
+    def unavailable(_environment: str) -> ProcessConfinementPlan:
+        """@brief 模拟 kernel 强隔离不可用 / Simulate unavailable kernel confinement.
+
+        @param _environment 未使用部署环境 / Unused deployment environment.
+        @return 不返回 / Does not return.
+        @raise ProcessConfinementUnavailable 总是抛出 / Always raised.
+        """
+
+        raise ProcessConfinementUnavailable("missing Landlock")
+
+    monkeypatch.setattr(rendering, "confinement_plan_for", unavailable)
+
+    with pytest.raises(RuntimeError, match="strong confinement"):
+        rendering.renderer_for(_renderer_settings(tmp_path), environment="production")
+
+
+def test_sandbox_mounts_only_required_read_only_tex_state_and_private_writable_state(
+    tmp_path: Path,
+) -> None:
+    """@brief TeX 系统状态只读，缓存仅写 sandbox tmpfs / TeX system state is read-only and caches write only to sandbox tmpfs.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    """
+
+    argv = rendering._bubblewrap_argv(
+        "/usr/bin/bwrap",
+        _renderer_settings(tmp_path),
+        tmp_path,
+        child_argv=("/usr/bin/python", "-m", "backend.infrastructure.resume_render_sandbox"),
+        xelatex_path="/usr/bin/xelatex",
+    )
+    joined = "\x00".join(argv)
+
+    for required in ("/etc/fonts", "/etc/texmf", "/var/cache/fontconfig", "/var/lib/texmf"):
+        assert f"--ro-bind-try\x00{required}\x00{required}" in joined
+    assert "--unshare-net" in argv
+    assert "--setenv\x00HOME\x00/work" in joined
+    assert "--setenv\x00TMPDIR\x00/work/tmp" in joined
+    assert "--bind\x00" + str(tmp_path) + "\x00/work" in joined
+    assert "backend.infrastructure.resume_render_sandbox" in argv
+
+
+def test_fixed_template_selects_a_packaged_cjk_capable_font() -> None:
+    """@brief 固定模板不会把中文姓名渲染成空白字形 / Fixed template does not render Chinese names as missing glyphs."""
+
+    document = _resume_document()
+    document["title"] = "高级工程师"
+    document["profile"] = {"full_name": "可莉"}
+
+    source = rendering._safe_template(document)
+
+    assert r"\setmainfont{Noto Sans CJK SC}" in source
+    assert "高级工程师" in source
+    assert "可莉" in source
+
+
+def _install_fake_renderer_command(
     monkeypatch: pytest.MonkeyPatch,
     script: str,
     *,
     command_arguments: list[str] | None = None,
 ) -> None:
-    """@brief 将 bwrap argv 替换为受控 Python 子进程 / Replace bwrap argv with a controlled Python subprocess.
+    """@brief 将 renderer launcher 替换为受控 Python 子进程 / Replace the renderer launcher with a controlled Python subprocess.
 
     @param monkeypatch pytest 补丁器 / pytest patch controller.
     @param script 要在隔离 session 中执行的 Python 源码 / Python source to run in the isolated session.
@@ -65,11 +143,15 @@ def _install_fake_sandbox_command(
     """
 
     arguments = command_arguments or []
-    monkeypatch.setattr(shutil, "which", lambda _name: "/test/bwrap")
     monkeypatch.setattr(
         rendering,
-        "_bubblewrap_argv",
-        lambda _bubblewrap, _settings, _workdir: [sys.executable, "-c", script, *arguments],
+        "_renderer_process_argv",
+        lambda _xelatex, _settings, _workdir, _plan: [
+            sys.executable,
+            "-c",
+            script,
+            *arguments,
+        ],
     )
 
 
@@ -115,9 +197,12 @@ async def test_renderer_kills_the_whole_process_group_when_combined_pipe_output_
         "sys.stdout.flush()\n"
         "time.sleep(30)\n"
     )
-    _install_fake_sandbox_command(monkeypatch, script)
+    _install_fake_renderer_command(monkeypatch, script)
 
-    renderer = rendering.SandboxedXeLaTeXRenderer(_renderer_settings(tmp_path, max_output_bytes=128))
+    renderer = rendering.SandboxedXeLaTeXRenderer(
+        _renderer_settings(tmp_path, max_output_bytes=128),
+        xelatex_path=sys.executable,
+    )
     with pytest.raises(DomainError) as raised:
         await renderer.render(_resume_document())
 
@@ -152,9 +237,12 @@ async def test_renderer_cancellation_kills_the_whole_process_group(
         f"subprocess.Popen([sys.executable, '-c', {child_script!r}])\n"
         "time.sleep(30)\n"
     )
-    _install_fake_sandbox_command(monkeypatch, script)
+    _install_fake_renderer_command(monkeypatch, script)
 
-    renderer = rendering.SandboxedXeLaTeXRenderer(_renderer_settings(tmp_path))
+    renderer = rendering.SandboxedXeLaTeXRenderer(
+        _renderer_settings(tmp_path),
+        xelatex_path=sys.executable,
+    )
     task = asyncio.create_task(renderer.render(_resume_document()))
     await _wait_for_file(ready)
     task.cancel()
@@ -212,3 +300,48 @@ async def test_renderer_fails_closed_without_a_posix_sandbox(tmp_path: Path) -> 
         await renderer.render(_resume_document())
 
     assert raised.value.problem.code == "resume.renderer_sandbox_unavailable"
+
+
+def test_minimal_xelatex_document_compiles_through_real_strong_boundary(
+    tmp_path: Path,
+) -> None:
+    """@brief 最小 TeX 经真实 Landlock/libseccomp launcher 编译 / Compile minimal TeX through the real strong launcher.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    """
+
+    xelatex = shutil.which("xelatex")
+    if xelatex is None:
+        pytest.skip("XeLaTeX is unavailable")
+    clear_confinement_probe_cache()
+    try:
+        probed_plan = confinement_plan_for("production")
+    except ProcessConfinementUnavailable:
+        pytest.skip("Landlock ABI >= 3 and libseccomp are unavailable")
+    plan = ProcessConfinementPlan(ProcessConfinementMode.STRONG, None)
+    assert probed_plan.mode is ProcessConfinementMode.STRONG
+    settings = _renderer_settings(tmp_path, max_output_bytes=4 * 1024 * 1024)
+    (tmp_path / "resume.tex").write_text(
+        "\\documentclass{article}\n"
+        "\\pagestyle{empty}\n"
+        "\\begin{document}\n"
+        "Confinement boundary smoke test.\n"
+        "\\end{document}\n",
+        encoding="utf-8",
+    )
+    argv = rendering._renderer_process_argv(xelatex, settings, tmp_path, plan)
+
+    completed = subprocess.run(
+        argv,
+        cwd=tmp_path,
+        env=rendering._renderer_process_environment(tmp_path),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+        timeout=15,
+        start_new_session=True,
+    )
+
+    diagnostic = (completed.stdout + completed.stderr).decode("utf-8", "replace")
+    assert completed.returncode == 0, diagnostic[-4_000:]
+    assert (tmp_path / "resume.pdf").read_bytes().startswith(b"%PDF-")

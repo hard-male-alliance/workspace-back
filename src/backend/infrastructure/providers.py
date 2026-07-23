@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 from collections import deque
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -39,6 +40,29 @@ _SUPPORTED_MESSAGE_ROLES = frozenset({"user", "assistant", "tool"})
 
 _SUPPORTED_DATA_REGIONS = frozenset({"cn", "global", "private_deployment"})
 """@brief 可声明的模型数据处理地域 / Supported declared model data-processing regions."""
+
+_AGENT_STRICT_RESPONSE_FORMAT = "agent.output.strict_json.v1"
+"""@brief Agent 封闭结构化输出协议 / Closed Agent structured-output protocol."""
+
+_STRICT_RESPONSE_FORMAT_PATTERN = re.compile(
+    r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\.strict_json\.v[1-9][0-9]*\Z",
+    flags=re.ASCII,
+)
+"""@brief 服务器认可的稳定 strict JSON 协议标识 / Accepted stable strict-JSON identifiers."""
+
+_MAX_RESPONSE_FORMAT_LENGTH = 64
+"""@brief OpenAI schema name 可安全承载的协议标识上限 / Safe protocol identifier limit for OpenAI schema names."""
+
+_MAX_RESPONSE_SCHEMA_BYTES = 256 * 1024
+"""@brief 单个结构化响应 schema 的 UTF-8 上限 / UTF-8 limit for one structured-response schema."""
+
+_MAX_RESPONSE_SCHEMA_DEPTH = 32
+"""@brief schema 递归深度上限 / Maximum response-schema recursion depth."""
+
+_CALLER_SCHEMA_NAME_KEYS = frozenset(
+    {"response_schema_name", "schema_name", "json_schema_name"}
+)
+"""@brief 禁止调用方控制上游 schema name 的字段 / Caller-controlled upstream schema-name fields that are forbidden."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,8 +206,8 @@ class OpenAICompatibleModelProvider:
     """@brief OpenAI Chat Completions SSE provider / OpenAI Chat Completions SSE provider.
 
     支持 OpenRouter 及采用 ``POST /chat/completions`` 和 SSE ``data:`` 帧的中国
-    OpenAI 兼容接口。该适配器不实现工具调用或结构化输出：即使底层模型支持，
-    也不能在没有显式协议适配的情况下声称支持。
+    OpenAI 兼容接口。结构化请求经本地严格校验后映射到原生 ``json_schema``；工具
+    调用仍未接通，因此不得声称支持。
 
     @note ``base_url`` 必须是服务端配置的 HTTPS 地址；只允许 loopback 使用 HTTP，
     以避免密钥被意外发送到明文远程端点。
@@ -266,7 +290,7 @@ class OpenAICompatibleModelProvider:
         @return 稳定能力描述 / Stable capability descriptors.
         """
         return tuple(
-            CapabilityDescriptor(name, True, False, False) for name in _CAPABILITY_GUIDANCE
+            CapabilityDescriptor(name, True, False, True) for name in _CAPABILITY_GUIDANCE
         )
 
     def build_payload(self, prompt: str, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -291,7 +315,15 @@ class OpenAICompatibleModelProvider:
                 "Model provider request has no user content",
                 retryable=False,
             )
-        return {"model": self._model, "messages": messages, "stream": True}
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": messages,
+            "stream": True,
+        }
+        structured_response = _structured_response_format(request)
+        if structured_response is not None:
+            payload["response_format"] = structured_response
+        return payload
 
     async def stream_text(self, prompt: str, request: dict[str, Any]) -> AsyncIterator[str]:
         """@brief 从兼容 SSE 流提取 ``delta.content`` / Extract ``delta.content`` from a compatible SSE stream.
@@ -388,11 +420,23 @@ class FallbackModelProvider:
             for provider in self._providers
         ]
         primary = capability_sets[0]
-        return tuple(
-            descriptor
-            for name, descriptor in primary.items()
-            if all(name in candidate for candidate in capability_sets[1:])
-        )
+        common: list[CapabilityDescriptor] = []
+        for name in primary:
+            descriptors = [candidate.get(name) for candidate in capability_sets]
+            if any(descriptor is None for descriptor in descriptors):
+                continue
+            concrete = tuple(
+                descriptor for descriptor in descriptors if descriptor is not None
+            )
+            common.append(
+                CapabilityDescriptor(
+                    name,
+                    all(descriptor.supports_streaming for descriptor in concrete),
+                    all(descriptor.supports_tool_calling for descriptor in concrete),
+                    all(descriptor.supports_structured_output for descriptor in concrete),
+                )
+            )
+        return tuple(common)
 
     async def stream_text(self, prompt: str, request: dict[str, Any]) -> AsyncIterator[str]:
         """@brief 仅在首个文本前尝试下一候选 provider / Try the next provider only before first text.
@@ -404,7 +448,22 @@ class FallbackModelProvider:
         """
         last_error: ModelProviderStreamError | None = None
         allow_fallback = _allow_provider_fallback(request)
+        requires_structured_output = _structured_response_format(request) is not None
+        capability = _request_string(request, "capability", fallback="general")
         for index, provider in enumerate(self._providers):
+            if requires_structured_output and not _supports_structured_output(
+                provider,
+                capability,
+            ):
+                last_error = ModelProviderStreamError(
+                    "agent.provider_capability_unavailable",
+                    "Model provider does not support the requested structured output",
+                    retryable=False,
+                    status=422,
+                )
+                if index == 0 and not allow_fallback:
+                    raise last_error
+                continue
             emitted = False
             try:
                 async for chunk in provider.stream_text(prompt, request):
@@ -485,7 +544,235 @@ class MockModelProvider:
         @return 不含推理链的响应 / Response without chain-of-thought.
         """
         prompt = str(input_value.get("prompt", "")).strip()
-        return f"已收到你的请求：{prompt}" if prompt else "已收到你的请求。"
+        request = input_value.get("request")
+        if not isinstance(request, Mapping):
+            raise ModelProviderStreamError(
+                "agent.provider_invalid_request",
+                "Model provider request is invalid",
+                retryable=False,
+            )
+        structured_response = _structured_response_format(request)
+        if structured_response is None:
+            return f"已收到你的请求：{prompt}" if prompt else "已收到你的请求。"
+        if request.get("response_format") != _AGENT_STRICT_RESPONSE_FORMAT:
+            raise ModelProviderStreamError(
+                "agent.provider_capability_unavailable",
+                "Mock model provider does not implement the requested structured protocol",
+                retryable=False,
+                status=422,
+            )
+        return _mock_agent_response(prompt, request)
+
+
+def _structured_response_format(request: Mapping[str, Any]) -> dict[str, Any] | None:
+    """@brief 构造受信的 OpenAI strict JSON envelope / Build a trusted OpenAI strict-JSON envelope.
+
+    @param request provider 无关请求 / Provider-independent request.
+    @return 无结构化请求时为 ``None``，否则返回 OpenAI ``response_format``。
+    @raise ModelProviderStreamError 协议标识、schema 或 caller schema name 不合法时抛出。
+
+    @note ``json_schema.name`` 只从服务器认可的稳定协议标识确定性推导；调用方不能提供
+        独立 name。为避免改变既有 Interview Report 路径，只有携带 ``response_schema``
+        才激活通用适配，但 Agent 的 strict 协议缺少 schema 时始终 fail closed。
+    """
+    raw_format = request.get("response_format")
+    has_schema = "response_schema" in request
+    if not has_schema:
+        if raw_format == _AGENT_STRICT_RESPONSE_FORMAT:
+            raise _invalid_structured_request()
+        return None
+    if any(key in request for key in _CALLER_SCHEMA_NAME_KEYS):
+        raise _invalid_structured_request()
+    if (
+        not isinstance(raw_format, str)
+        or len(raw_format) > _MAX_RESPONSE_FORMAT_LENGTH
+        or _STRICT_RESPONSE_FORMAT_PATTERN.fullmatch(raw_format) is None
+    ):
+        raise _invalid_structured_request()
+    schema = request.get("response_schema")
+    if not isinstance(schema, dict):
+        raise _invalid_structured_request()
+    _validate_strict_response_schema(schema)
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": raw_format.replace(".", "_").replace("-", "_"),
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
+def _validate_strict_response_schema(schema: dict[str, Any]) -> None:
+    """@brief 校验 OpenAI strict JSON schema 的安全子集 / Validate the safe OpenAI strict-JSON-schema subset.
+
+    @param schema 待转发且不得修改的原始 schema / Original schema to forward unchanged.
+    @return 无返回值。
+    @raise ModelProviderStreamError schema 非 JSON、过大、过深或不满足 strict object 约束时抛出。
+    """
+    try:
+        encoded = json.dumps(
+            schema,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError, UnicodeError) as error:
+        raise _invalid_structured_request() from error
+    if len(encoded) > _MAX_RESPONSE_SCHEMA_BYTES:
+        raise _invalid_structured_request()
+    if schema.get("type") != "object":
+        raise _invalid_structured_request()
+    _walk_strict_response_schema(schema, depth=0, ancestors=set())
+
+
+def _walk_strict_response_schema(
+    value: object,
+    *,
+    depth: int,
+    ancestors: set[int],
+) -> None:
+    """@brief 递归校验 JSON 值及 strict object 约束 / Recursively validate JSON values and strict object constraints.
+
+    @param value 当前 schema 节点或 JSON 值 / Current schema node or JSON value.
+    @param depth 当前递归深度 / Current recursion depth.
+    @param ancestors 当前递归路径中的容器 identity / Container identities on the current path.
+    @return 无返回值。
+    @raise ModelProviderStreamError 节点不属于安全 JSON schema 子集时抛出。
+    """
+    if depth > _MAX_RESPONSE_SCHEMA_DEPTH:
+        raise _invalid_structured_request()
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return
+    if not isinstance(value, (dict, list)):
+        raise _invalid_structured_request()
+    identity = id(value)
+    if identity in ancestors:
+        raise _invalid_structured_request()
+    ancestors.add(identity)
+    try:
+        if isinstance(value, list):
+            for item in value:
+                _walk_strict_response_schema(
+                    item,
+                    depth=depth + 1,
+                    ancestors=ancestors,
+                )
+            return
+        if any(not isinstance(key, str) for key in value):
+            raise _invalid_structured_request()
+        reference = value.get("$ref")
+        if reference is not None and (
+            not isinstance(reference, str) or not reference.startswith("#/")
+        ):
+            raise _invalid_structured_request()
+        if value.get("type") == "object" or "properties" in value:
+            properties = value.get("properties")
+            required = value.get("required")
+            if (
+                value.get("type") != "object"
+                or not isinstance(properties, dict)
+                or value.get("additionalProperties") is not False
+                or not isinstance(required, list)
+                or any(not isinstance(item, str) for item in required)
+                or len(required) != len(set(required))
+                or set(required) != set(properties)
+            ):
+                raise _invalid_structured_request()
+        for child in value.values():
+            _walk_strict_response_schema(
+                child,
+                depth=depth + 1,
+                ancestors=ancestors,
+            )
+    finally:
+        ancestors.remove(identity)
+
+
+def _invalid_structured_request() -> ModelProviderStreamError:
+    """@brief 构造统一的结构化请求拒绝 / Build the uniform structured-request rejection.
+
+    @return 不泄露 schema 内容的不可重试错误 / Non-retryable error that does not expose schema content.
+    """
+    return ModelProviderStreamError(
+        "agent.provider_invalid_request",
+        "Model provider structured-output request is invalid",
+        retryable=False,
+        status=422,
+    )
+
+
+def _supports_structured_output(provider: AgentModelProvider, capability: str) -> bool:
+    """@brief 判断候选是否声明目标能力的结构化输出 / Check structured output for one candidate capability.
+
+    @param provider fallback 候选 / Fallback candidate.
+    @param capability 请求能力 / Requested capability.
+    @return 仅在精确能力描述声明支持时为真 / True only for an exact supporting descriptor.
+    """
+    return any(
+        descriptor.name == capability and descriptor.supports_structured_output
+        for descriptor in provider.capabilities()
+    )
+
+
+def _mock_agent_response(prompt: str, request: Mapping[str, Any]) -> str:
+    """@brief 生成最小 Agent strict JSON mock / Generate minimal Agent strict JSON mock output.
+
+    @param prompt 已授权用户文本 / Authorized user text.
+    @param request 已校验存在 Agent strict schema 的内部请求 / Internal request with a validated Agent strict schema.
+    @return 根据 output modes 构造的确定性 JSON / Deterministic JSON derived from output modes.
+    @raise ModelProviderStreamError mode 或 Resume context 元数据无效时抛出。
+    """
+    raw_modes = request.get("output_modes")
+    allowed_modes = frozenset({"text", "citations", "resume_operations"})
+    if (
+        not isinstance(raw_modes, list)
+        or not raw_modes
+        or any(not isinstance(mode, str) or mode not in allowed_modes for mode in raw_modes)
+        or len(raw_modes) != len(set(raw_modes))
+    ):
+        raise _invalid_structured_request()
+    modes = frozenset(raw_modes)
+    evidence_count = request.get("evidence_count", 0)
+    if (
+        isinstance(evidence_count, bool)
+        or not isinstance(evidence_count, int)
+        or evidence_count < 0
+    ):
+        raise _invalid_structured_request()
+    resume_proposal: dict[str, Any] | None = None
+    if "resume_operations" in modes:
+        resume_root_id = request.get("resume_root_id")
+        if not isinstance(resume_root_id, str) or not resume_root_id.strip():
+            raise _invalid_structured_request()
+        resume_proposal = {
+            "title": "AI resume suggestions",
+            "operations_json": [
+                json.dumps(
+                    {
+                        "op": "set_field",
+                        "entity_id": resume_root_id.strip(),
+                        "field_path": ["title"],
+                        "value": "AI suggestion",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            ],
+        }
+    response = {
+        "protocol_version": _AGENT_STRICT_RESPONSE_FORMAT,
+        "text": (
+            f"已收到你的请求：{prompt}" if prompt else "已收到你的请求。"
+        )
+        if "text" in modes
+        else None,
+        "citation_indices": (
+            [0] if "citations" in modes and evidence_count > 0 else []
+        ),
+        "resume_proposal": resume_proposal,
+    }
+    return json.dumps(response, ensure_ascii=False, separators=(",", ":"))
 
 
 def _assert_external_processing_policy(request: Mapping[str, Any], provider_region: str) -> None:
