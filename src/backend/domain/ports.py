@@ -3,17 +3,30 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 from typing import Any, Protocol
 
 from backend.domain.agent import AgentRunRecord, ConversationRecord, MessageRecord
 from backend.domain.common import Job
+from backend.domain.identity import (
+    IdentityAuthenticatorRecord,
+    IdentityBrowserSessionRecord,
+    IdentityFlowRecord,
+    IdentitySessionRecord,
+    IdentityUserRecord,
+)
 from backend.domain.interview import InterviewSessionRecord
 from backend.domain.knowledge import (
     EmbeddingSpace,
     KnowledgeSourceRecord,
     ParsedKnowledgeDocument,
     StoredKnowledgeBlob,
+)
+from backend.domain.oauth import (
+    AuthorizationCodeExchange,
+    AuthorizationRequestRecord,
+    RefreshTokenRotation,
 )
 from backend.domain.observability import (
     AttributeValue,
@@ -28,6 +41,326 @@ from backend.domain.resume import ResumeRecord
 from workspace_shared.tenancy import ActorScope
 
 
+class OAuthAuthorizationRequestRepository(Protocol):
+    """Persistence boundary for short-lived Authorization Server transactions."""
+
+    async def create_authorization_request(self, record: AuthorizationRequestRecord) -> None:
+        """Persist a newly validated authorization request atomically."""
+
+    async def get_authorization_request(self, request_id: str) -> AuthorizationRequestRecord | None:
+        """Read one authorization request without accepting client-provided state."""
+
+    async def issue_authorization_code(
+        self,
+        request_id: str,
+        *,
+        subject: str,
+        user_id: str,
+        login_session_id: str,
+        code_hash: str,
+        auth_time: datetime,
+        expires_at: datetime,
+    ) -> bool:
+        """Atomically complete a pending request and persist a code bound to its login session."""
+
+    async def exchange_authorization_code(
+        self,
+        code_hash: str,
+        *,
+        client_id: str,
+        redirect_uri: str,
+        verifier_challenge: str,
+        refresh_family_id: str | None,
+        refresh_token_id: str | None,
+        refresh_token_hash: str | None,
+        refresh_expires_at: datetime | None,
+    ) -> AuthorizationCodeExchange | None:
+        """Consume a matching code and create its refresh family in one transaction."""
+
+    async def rotate_refresh_token(
+        self,
+        token_hash: str,
+        *,
+        client_id: str,
+        replacement_token_id: str,
+        replacement_token_hash: str,
+        replacement_expires_at: datetime,
+    ) -> RefreshTokenRotation | None:
+        """Rotate once, revoking the family on reuse of a consumed token."""
+
+    async def revoke_refresh_token(self, token_hash: str) -> None:
+        """Revoke the complete refresh family if the opaque token is known."""
+
+    async def revoke_access_token(self, jti: str, expires_at: datetime) -> None:
+        """Persist an access-token denylist entry until its natural expiration."""
+
+    async def access_token_is_revoked(self, jti: str) -> bool:
+        """Check an access-token JTI without exposing it outside the identity boundary."""
+
+    async def revoke_access_tokens_for_user(
+        self,
+        user_id: str,
+        revoked_before: datetime,
+    ) -> None:
+        """@brief 撤销用户在截止时刻及之前签发的全部 access token / Revoke all user access tokens issued at or before a cutoff.
+
+        @param user_id 本地用户 ID / Local user identifier.
+        @param revoked_before 带时区的 inclusive 签发截止时间 / Timezone-aware inclusive issue cutoff.
+        """
+
+    async def user_access_tokens_are_revoked(
+        self,
+        user_id: str,
+        issued_at: datetime,
+    ) -> bool:
+        """@brief 检查用户级 token epoch / Check the user-level token epoch.
+
+        @param user_id access token 的本地用户 claim / Local user claim from the access token.
+        @param issued_at token 的 ``iat`` / Token ``iat`` instant.
+        @return token 在用户级撤销截止内时为真 / True when the token falls within the user's
+            revocation cutoff.
+        """
+
+
+class OAuthTokenIssuerVerifier(Protocol):
+    """Asymmetric JWT issuance and verification port."""
+
+    @property
+    def jwks(self) -> dict[str, list[dict[str, str]]]:
+        """Return public-only signing keys."""
+
+    def issue_access_token(
+        self,
+        *,
+        user_id: str,
+        subject: str,
+        client_id: str,
+        scopes: tuple[str, ...],
+        lifetime_seconds: int,
+        now: datetime | None = None,
+    ) -> tuple[str, datetime, str]:
+        """Issue one Resource Server access token bound to its local user."""
+
+    def issue_id_token(
+        self,
+        *,
+        subject: str,
+        client_id: str,
+        nonce: str,
+        lifetime_seconds: int,
+        auth_time: datetime,
+        now: datetime | None = None,
+    ) -> str:
+        """Issue one nonce-bound OIDC ID Token."""
+
+    def verify_access_token(self, token: str, *, now: datetime | None = None) -> dict[str, Any]:
+        """Verify one access token and return its required claims."""
+
+
+class HostedIdentityRepository(Protocol):
+    """Persistence boundary for hosted identity browser and flow state."""
+
+    async def create_browser_session(self, record: IdentityBrowserSessionRecord) -> None:
+        """Persist a new browser binding."""
+
+    async def get_browser_session(self, session_id: str) -> IdentityBrowserSessionRecord | None:
+        """Read a browser binding by opaque server identifier."""
+
+    async def create_flow(self, record: IdentityFlowRecord) -> None:
+        """Persist a new identity flow."""
+
+    async def get_flow(self, flow_id: str) -> IdentityFlowRecord | None:
+        """Read one identity flow."""
+
+    async def transition_flow(
+        self,
+        flow_id: str,
+        *,
+        browser_session_id: str,
+        step_id: str,
+        expected_step: str,
+        allowed_steps: tuple[str, ...],
+        status: str,
+        state_updates: dict[str, object],
+        user_id: str | None = None,
+        authorization_resume_uri: str | None = None,
+        webauthn_options: dict[str, object] | None = None,
+        completed_at: datetime | None = None,
+    ) -> IdentityFlowRecord | None:
+        """@brief 原子去重并应用一次允许的状态转换 / Atomically apply one allowed transition.
+
+        @param flow_id 流程标识 / Flow identifier.
+        @param browser_session_id 绑定的浏览器会话 / Bound browser session.
+        @param step_id 客户端幂等步骤标识 / Client idempotency step identifier.
+        @param expected_step 当前允许的步骤类型 / Currently allowed step kind.
+        @param allowed_steps 转换后的允许步骤 / Allowed steps after transition.
+        @param status 转换后的状态 / Status after transition.
+        @param state_updates 私有状态增量 / Private-state delta.
+        @param user_id 可选绑定用户 / Optional bound user.
+        @param authorization_resume_uri 可选授权恢复 URI / Optional authorization resume URI.
+        @param webauthn_options 可选 WebAuthn 参数 / Optional WebAuthn options.
+        @param completed_at 进入 completed 状态的时刻 / Instant entering completed state.
+        @return 转换后的流程；冲突时为空 / Transitioned flow, or ``None`` on conflict.
+        """
+
+    async def processed_step_kind(self, flow_id: str, step_id: str) -> str | None:
+        """Return the non-secret kind of an already processed step receipt."""
+
+    async def get_user_by_email(self, normalized_email: str) -> IdentityUserRecord | None:
+        """Resolve an account internally without changing public enumeration behavior."""
+
+    async def get_identity_user(self, user_id: str) -> IdentityUserRecord | None:
+        """Read an account after a server-authenticated session resolves its opaque ID."""
+
+    async def create_user_with_password(
+        self,
+        *,
+        user: IdentityUserRecord,
+        password_authenticator_id: str,
+        password_verifier: str,
+        now: datetime,
+        passkey: IdentityAuthenticatorRecord | None = None,
+    ) -> bool:
+        """@brief 原子完成首次注册 provision / Atomically complete first-registration provisioning.
+
+        @param user 唯一 identity 用户 / Unique identity user.
+        @param password_authenticator_id 密码验证器 ID / Password-authenticator ID.
+        @param password_verifier 不可逆密码 verifier / Irreversible password verifier.
+        @param now 所有资源共享的创建时刻 / Creation instant shared by all resources.
+        @param passkey 可选同时注册 passkey / Optional passkey registered at the same time.
+        @return 用户、密码、可选 passkey、个人 Workspace、owner membership 与
+            ``default_workspace_id`` 全部提交时为真；唯一性冲突时为假 / True only when the
+            user, password, optional passkey, personal Workspace, owner membership, and
+            ``default_workspace_id`` all commit; false on a uniqueness conflict.
+        """
+
+    async def password_verifier(self, user_id: str) -> str | None:
+        """Read the active password verifier for authentication."""
+
+    async def replace_password_and_revoke_sessions(
+        self, user_id: str, *, password_verifier: str, now: datetime
+    ) -> bool:
+        """Atomically replace a password and revoke existing login/token families after recovery."""
+
+    async def create_login_session(self, record: IdentitySessionRecord) -> None:
+        """Persist a rotated Authorization Server login session."""
+
+    async def get_login_session(self, session_id: str) -> IdentitySessionRecord | None:
+        """Read a login session by opaque identifier."""
+
+    async def bind_browser_user(self, browser_session_id: str, user_id: str) -> None:
+        """Bind an authenticated user to the existing browser authorization session."""
+
+    async def list_login_sessions(self, user_id: str) -> list[IdentitySessionRecord]:
+        """List active login sessions for one authenticated account."""
+
+    async def revoke_login_session(self, user_id: str, session_id: str, now: datetime) -> bool:
+        """Revoke one owned login session and associated refresh families."""
+
+    async def list_authenticators(self, user_id: str) -> list[IdentityAuthenticatorRecord]:
+        """List active verifier metadata for one account."""
+
+    async def replace_recovery_codes(
+        self,
+        user_id: str,
+        *,
+        authenticator_id: str,
+        verifiers: tuple[str, ...],
+        now: datetime,
+    ) -> None:
+        """Atomically revoke old recovery codes and persist a new verifier-only bundle."""
+
+    async def revoke_authenticator(
+        self, user_id: str, authenticator_id: str, now: datetime
+    ) -> bool:
+        """Revoke an owned authenticator only while another recovery path remains."""
+
+    async def add_passkey(self, record: IdentityAuthenticatorRecord) -> bool:
+        """Persist one verified unique WebAuthn credential."""
+
+    async def get_passkey_by_credential_id(
+        self, credential_id: str
+    ) -> IdentityAuthenticatorRecord | None:
+        """Resolve an active passkey by its base64url credential identifier."""
+
+    async def update_passkey_sign_count(
+        self, authenticator_id: str, *, expected: int, replacement: int, now: datetime
+    ) -> bool:
+        """Advance a WebAuthn signature counter with optimistic concurrency."""
+
+    async def consume_recovery_code(self, user_id: str, verifier: str, now: datetime) -> bool:
+        """Atomically consume one exact recovery-code verifier once."""
+
+
+class IdentityEmailRateLimitExceeded(RuntimeError):
+    """@brief 身份邮件的持久化频控额度已耗尽 / Durable identity-email budget is exhausted."""
+
+
+class IdentityEmailEnqueueError(RuntimeError):
+    """@brief 身份邮件无法原子写入 durable outbox / Identity email cannot enter the durable outbox."""
+
+
+class IdentityEmailSender(Protocol):
+    """@brief 身份邮件的事务型队列端口 / Transactional identity-email queue port.
+
+    @note ``send_*`` 表示邮件已被可靠接纳，而不是 SMTP 已完成；网络投递只能由
+        outbox worker 执行。 / ``send_*`` acknowledges durable acceptance, not SMTP delivery;
+        only the outbox worker performs network I/O.
+    """
+
+    def atomic(self) -> AbstractAsyncContextManager[None]:
+        """@brief 打开与身份仓储共享的原子事务 / Open an atomic transaction shared with identity storage.
+
+        @return 正常退出才提交的异步上下文 / Async context committed only on normal exit.
+        """
+
+    async def send_verification_code(
+        self,
+        recipient: str,
+        code: str,
+        *,
+        browser_session_id: str,
+        network_identifier: str,
+        limit_per_hour: int,
+    ) -> None:
+        """@brief 原子消费三维额度并入队验证码 / Atomically consume three budgets and enqueue a code.
+
+        @param recipient 规范化收件地址 / Normalized recipient address.
+        @param code 单次短期验证码 / Single-use short-lived code.
+        @param browser_session_id 设备维度的浏览器绑定 / Browser binding for the device axis.
+        @param network_identifier 可信网络维度 / Trusted network axis.
+        @param limit_per_hour 每维每小时硬上限 / Per-dimension hourly hard limit.
+        @raise IdentityEmailRateLimitExceeded 任一维额度耗尽 / Any dimension is exhausted.
+        @raise IdentityEmailEnqueueError 密文无法持久化 / Encrypted payload cannot be persisted.
+        """
+
+    async def send_recovery_notification(self, recipient: str) -> None:
+        """@brief 原子入队凭据轮换安全通知 / Atomically enqueue a credential-rotation notice.
+
+        @param recipient 已恢复账户的地址 / Address of the recovered account.
+        @raise IdentityEmailEnqueueError 密文无法持久化 / Encrypted payload cannot be persisted.
+        """
+
+
+class BreachedPasswordChecker(Protocol):
+    """@brief 检查候选密码是否出现在泄露语料中 / Check whether a candidate password appears in breach corpora.
+
+    @note 实现不得记录、持久化或向远端发送明文密码；外部检查应使用 k-anonymity
+        或等价的隐私保护协议。 / Implementations must not log, persist, or transmit the
+        plaintext password; remote checks should use k-anonymity or an equivalent privacy-preserving
+        protocol.
+    """
+
+    async def is_breached(self, password: str) -> bool:
+        """@brief 返回密码是否已泄露 / Return whether the password is known to be breached.
+
+        @param password 仅在当前调用内存活的候选明文 / Candidate plaintext scoped to this call.
+        @return 已出现在泄露语料时为真 / True when present in breach corpora.
+        @raise RuntimeError 检查器无法给出可信结论时抛出 / Raised when the checker cannot
+            produce a trustworthy decision.
+        """
+
+
 class WorkspaceRepository(Protocol):
     """Read-only current-user and workspace membership projections."""
 
@@ -37,9 +370,7 @@ class WorkspaceRepository(Protocol):
     async def list_workspaces(self, scope: ActorScope) -> list[dict[str, Any]]:
         """List workspaces authorized by the current identity assertion."""
 
-    async def get_workspace(
-        self, scope: ActorScope, workspace_id: str
-    ) -> dict[str, Any] | None:
+    async def get_workspace(self, scope: ActorScope, workspace_id: str) -> dict[str, Any] | None:
         """Read one authorized workspace."""
 
     async def list_workspace_members(
@@ -112,9 +443,7 @@ class ResumeProposalRepository(Protocol):
     ) -> ResumeProposalRecord | None:
         """Read a proposal without crossing workspace or owner boundaries."""
 
-    async def list_proposals(
-        self, scope: ActorScope, resume_id: str
-    ) -> list[ResumeProposalRecord]:
+    async def list_proposals(self, scope: ActorScope, resume_id: str) -> list[ResumeProposalRecord]:
         """List proposals for one scoped Resume in newest-first order."""
 
     async def save_proposal(self, scope: ActorScope, record: ResumeProposalRecord) -> None:
@@ -172,7 +501,9 @@ class AgentRepository(Protocol):
         @param record 会话聚合 / Conversation aggregate.
         """
 
-    async def get_conversation(self, scope: ActorScope, conversation_id: str) -> ConversationRecord | None:
+    async def get_conversation(
+        self, scope: ActorScope, conversation_id: str
+    ) -> ConversationRecord | None:
         """@brief 范围内查询会话 / Read a scoped conversation.
 
         @param scope workspace 范围 / Workspace scope.
@@ -236,7 +567,9 @@ class InterviewRepository(Protocol):
         @param record Session 记录 / Session record.
         """
 
-    async def get_session(self, scope: ActorScope, session_id: str) -> InterviewSessionRecord | None:
+    async def get_session(
+        self, scope: ActorScope, session_id: str
+    ) -> InterviewSessionRecord | None:
         """@brief 范围内查询面试 / Read a scoped interview session.
 
         @param scope workspace 范围 / Workspace scope.

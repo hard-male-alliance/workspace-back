@@ -16,20 +16,40 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.api.diagnostics import diagnostics_router
 from backend.api.errors import (
+    api_problem_response,
     domain_error_handler,
     http_exception_handler,
     request_validation_error_handler,
 )
+from backend.api.identity import is_hosted_identity_path, router_identity
+from backend.api.interview_realtime import router_interview_realtime
 from backend.api.middleware.context import correlate_http_response
 from backend.api.middleware.transport import (
     TransportTelemetryMiddleware,
     log_http_start,
 )
+from backend.api.oauth import is_public_oauth_path, router_oauth
+from backend.api.oauth_metadata import (
+    is_public_oauth_metadata_path,
+    router_oauth_metadata,
+)
 from backend.api.routes import router
+from backend.api.v2 import PROTECTED_RESOURCE_METADATA_URL, is_public_v2_path, router_v2
+from backend.api.v2_access import router_v2_access
+from backend.api.v2_agent import router_v2_agent
+from backend.api.v2_interview import router_v2_interview
+from backend.api.v2_knowledge import router_v2_knowledge
+from backend.api.v2_platform import router_v2_platform
+from backend.api.v2_resumes import router_v2_resumes
 from backend.composition import build_container
-from backend.config import BackendSettings
+from backend.config import BackendSettings, KnowledgeLocalUploadStorageSettings
 from backend.domain.common import DomainError, Problem
+from backend.domain.oauth import OAuthTokenValidationError
 from backend.infrastructure.identity import IdentityVerificationError, peer_is_trusted_proxy
+from backend.infrastructure.knowledge_uploads import (
+    LocalSignedUploadStore,
+    build_local_upload_router,
+)
 from backend.infrastructure.observability.context import (
     ObservabilityContext,
     ServerTraceContext,
@@ -40,6 +60,31 @@ from workspace_shared.tenancy import ActorScope
 logger = logging.getLogger(__name__)
 """@brief HTTP 边界稳定事件 logger / Stable-event logger for the HTTP boundary."""
 
+_DURABLE_V2_RESOURCE_FAMILIES = frozenset(
+    {
+        "audit-events",
+        "events",
+        "jobs",
+        "artifacts",
+    }
+)
+"""@brief 依赖统一 PostgreSQL 投影的 V2 资源族 / V2 resource families requiring unified PostgreSQL projections."""
+
+_DURABLE_V2_COMMAND_TERMINALS = frozenset(
+    {
+        "completions",
+        "decisions",
+        "end-requests",
+        "ingestion-jobs",
+        "operations",
+        "render-jobs",
+        "report-jobs",
+        "restore-jobs",
+        "sync-jobs",
+    }
+)
+"""@brief 会提交 durable work 的命令尾段 / Terminal path segments that enqueue durable work."""
+
 
 def config_path() -> Path:
     """@brief 解析配置路径 / Resolve the configuration path.
@@ -47,6 +92,56 @@ def config_path() -> Path:
     @return 当前目录 config.jsonc / Current-directory config.jsonc.
     """
     return Path("config.jsonc")
+
+
+def _requires_durable_v2_runtime(method: str, path: str) -> bool:
+    """@brief 判断请求是否依赖跨领域 durable runtime / Decide whether a request needs the cross-domain durable runtime.
+
+    @param method 已规范化或原始 HTTP method / Normalized or raw HTTP method.
+    @param path 已解码的绝对请求路径 / Decoded absolute request path.
+    @return PostgreSQL 的统一 Job/Event/outbox 或 worker 是正确语义所必需时为真 / True
+        when PostgreSQL-backed unified Job/Event/outbox state or a worker is required for correct semantics.
+
+    @note memory adapter 不伪造异步成功，也不伪造跨领域 projection。该检查只约束应用工厂；
+        领域单元测试仍可直接使用其确定性内存 UoW。/ The memory adapter neither fabricates
+        asynchronous success nor cross-domain projections. Domain tests may still use deterministic
+        in-memory UoWs directly.
+    """
+
+    segments = tuple(segment for segment in path.split("/") if segment)
+    if len(segments) < 3 or segments[:2] != ("api", "v2"):
+        return False
+    normalized_method = method.upper()
+    terminal = segments[-1]
+    if (
+        len(segments) >= 5
+        and segments[2] == "workspaces"
+        and segments[4] in _DURABLE_V2_RESOURCE_FAMILIES
+    ):
+        return True
+    if normalized_method == "POST" and terminal in _DURABLE_V2_COMMAND_TERMINALS:
+        return True
+    if normalized_method == "POST" and terminal in {"agent-runs", "resume-import-jobs"}:
+        return True
+    if normalized_method == "DELETE" and len(segments) >= 6:
+        return segments[-2] in {"connections", "knowledge-sources"}
+    return (
+        normalized_method == "POST"
+        and terminal == "account-deletion-requests"
+        and segments == ("api", "v2", "me", "account-deletion-requests")
+    )
+
+
+def _local_upload_store(request: Request) -> LocalSignedUploadStore | None:
+    """@brief 从当前 lifespan container 解析本地上传 store / Resolve the local upload store from the current lifespan container.
+
+    @param request 当前签名 PUT 请求 / Current signed PUT request.
+    @return development/test store，否则 None / Development/test store, otherwise ``None``.
+    """
+
+    container = getattr(request.app.state, "container", None)
+    candidate = getattr(container, "knowledge_local_upload_store", None)
+    return candidate if isinstance(candidate, LocalSignedUploadStore) else None
 
 
 def _identity_problem_response(request: Request, error: IdentityVerificationError) -> JSONResponse:
@@ -93,6 +188,10 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
     @return 已配置的 FastAPI 应用 / Configured FastAPI application.
     """
     resolved_settings = settings or BackendSettings.from_file(config_path())
+    local_upload_enabled = isinstance(
+        resolved_settings.knowledge.uploads.storage,
+        KnowledgeLocalUploadStorageSettings,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -113,8 +212,23 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
         openapi_url="/openapi.json",
         docs_url="/docs" if resolved_settings.environment != "production" else None,
     )
-    app.include_router(router)
-    app.include_router(diagnostics_router)
+    if resolved_settings.api.legacy_v1_enabled:
+        app.include_router(router)
+    app.include_router(router_v2)
+    app.include_router(router_v2_access)
+    app.include_router(router_v2_resumes)
+    app.include_router(router_v2_knowledge)
+    app.include_router(router_v2_agent)
+    app.include_router(router_v2_interview)
+    app.include_router(router_interview_realtime)
+    app.include_router(router_v2_platform)
+    app.include_router(router_oauth_metadata)
+    app.include_router(router_oauth)
+    app.include_router(router_identity)
+    if resolved_settings.api.legacy_v1_enabled:
+        app.include_router(diagnostics_router)
+    if local_upload_enabled:
+        app.include_router(build_local_upload_router(_local_upload_store))
     app.add_exception_handler(DomainError, domain_error_handler)
     app.add_exception_handler(RequestValidationError, request_validation_error_handler)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
@@ -132,22 +246,75 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
         """
         response: Response
         trace = cast(ServerTraceContext, request.state.trace_context)
+        if not resolved_settings.api.legacy_v1_enabled and (
+            request.url.path == "/api/v1" or request.url.path.startswith("/api/v1/")
+        ):
+            return correlate_http_response(
+                JSONResponse({"detail": "Not Found"}, status_code=404),
+                request,
+                trace,
+            )
         container = getattr(request.app.state, "container", None)
         if bool(request.state.request_id_invalid):
             request.state.route_fallback = "pre_auth"
             if container is not None:
                 log_http_start(request, trace)
             problem = Problem("http.invalid_request_id", 400, "X-Request-Id is invalid")
-            response = JSONResponse(
-                problem.as_dict(request.state.request_id, request.url.path),
-                status_code=400,
-                media_type="application/problem+json",
-            )
+            response = api_problem_response(request, problem)
             return correlate_http_response(response, request, trace)
         if container is None:
             response = await call_next(request)
             return correlate_http_response(response, request, trace)
-        if request.url.path == "/_internal/healthz":
+        if (
+            request.url.path == "/_internal/healthz"
+            or (local_upload_enabled and request.url.path.startswith("/__local-uploads/"))
+            or is_public_v2_path(request.url.path)
+            or is_public_oauth_metadata_path(request.url.path)
+            or is_public_oauth_path(request.url.path)
+            or is_hosted_identity_path(request.url.path)
+        ):
+            response = await call_next(request)
+            return correlate_http_response(response, request, trace)
+        if request.url.path == "/userinfo" or request.url.path.startswith("/api/v2/"):
+            request.state.route_fallback = "pre_auth"
+            if request.url.path.startswith("/api/v2/") and not request.headers.getlist(
+                "X-Request-Id"
+            ):
+                response = api_problem_response(
+                    request,
+                    Problem("http.request_id_required", 400, "X-Request-Id is required"),
+                )
+                return correlate_http_response(response, request, trace)
+            authorization_headers = request.headers.getlist("Authorization")
+            scheme, separator, access_token = (
+                authorization_headers[0].partition(" ")
+                if len(authorization_headers) == 1
+                else ("", "", "")
+            )
+            if scheme.lower() != "bearer" or separator != " " or not access_token.strip():
+                response = _v2_bearer_problem(request)
+                return correlate_http_response(response, request, trace)
+            try:
+                request.state.oauth_claims = await container.oauth.verify_access_token(
+                    access_token.strip()
+                )
+            except OAuthTokenValidationError:
+                response = _v2_bearer_problem(request)
+                return correlate_http_response(response, request, trace)
+            if resolved_settings.database.mode == "memory" and _requires_durable_v2_runtime(
+                request.method,
+                request.url.path,
+            ):
+                response = api_problem_response(
+                    request,
+                    Problem(
+                        "service.durable_runtime_required",
+                        503,
+                        "This operation requires the durable service runtime",
+                        retryable=True,
+                    ),
+                )
+                return correlate_http_response(response, request, trace)
             response = await call_next(request)
             return correlate_http_response(response, request, trace)
         log_http_start(request, trace)
@@ -221,11 +388,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
                 exc_info=error,
             )
         problem = Problem("internal.unexpected", 500, "Unexpected server error")
-        response = JSONResponse(
-            problem.as_dict(getattr(request.state, "request_id", None), request.url.path),
-            status_code=500,
-            media_type="application/problem+json",
-        )
+        response = api_problem_response(request, problem)
         request_id = getattr(request.state, "request_id", None)
         if isinstance(request_id, str):
             response.headers["X-Request-Id"] = request_id
@@ -239,9 +402,11 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
             CORSMiddleware,
             allow_origins=list(resolved_settings.network.cors_allowed_origins),
             allow_credentials=False,
-            allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=[
                 "Accept",
+                "Accept-Language",
+                "Authorization",
                 "Content-Type",
                 "Idempotency-Key",
                 "If-Match",
@@ -253,10 +418,12 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
             ],
             expose_headers=[
                 "Accept-Ranges",
+                "Content-Disposition",
                 "Content-Length",
                 "Content-Range",
                 "ETag",
                 "Location",
+                "Retry-After",
                 "X-Request-Id",
                 "traceparent",
             ],
@@ -265,4 +432,31 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
 
     app.add_middleware(TransportTelemetryMiddleware)
 
+    @app.middleware("http")
+    async def isolate_hosted_identity_from_cors(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        """Strip all CORS capability headers from cookie-authenticated identity routes."""
+
+        response = await call_next(request)
+        if is_hosted_identity_path(request.url.path):
+            for header in tuple(response.headers):
+                if header.lower().startswith("access-control-"):
+                    del response.headers[header]
+        return response
+
     return app
+
+
+def _v2_bearer_problem(request: Request) -> JSONResponse:
+    """Return the uniform v2 Bearer challenge without leaking token failure details."""
+
+    response = api_problem_response(
+        request,
+        Problem("oauth.invalid_token", 401, "Bearer access token is required or invalid"),
+    )
+    response.headers["WWW-Authenticate"] = (
+        f'Bearer resource_metadata="{PROTECTED_RESOURCE_METADATA_URL}"'
+    )
+    return response

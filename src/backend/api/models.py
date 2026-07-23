@@ -10,7 +10,9 @@ from pydantic import BaseModel, ConfigDict, Field
 class MockContractAdapter(BaseModel):
     """@brief 无正式路径级契约时的临时 DTO / Temporary DTO where no formal path-level contract exists.
 
-    @note MOCK — 不得视作 `contract/` 的正式补充；待确认项记录在 docs/CONTRACT_GAPS.md。
+    @note 仅供显式启用的 V1 开发迁移面；V2 不导入这些 DTO，且不得把它们视作共享契约的补充。
+        / Only for the explicitly enabled V1 development-migration surface; V2 does not import
+        these DTOs, and they must not be treated as additions to the shared contract.
     """
 
     model_config = ConfigDict(extra="forbid", json_schema_extra={"x-contract-status": "mock", "x-pending-contract": True})

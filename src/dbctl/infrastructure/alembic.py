@@ -1,5 +1,7 @@
 """@brief Alembic migration port 适配器 / Alembic migration-port adapter."""
 
+import json
+
 from alembic import command
 from alembic.config import Config
 
@@ -43,6 +45,18 @@ class AlembicMigrationAdapter:
                 configuration.set_main_option("aiws.migrator_role", roles.migrator.value)
                 configuration.set_main_option("aiws.app_role", roles.application.value)
                 configuration.set_main_option("aiws.dashboard_role", roles.dashboard.value)
+                configuration.set_main_option(
+                    "aiws.v2_default_data_region", blueprint.v2_default_data_region
+                )
+                configuration.set_main_option(
+                    "aiws.v2_legacy_workspace_plans",
+                    json.dumps(
+                        dict(blueprint.v2_legacy_workspace_plans),
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
                 command.upgrade(configuration, revision.value)
         except Exception as error:
             raise MigrationExecutionError(

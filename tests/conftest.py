@@ -92,6 +92,7 @@ def backend_client() -> Iterator[TestClient]:
     settings = BackendSettings.from_file(PROJECT_ROOT / "example.jsonc")
     settings = replace(
         settings,
+        api=replace(settings.api, legacy_v1_enabled=True),
         network=replace(
             settings.network,
             cors_allowed_origins=("http://127.0.0.1:5173", "http://localhost:5173"),
