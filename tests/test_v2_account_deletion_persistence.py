@@ -240,7 +240,10 @@ def deletion_postgres(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Pos
         # PostgreSQL extensions are cluster-administrator bootstrap concerns.  The
         # application migrator deliberately is not a superuser, so mirror the
         # production db-init ordering before Alembic reaches revision 0001.
-        harness.psql(psql, "CREATE EXTENSION vector;")
+        try:
+            harness.psql(psql, "CREATE EXTENSION vector;")
+        except subprocess.CalledProcessError:
+            pytest.skip("the PostgreSQL vector extension is unavailable")
         configuration = _migration_config(harness.migration_dsn)
         command.upgrade(configuration, "20260723_0024")
         harness.execute(
