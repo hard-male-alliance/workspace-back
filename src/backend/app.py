@@ -258,11 +258,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
             if container is not None:
                 log_http_start(request, trace)
             problem = Problem("http.invalid_request_id", 400, "X-Request-Id is invalid")
-            response = JSONResponse(
-                problem.as_dict(request.state.request_id, request.url.path),
-                status_code=400,
-                media_type="application/problem+json",
-            )
+            response = api_problem_response(request, problem)
             return correlate_http_response(response, request, trace)
         if container is None:
             response = await call_next(request)

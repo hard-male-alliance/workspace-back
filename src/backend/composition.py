@@ -1972,8 +1972,23 @@ def _log_identity_email_result(result: IdentityEmailWorkerResult) -> None:
 
     @param result 单轮聚合结果 / Aggregate result for one pass.
     @return 无返回值 / No return value.
+
+    @note 空轮询不产生日志，避免常驻服务按轮询频率制造无信息量的磁盘写入。
+        / Empty polls emit no log to avoid persistent, information-free disk writes.
     """
 
+    if not any(
+        (
+            result.claimed,
+            result.sent,
+            result.retried,
+            result.dead,
+            result.lost_leases,
+            result.purged_outbox_rows,
+            result.purged_rate_limit_rows,
+        )
+    ):
+        return
     logger.log(
         logging.WARNING if result.dead or result.lost_leases else logging.INFO,
         "backend.identity_email.outbox.completed",

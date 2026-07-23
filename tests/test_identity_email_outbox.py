@@ -3,20 +3,69 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import Mock
 
 import pytest
 
+from backend.composition import _log_identity_email_result
+from backend.domain.observability import ResourceMetadata, SignalEnvelope, SignalSource
 from backend.domain.ports import IdentityEmailRateLimitExceeded
 from backend.infrastructure.identity_email import MemoryIdentityEmailSender
 from backend.infrastructure.identity_email_outbox import (
     ClaimedIdentityEmail,
     IdentityEmailKeyring,
     IdentityEmailPayloadError,
+    IdentityEmailWorkerResult,
     identity_email_retry_delay,
 )
 
 KEY = bytes(range(32))
 """@brief 固定测试 AES-256 key / Fixed test AES-256 key."""
+
+
+def test_empty_worker_result_does_not_emit_completed_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief 空轮询不写 completed 日志 / Empty polls do not write completed logs.
+
+    @param monkeypatch pytest 替换工具 / Pytest patch helper.
+    @return 无返回值 / No return value.
+    """
+
+    log = Mock()
+    monkeypatch.setattr("backend.composition.logger.log", log)
+
+    _log_identity_email_result(IdentityEmailWorkerResult(0, 0, 0, 0, 0, 0, 0))
+
+    log.assert_not_called()
+
+
+def test_nonempty_worker_result_emits_completed_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief 有实际工作时保留聚合日志 / Aggregate logs remain for actual work.
+
+    @param monkeypatch pytest 替换工具 / Pytest patch helper.
+    @return 无返回值 / No return value.
+    """
+
+    log = Mock()
+    monkeypatch.setattr("backend.composition.logger.log", log)
+
+    _log_identity_email_result(IdentityEmailWorkerResult(1, 1, 0, 0, 0, 0, 0))
+
+    log.assert_called_once()
+    call = log.call_args
+    assert call.args[1] == "backend.identity_email.outbox.completed"
+    attributes = call.kwargs["extra"]["telemetry_attributes"]
+    assert attributes["claimed"] == 1
+    assert attributes["sent"] == 1
+    SignalEnvelope(
+        SignalSource.BACKEND,
+        ResourceMetadata("backend.test"),
+        call.args[1],
+        attributes=attributes,
+    )
 
 
 def test_aes_gcm_round_trip_binds_row_kind_key_and_aad_version() -> None:

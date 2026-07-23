@@ -328,9 +328,11 @@ def test_openapi_contains_the_access_resume_platform_and_template_routes_impleme
 def test_non_public_v2_paths_never_fall_back_to_v1_mock_identity(
     backend_client: TestClient,
 ) -> None:
+    validator = ContractValidator.from_jsonc(read_contract_schema_text("v2"))
     missing_request_id = backend_client.get("/api/v2/me")
     assert missing_request_id.status_code == 400
     assert missing_request_id.json()["code"] == "http.request_id_required"
+    validator.validate_definition("ProblemDetails", missing_request_id.json())
 
     unauthenticated = backend_client.get(
         "/api/v2/me", headers={"X-Request-Id": "req-api-v2-boundary"}
@@ -340,9 +342,15 @@ def test_non_public_v2_paths_never_fall_back_to_v1_mock_identity(
     assert unauthenticated.headers["www-authenticate"] == (
         f'Bearer resource_metadata="{PROTECTED_RESOURCE_METADATA_URL}"'
     )
-    ContractValidator.from_jsonc(read_contract_schema_text("v2")).validate_definition(
-        "ProblemDetails", unauthenticated.json()
+    validator.validate_definition("ProblemDetails", unauthenticated.json())
+
+    invalid_request_id = backend_client.get(
+        "/api/v2/me",
+        headers={"X-Request-Id": "invalid request id"},
     )
+    assert invalid_request_id.status_code == 400
+    assert invalid_request_id.json()["code"] == "http.invalid_request_id"
+    validator.validate_definition("ProblemDetails", invalid_request_id.json())
 
 
 def test_public_openid_configuration_only_advertises_the_frozen_secure_flow(
