@@ -270,6 +270,11 @@ async def test_streaming_report_provider_builds_grounded_draft_and_stable_reques
     assert first.engine_version == "test-model-json-v1"
     assert len(provider.requests) == 2
     assert {item["operation_id"] for item in provider.requests} == {str(OPERATION_ID)}
+    assert provider.requests[0]["response_format"] == "interview_report.strict_json.v1"
+    response_schema = provider.requests[0]["response_schema"]
+    assert response_schema["type"] == "object"
+    assert response_schema["additionalProperties"] is False
+    assert set(response_schema["required"]) == set(response_schema["properties"])
     inference = provider.requests[0]["inference"]
     assert inference == {
         "data_region": "global",

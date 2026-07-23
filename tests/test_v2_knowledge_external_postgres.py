@@ -788,6 +788,11 @@ async def test_knowledge_worker_commits_index_and_privacy_deletion_atomically(
             {"count": 1}
         ]
         assert external_postgres.rows(
+            "SELECT updated_at >= created_at AS timestamps_valid "
+            "FROM knowledge.source_versions "
+            f"WHERE id = '{version_id}'"
+        ) == [{"timestamps_valid": True}]
+        assert external_postgres.rows(
             "SELECT count(*) AS count FROM identity.audit_events "
             f"WHERE resource_id = '{source_id}' AND action = 'knowledge.index.completed'"
         ) == [{"count": 1}]

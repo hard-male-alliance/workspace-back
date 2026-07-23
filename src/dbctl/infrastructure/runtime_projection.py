@@ -248,11 +248,7 @@ def build_runtime_config(
         active_key_id = _optional_text(
             environ,
             "AIWS_INTERVIEW_REALTIME_ACTIVE_KEY_ID",
-        ) or (
-            configured_active_key_id
-            if isinstance(configured_active_key_id, str)
-            else None
-        )
+        ) or (configured_active_key_id if isinstance(configured_active_key_id, str) else None)
         signing_keys = _optional_json_string_mapping(
             environ,
             "AIWS_INTERVIEW_REALTIME_SIGNING_KEYS",
@@ -271,7 +267,14 @@ def build_runtime_config(
         "AIWS_INTERVIEW_ICE_URLS",
         interview_realtime.get("ice_urls", []),
     )
+    turn_shared_secret = _optional_text(
+        environ,
+        "AIWS_INTERVIEW_TURN_SHARED_SECRET",
+    )
+    if turn_shared_secret is not None:
+        interview_realtime["turn_shared_secret"] = turn_shared_secret
     interview["realtime"] = interview_realtime
+    interview["recording_directory"] = "/var/lib/aiws/interview-media"
     root["interview"] = interview
 
     renderer = require_mapping(root.get("resume_rendering"), "resume_rendering")
@@ -345,9 +348,7 @@ def build_runtime_config(
             )
         security["identity_mode"] = "disabled"
         security["trusted_proxy_hmac_secret"] = None
-        security["cursor_hmac_secret"] = _required_text(
-            environ, "AIWS_CURSOR_HMAC_SECRET"
-        )
+        security["cursor_hmac_secret"] = _required_text(environ, "AIWS_CURSOR_HMAC_SECRET")
         security["sensitive_idempotency_hmac_secret"] = _required_text(
             environ, "AIWS_SENSITIVE_IDEMPOTENCY_HMAC_SECRET"
         )
@@ -390,22 +391,22 @@ def build_runtime_config(
         if smtp_username is not None or smtp_password is not None:
             identity_email["smtp_username"] = smtp_username
             identity_email["smtp_password"] = smtp_password
-        email_outbox.update(
-            {
-                "active_key_id": _required_text(
-                    environ,
-                    "AIWS_IDENTITY_EMAIL_ACTIVE_KEY_ID",
-                ),
-                "encryption_keys": _required_json_string_mapping(
-                    environ,
-                    "AIWS_IDENTITY_EMAIL_ENCRYPTION_KEYS",
-                ),
-                "rate_limit_hmac_key": _required_text(
-                    environ,
-                    "AIWS_IDENTITY_EMAIL_RATE_LIMIT_HMAC_KEY",
-                ),
-            }
-        )
+    email_outbox.update(
+        {
+            "active_key_id": _required_text(
+                environ,
+                "AIWS_IDENTITY_EMAIL_ACTIVE_KEY_ID",
+            ),
+            "encryption_keys": _required_json_string_mapping(
+                environ,
+                "AIWS_IDENTITY_EMAIL_ENCRYPTION_KEYS",
+            ),
+            "rate_limit_hmac_key": _required_text(
+                environ,
+                "AIWS_IDENTITY_EMAIL_RATE_LIMIT_HMAC_KEY",
+            ),
+        }
+    )
     identity_email["outbox"] = email_outbox
     hosted_identity["password_breach"] = password_breach
     hosted_identity["email"] = identity_email
@@ -474,7 +475,7 @@ def _optional_json_string_list(
     if raw_value:
         try:
             parsed = json.loads(raw_value, object_pairs_hook=_unique_json_object)
-        except (json.JSONDecodeError, ValueError):
+        except json.JSONDecodeError, ValueError:
             raise ConfigurationError(f"{name} must be a JSON string array") from None
     if not isinstance(parsed, list) or not all(isinstance(item, str) and item for item in parsed):
         raise ConfigurationError(f"{name} must be a JSON string array")
@@ -525,7 +526,7 @@ def _optional_json_object_list(
     if raw_value:
         try:
             parsed = json.loads(raw_value, object_pairs_hook=_unique_json_object)
-        except (json.JSONDecodeError, ValueError):
+        except json.JSONDecodeError, ValueError:
             raise ConfigurationError(f"{name} must be a JSON object array") from None
     if not isinstance(parsed, list) or not all(isinstance(item, dict) for item in parsed):
         raise ConfigurationError(f"{name} must be a JSON object array")
@@ -629,13 +630,10 @@ def _optional_json_string_mapping(
     if raw_value:
         try:
             parsed = json.loads(raw_value, object_pairs_hook=_unique_json_object)
-        except (json.JSONDecodeError, ValueError):
+        except json.JSONDecodeError, ValueError:
             raise ConfigurationError(f"{name} must be a JSON string mapping") from None
     if not isinstance(parsed, dict) or not all(
-        isinstance(key, str)
-        and bool(key)
-        and isinstance(value, str)
-        and bool(value)
+        isinstance(key, str) and bool(key) and isinstance(value, str) and bool(value)
         for key, value in parsed.items()
     ):
         raise ConfigurationError(f"{name} must be a JSON string mapping")

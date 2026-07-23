@@ -130,6 +130,12 @@
   },
   // Interview V2 realtime 凭据必须是独立、短期且绑定 audience 的 HMAC grant。
   "interview": {
+    // 包含排队和完整流式输出；必须有界，配置解析硬限制为最多 120 秒。
+    "report_timeout_ms": 60000,
+    // WebSocket 媒体分片先写受控目录；多 worker 部署必须挂载同一受限持久卷。
+    "recording_directory": "data/interview-media",
+    "media_chunk_max_bytes": 1048576,
+    "media_session_max_bytes": 536870912,
     "realtime": {
       // 公开模板不伪造可持久 secret；development/test 未配置时组合根 fail closed。
       // staging/production 必须配置 active key 与对应的无 padding 32-byte base64url key。
@@ -141,7 +147,9 @@
       "credential_ttl_seconds": 300,
       "heartbeat_interval_ms": 5000,
       // 可选 RFC 7064/7065 STUN/TURN URI；TURN 凭据由服务端短期签发。
-      "ice_urls": []
+      "ice_urls": [],
+      // 仅存在 TURN URL 时填写，与 JWT signing key 严格分离的 32-byte base64url secret。
+      "turn_shared_secret": null
     }
   },
   "resume_rendering": {

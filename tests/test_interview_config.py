@@ -56,6 +56,7 @@ def _configured_development_root() -> dict[str, Any]:
                 "stun:stun.hmalliances.org:3478",
                 "turns:turn.hmalliances.org:5349?transport=tcp",
             ],
+            "turn_shared_secret": _encoded_key(21),
         }
     )
     return root
@@ -178,6 +179,7 @@ def test_configured_realtime_decodes_key_and_preserves_transport_policy(
         "wss://realtime.hmalliances.org/v2/interview"
     )
     assert settings.interview.realtime.ice_urls[1].startswith("turns:")
+    assert settings.interview.realtime.turn_shared_secret == _encoded_key(21)
 
 
 def test_deployed_realtime_requires_keyring_and_non_placeholder_endpoint(

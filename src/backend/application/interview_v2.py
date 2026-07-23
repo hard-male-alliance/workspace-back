@@ -53,6 +53,7 @@ from backend.domain.interview_v2 import (
     InterviewSessionView,
     JobTarget,
     RealtimeConnection,
+    RealtimeConnectionId,
     RealtimeConnectionLease,
     RealtimeControl,
     RealtimeControlInput,
@@ -953,6 +954,49 @@ class InterviewApplicationService:
                 "the Session changed while realtime input was committed",
             ) from error
 
+    async def authorize_media_capture(
+        self,
+        audience: ResourceRef,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+        connection_id: RealtimeConnectionId,
+        kind: str,
+    ) -> None:
+        """Validate lease, active state, and frozen recording consent before writing a chunk."""
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            lease = await uow.repository.get_connection_lease(
+                workspace_id, session_id, connection_id
+            )
+            if (
+                lease is None
+                or lease.audience != audience
+                or now >= lease.expires_at
+            ):
+                raise InterviewResourceNotFound("realtime_connection")
+            session = await self._session(uow, workspace_id, session_id)
+            if session.view.status not in {
+                InterviewSessionStatus.CONNECTING,
+                InterviewSessionStatus.ACTIVE,
+            }:
+                raise InterviewConflict(
+                    "interview_session.media_capture_forbidden",
+                    "the Session cannot accept media in its current state",
+                )
+            allowed = (
+                session.spec.recording.record_audio
+                if kind == "audio"
+                else session.spec.recording.record_video
+                if kind == "video"
+                else False
+            )
+            if not allowed:
+                raise InterviewConflict(
+                    "interview_session.recording_not_consented",
+                    "recording consent does not allow this media kind",
+                )
+            await uow.commit()
+
     async def _authorize(
         self,
         uow: InterviewUnitOfWork,
@@ -1401,8 +1445,12 @@ class InterviewWorkerService:
                     )
                 validate_interview_job_alignment(current, current_job)
                 validate_artifacts_for_session(output.artifacts, current)
-                for artifact in output.artifacts:
-                    await second.artifacts.add(artifact)
+                for artifact, content in zip(
+                    output.artifacts,
+                    output.contents,
+                    strict=True,
+                ):
+                    await second.artifacts.add(artifact, content)
                 completed = current.finish_end(at=finished_at)
                 completed_job = current_job.succeed(
                     [

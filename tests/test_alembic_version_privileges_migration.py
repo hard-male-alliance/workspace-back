@@ -71,7 +71,7 @@ def test_revision_extends_0006_in_the_single_linear_history() -> None:
     scripts = ScriptDirectory.from_config(configuration)
     revision_script = scripts.get_revision("20260721_0007")
 
-    assert scripts.get_heads() == ["20260723_0027"]
+    assert scripts.get_heads() == ["20260723_0028"]
     assert revision_script is not None
     assert revision_script.down_revision == "20260721_0006"
     assert revision_script.branch_labels == set()

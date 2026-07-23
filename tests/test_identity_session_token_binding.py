@@ -31,7 +31,7 @@ def test_0018_is_linear_and_remains_on_the_single_migration_chain() -> None:
     configuration.set_main_option("script_location", str(PROJECT_ROOT / "alembic"))
     scripts = ScriptDirectory.from_config(configuration)
 
-    assert scripts.get_heads() == ["20260723_0027"]
+    assert scripts.get_heads() == ["20260723_0028"]
     script = scripts.get_revision("20260723_0018")
     assert script is not None
     assert script.down_revision == "20260723_0017"

@@ -22,6 +22,7 @@ from backend.api.errors import (
     request_validation_error_handler,
 )
 from backend.api.identity import is_hosted_identity_path, router_identity
+from backend.api.interview_realtime import router_interview_realtime
 from backend.api.middleware.context import correlate_http_response
 from backend.api.middleware.transport import (
     TransportTelemetryMiddleware,
@@ -219,6 +220,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
     app.include_router(router_v2_knowledge)
     app.include_router(router_v2_agent)
     app.include_router(router_v2_interview)
+    app.include_router(router_interview_realtime)
     app.include_router(router_v2_platform)
     app.include_router(router_oauth_metadata)
     app.include_router(router_oauth)

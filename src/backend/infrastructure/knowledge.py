@@ -1225,7 +1225,7 @@ class PostgresKnowledgeRepository:
         if actor_id != source.created_by:
             raise PermissionError("Knowledge source creator does not match authenticated actor")
         self._session.add(_source_record(source, actor_id))
-        self._add_policy(source, actor_id)
+        await self._add_policy(source, actor_id)
         self._source_state[(str(source.workspace_id), str(source.meta.id))] = (
             str(actor_id),
             source.visibility.policy_version,
@@ -1271,7 +1271,7 @@ class PostgresKnowledgeRepository:
         if source.visibility.policy_version != current_policy:
             if source.visibility.policy_version != current_policy + 1:
                 raise KnowledgeCasMismatch
-            self._add_policy(source, UserId(owner_id))
+            await self._add_policy(source, UserId(owner_id))
         self._source_state[(str(source.workspace_id), str(source.meta.id))] = (
             owner_id,
             source.visibility.policy_version,
@@ -1668,7 +1668,7 @@ class PostgresKnowledgeRepository:
         self._source_state[key] = result
         return result
 
-    def _add_policy(self, source: KnowledgeSource, owner_id: UserId) -> None:
+    async def _add_policy(self, source: KnowledgeSource, owner_id: UserId) -> None:
         """@brief append policy snapshot 与有序 grants / Append a policy snapshot and ordered grants."""
         policy = source.visibility
         policy_id = _row_id("knowledge_policy")
@@ -1691,6 +1691,10 @@ class PostgresKnowledgeRepository:
                 extensions={},
             )
         )
+        # Grants reference the policy row but the persistence models deliberately expose no
+        # relationship.  Establish the foreign-key parent before adding children instead of
+        # relying on incidental SQLAlchemy INSERT ordering.
+        await self._session.flush()
         for ordinal, grant in enumerate(policy.agent_grants):
             self._session.add(
                 KnowledgeVisibilityGrantRecord(

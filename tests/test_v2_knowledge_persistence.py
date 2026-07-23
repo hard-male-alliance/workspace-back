@@ -30,9 +30,20 @@ from backend.domain.connections import (
     ConnectionProvider,
     ProviderSessionReference,
 )
-from backend.domain.knowledge_sources import KnowledgeSourceId
+from backend.domain.knowledge_sources import (
+    AgentScopeGrant,
+    KnowledgeOperation,
+    KnowledgeSensitivity,
+    KnowledgeSource,
+    KnowledgeSourceId,
+    KnowledgeVisibilityPolicy,
+    ManualSourceInput,
+    ModelRegion,
+    PolicyEffect,
+)
 from backend.domain.principals import (
     ClientId,
+    ResourceMeta,
     Scope,
     Subject,
     TokenPrincipal,
@@ -659,6 +670,96 @@ async def test_real_postgres_adapter_rehydrates_sources_and_round_trips_sealed_s
             assert restored.generation == 2
     finally:
         await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_persists_policy_before_agent_grants(
+    knowledge_postgres: _PostgresHarness,
+) -> None:
+    """@brief 真实 adapter 先落 policy 再落 grants / Real adapter persists a policy before its grants."""
+
+    database = AsyncDatabase(
+        AsyncDatabaseOptions(
+            knowledge_postgres.app_dsn,
+            pool_size=1,
+            max_overflow=0,
+            statement_timeout_ms=5_000,
+            lock_timeout_ms=1_000,
+        )
+    )
+    factory = PostgresKnowledgeUnitOfWorkFactory(
+        database,
+        launch_cipher=AesGcmAuthorizationLaunchCipher(
+            {"key_2026": bytes(range(32))},
+            active_key_id="key_2026",
+        ),
+    )
+    workspace_id = WorkspaceId("workspace_legacy0001")
+    user_id = UserId("user_legacy0001")
+    principal = TokenPrincipal(
+        user_id,
+        Subject("legacy-subject"),
+        ClientId("client_legacy0001"),
+        frozenset({Scope("workspace.read"), Scope("workspace.write")}),
+    )
+    source = KnowledgeSource.create(
+        meta=ResourceMeta(
+            KnowledgeSourceId("source_policy_grant1"),
+            1,
+            NOW,
+            NOW,
+        ),
+        workspace_id=workspace_id,
+        created_by=user_id,
+        name="Policy grant ordering",
+        source_input=ManualSourceInput("policy grant persistence"),
+        visibility=KnowledgeVisibilityPolicy(
+            KnowledgeSensitivity.NORMAL,
+            PolicyEffect.DENY,
+            (
+                AgentScopeGrant(
+                    "agent.default",
+                    PolicyEffect.ALLOW,
+                    (KnowledgeOperation.RETRIEVE,),
+                ),
+            ),
+            False,
+            (ModelRegion.GLOBAL,),
+            False,
+            None,
+            1,
+        ),
+    )
+    try:
+        async with factory() as unit:
+            actor = await unit.authorizer.authenticate(principal)
+            await unit.authorizer.authorize(
+                actor,
+                workspace_id,
+                WorkspaceAction.CREATE_KNOWLEDGE_SOURCE,
+            )
+            await unit.repository.add_source(source, None)
+            await unit.commit()
+    finally:
+        await database.aclose()
+
+    assert knowledge_postgres.rows(
+        """
+        SELECT policy.source_id, visibility_grant.agent_scope, visibility_grant.effect,
+               visibility_grant.allowed_operations
+        FROM knowledge.visibility_policies AS policy
+        JOIN knowledge.visibility_grants AS visibility_grant
+          ON visibility_grant.policy_id = policy.id
+        WHERE policy.source_id = 'source_policy_grant1'
+        """
+    ) == [
+        {
+            "source_id": "source_policy_grant1",
+            "agent_scope": "agent.default",
+            "effect": "allow",
+            "allowed_operations": ["retrieve"],
+        }
+    ]
 
 
 def test_0019_empty_upgrade_can_safely_restore_0018_shape(

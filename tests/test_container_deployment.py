@@ -45,9 +45,7 @@ def _container_environment() -> dict[str, str]:
         "AIWS_IDENTITY_EMAIL_ENCRYPTION_KEYS": (
             '{"email-key-2026-07":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}'
         ),
-        "AIWS_IDENTITY_EMAIL_RATE_LIMIT_HMAC_KEY": (
-            "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"
-        ),
+        "AIWS_IDENTITY_EMAIL_RATE_LIMIT_HMAC_KEY": ("CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"),
         "AIWS_IDENTITY_EMAIL_FROM_ADDRESS": "identity@example.test",
         "AIWS_IDENTITY_EMAIL_SMTP_HOST": "smtp.example.test",
         "AIWS_TRUSTED_PROXY_CIDRS": '["172.30.0.0/24"]',
@@ -83,19 +81,17 @@ def _container_environment() -> dict[str, str]:
         "AIWS_KNOWLEDGE_S3_ACCESS_KEY_ID": "test-only-access-key",
         "AIWS_KNOWLEDGE_S3_SECRET_ACCESS_KEY": "test-only-secret-access-key",
         "AIWS_KNOWLEDGE_MALWARE_MODE": "reject",
-        "AIWS_KNOWLEDGE_SOURCE_ALLOWED_HOST_PATTERNS": (
-            '["example.test","*.example.test"]'
-        ),
+        "AIWS_KNOWLEDGE_SOURCE_ALLOWED_HOST_PATTERNS": ('["example.test","*.example.test"]'),
         "AIWS_INTERVIEW_REALTIME_ACTIVE_KEY_ID": "interview-key-2026-07",
         "AIWS_INTERVIEW_REALTIME_SIGNING_KEYS": (
             '{"interview-key-2026-07":"FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQ"}'
         ),
-        "AIWS_INTERVIEW_SIGNALING_URL": (
-            "wss://realtime.hmalliances.org/v2/interview"
-        ),
+        "AIWS_INTERVIEW_SIGNALING_URL": ("wss://realtime.hmalliances.org/v2/interview"),
         "AIWS_INTERVIEW_ICE_URLS": (
-            '["stun:stun.hmalliances.org:3478",'
-            '"turns:turn.hmalliances.org:5349?transport=tcp"]'
+            '["stun:stun.hmalliances.org:3478","turns:turn.hmalliances.org:5349?transport=tcp"]'
+        ),
+        "AIWS_INTERVIEW_TURN_SHARED_SECRET": (
+            "FRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRU"
         ),
     }
 
@@ -161,9 +157,7 @@ def test_runtime_projection_preserves_dbctl_credentials(tmp_path: Path) -> None:
     assert not backend.api.legacy_v1_enabled
     assert backend.security.identity_mode == "disabled"
     assert backend.security.trusted_proxy_hmac_secret is None
-    assert backend.security.cursor_hmac_secret == (
-        "test-only-cursor-secret-with-at-least-32-bytes"
-    )
+    assert backend.security.cursor_hmac_secret == ("test-only-cursor-secret-with-at-least-32-bytes")
     assert backend.security.sensitive_idempotency_hmac_secret == (
         "test-only-sensitive-idempotency-secret-32-bytes"
     )
@@ -187,14 +181,18 @@ def test_runtime_projection_preserves_dbctl_credentials(tmp_path: Path) -> None:
         "example.test",
         "*.example.test",
     )
-    assert backend.interview.realtime.signing_keyring.active_key_id == (
-        "interview-key-2026-07"
-    )
+    assert backend.interview.realtime.signing_keyring.active_key_id == ("interview-key-2026-07")
     assert backend.interview.realtime.active_signing_key == bytes([20]) * 32
     assert backend.interview.realtime.signaling_url == (
         "wss://realtime.hmalliances.org/v2/interview"
     )
     assert backend.interview.realtime.ice_urls[1].startswith("turns:")
+    assert backend.interview.realtime.turn_shared_secret == (
+        "FRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRUVFRU"
+    )
+    assert backend.interview.recording_directory == Path(
+        "/var/lib/aiws/interview-media"
+    )
     assert dashboard.database.mode == "postgresql"
     assert dashboard.api.host == "0.0.0.0"
     assert dashboard.access.mode == "operator_token"
@@ -728,9 +726,16 @@ def test_default_runtime_projection_keeps_development_mocks(tmp_path: Path) -> N
     runtime = build_runtime_config(
         source_path,
         {
+            "AIWS_IDENTITY_EMAIL_ACTIVE_KEY_ID": "email-dev-2026-07",
+            "AIWS_IDENTITY_EMAIL_ENCRYPTION_KEYS": (
+                '{"email-dev-2026-07":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}'
+            ),
+            "AIWS_IDENTITY_EMAIL_RATE_LIMIT_HMAC_KEY": (
+                "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"
+            ),
             "AIWS_KNOWLEDGE_LOCAL_UPLOAD_SIGNING_HMAC_KEY": (
                 "Dg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4"
-            )
+            ),
         },
     )
 
@@ -739,6 +744,7 @@ def test_default_runtime_projection_keeps_development_mocks(tmp_path: Path) -> N
     assert runtime["security"]["identity_mode"] == "development_mock"
     assert runtime["ai"]["provider"] == "mock"
     assert runtime["resume_rendering"]["adapter"] == "mock"
+    assert runtime["hosted_identity"]["email"]["outbox"]["active_key_id"] == ("email-dev-2026-07")
     assert runtime["interview"]["realtime"]["signing_keyring"] == {
         "active_key_id": None,
         "keys": {},
@@ -760,11 +766,7 @@ def test_development_projection_preserves_explicit_interview_realtime_config(
         {
             "signing_keyring": {
                 "active_key_id": "interview-dev-2026-07",
-                "keys": {
-                    "interview-dev-2026-07": (
-                        "FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQ"
-                    )
-                },
+                "keys": {"interview-dev-2026-07": ("FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQ")},
             },
             "signaling_url": "wss://realtime.hmalliances.org/v2/interview",
         }
@@ -774,15 +776,23 @@ def test_development_projection_preserves_explicit_interview_realtime_config(
     runtime = build_runtime_config(
         source_path,
         {
+            "AIWS_IDENTITY_EMAIL_ACTIVE_KEY_ID": "email-dev-2026-07",
+            "AIWS_IDENTITY_EMAIL_ENCRYPTION_KEYS": (
+                '{"email-dev-2026-07":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}'
+            ),
+            "AIWS_IDENTITY_EMAIL_RATE_LIMIT_HMAC_KEY": (
+                "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"
+            ),
             "AIWS_KNOWLEDGE_LOCAL_UPLOAD_SIGNING_HMAC_KEY": (
                 "Dg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4"
-            )
+            ),
         },
     )
 
-    assert runtime["interview"]["realtime"]["signing_keyring"][
-        "active_key_id"
-    ] == "interview-dev-2026-07"
+    assert (
+        runtime["interview"]["realtime"]["signing_keyring"]["active_key_id"]
+        == "interview-dev-2026-07"
+    )
     assert runtime["interview"]["realtime"]["signaling_url"] == (
         "wss://realtime.hmalliances.org/v2/interview"
     )
@@ -801,9 +811,7 @@ def test_docker_dbinit_only_changes_connection_endpoint() -> None:
 def test_nginx_exposes_only_the_frozen_v2_tls_surface() -> None:
     """@brief Nginx 对齐 :8022→:9000 且只公开 OAuth/Identity/API V2 / Nginx aligns :8022-to-:9000 and exposes only OAuth, Identity, and API V2."""
 
-    source = (PROJECT_ROOT / "deploy/nginx/ai-job-workspace.conf").read_text(
-        encoding="utf-8"
-    )
+    source = (PROJECT_ROOT / "deploy/nginx/ai-job-workspace.conf").read_text(encoding="utf-8")
 
     assert "listen 8022 ssl http2;" in source
     assert "server_name api.hmalliances.org;" in source
@@ -819,12 +827,15 @@ def test_nginx_exposes_only_the_frozen_v2_tls_surface() -> None:
         "location /identity/v2/",
         "location = /userinfo",
         "location /api/v2/",
+        "location = /realtime/v2/interview",
     ):
         assert boundary in source
     assert "location /api/v1/ { return 404; }" in source
     assert "location ~ ^/api/v2/workspaces/[^/]+/events$" in source
     assert "proxy_buffering off;" in source
-    assert "proxy_set_header Forwarded \"\";" in source
+    assert 'proxy_set_header Upgrade $http_upgrade;' in source
+    assert 'proxy_set_header Connection "upgrade";' in source
+    assert 'proxy_set_header Forwarded "";' in source
     assert "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for" not in source
 
 
@@ -844,6 +855,17 @@ def test_runtime_services_bound_the_process_tree_with_cgroup_pids() -> None:
 
     assert "x-aiws-runtime-service: &aiws-runtime-service" in source
     assert "  pids_limit: 256\n" in source
+
+
+def test_realtime_profile_pins_coturn_and_uses_rest_credentials() -> None:
+    """@brief 可选 realtime profile 使用固定 coturn 与独立临时凭据 secret / Optional realtime profile pins coturn and uses an independent temporary-credential secret."""
+    source = (PROJECT_ROOT / "compose.yaml").read_text(encoding="utf-8")
+
+    assert "image: coturn/coturn:4.12.0-r0" in source
+    assert 'profiles: ["realtime"]' in source
+    assert "--use-auth-secret" in source
+    assert "--static-auth-secret=${AIWS_INTERVIEW_TURN_SHARED_SECRET:-}" in source
+    assert "49160-49200:49160-49200/udp" in source
     assert "  cap_drop:\n    - ALL\n" in source
 
 
@@ -896,9 +918,7 @@ def test_deployed_container_rejects_unconsumed_legacy_identity_hmac_secret(
     source_path = _bootstrap_config(tmp_path)
     environ = _container_environment()
     environ["AIWS_ENVIRONMENT"] = environment
-    environ["AIWS_TRUSTED_PROXY_HMAC_SECRET"] = (
-        "unused-legacy-proxy-secret-with-at-least-32-bytes"
-    )
+    environ["AIWS_TRUSTED_PROXY_HMAC_SECRET"] = "unused-legacy-proxy-secret-with-at-least-32-bytes"
 
     with pytest.raises(ConfigurationError, match="is not consumed"):
         build_runtime_config(source_path, environ)
@@ -973,7 +993,7 @@ def test_production_container_requires_distributed_security_keys(
 
 @pytest.mark.parametrize(
     "malformed",
-    ('[]', '{}', '{"key":""}', 'not-json'),
+    ("[]", "{}", '{"key":""}', "not-json"),
 )
 def test_identity_email_keyring_environment_requires_nonempty_string_mapping(
     tmp_path: Path,

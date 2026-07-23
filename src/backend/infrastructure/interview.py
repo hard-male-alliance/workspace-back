@@ -113,6 +113,7 @@ from backend.infrastructure.access import (
 )
 from backend.infrastructure.persistence.database import AsyncDatabase
 from backend.infrastructure.persistence.models import (
+    ArtifactContentRecord,
     ArtifactRecord,
     AuditEventRecord,
     InterviewEventRecord,
@@ -520,6 +521,7 @@ class HmacInterviewRealtimeGateway:
         lifetime: timedelta = timedelta(minutes=5),
         heartbeat_interval_ms: int = 5_000,
         ice_urls: tuple[str, ...] = (),
+        turn_shared_secret: bytes | None = None,
         clock: _Clock | None = None,
     ) -> None:
         """@brief 配置 credential policy / Configure credential policy.
@@ -531,6 +533,7 @@ class HmacInterviewRealtimeGateway:
         @param lifetime grant lifetime, at most fifteen minutes / Grant lifetime, at most fifteen minutes.
         @param heartbeat_interval_ms heartbeat interval / Heartbeat interval.
         @param ice_urls optional TURN/STUN URLs / Optional TURN/STUN URLs.
+        @param turn_shared_secret coturn TURN REST HMAC-SHA1 secret，独立于 JWT keyring / coturn TURN REST HMAC-SHA1 secret, independent from the JWT keyring.
         @param clock injectable clock / Injectable clock.
         """
         keyring = (
@@ -547,12 +550,26 @@ class HmacInterviewRealtimeGateway:
             raise ValueError("realtime credential lifetime must be in (0, 15 minutes]")
         if not 1_000 <= heartbeat_interval_ms <= 120_000:
             raise ValueError("realtime heartbeat interval is invalid")
+        turn_urls = tuple(url for url in ice_urls if url.startswith(("turn:", "turns:")))
+        stun_urls = tuple(url for url in ice_urls if url.startswith(("stun:", "stuns:")))
+        if len(turn_urls) + len(stun_urls) != len(ice_urls):
+            raise ValueError("realtime ICE URL scheme is invalid")
+        if bool(turn_urls) != (turn_shared_secret is not None):
+            raise ValueError(
+                "realtime TURN secret must be configured exactly when TURN URLs are present"
+            )
+        if turn_shared_secret is not None and len(turn_shared_secret) < 32:
+            raise ValueError("realtime TURN secret must contain at least 32 bytes")
         self._keyring = keyring
         self._signaling_url = signaling_url
         self._allowed = allowed_transports
         self._lifetime = lifetime
         self._heartbeat = heartbeat_interval_ms
-        self._ice_urls = ice_urls
+        self._stun_urls = stun_urls
+        self._turn_urls = turn_urls
+        self._turn_shared_secret = (
+            bytes(turn_shared_secret) if turn_shared_secret is not None else None
+        )
         self._clock = clock or _UtcClock()
 
     async def issue(
@@ -612,13 +629,21 @@ class HmacInterviewRealtimeGateway:
             ).digest()
         )
         token = EphemeralToken(f"{header}.{body}.{signature}")
-        ice_servers: tuple[IceServer, ...] = ()
-        if self._ice_urls:
-            username = f"{int(expires_at.timestamp())}:{connection_id}:{audience.id}"
-            credential = _b64url(
-                hmac.new(active_key.key, username.encode(), hashlib.sha256).digest()
-            )
-            ice_servers = (IceServer(self._ice_urls, username, credential),)
+        ice_servers: tuple[IceServer, ...] = (
+            (IceServer(self._stun_urls, None, None),) if self._stun_urls else ()
+        )
+        if self._turn_urls:
+            if self._turn_shared_secret is None:
+                raise RuntimeError("validated TURN secret is unavailable")
+            username = f"{int(expires_at.timestamp())}:{audience.id}:{connection_id}"
+            credential = base64.b64encode(
+                hmac.new(
+                    self._turn_shared_secret,
+                    username.encode("utf-8"),
+                    hashlib.sha1,
+                ).digest()
+            ).decode("ascii")
+            ice_servers += (IceServer(self._turn_urls, username, credential),)
         return RealtimeConnection(
             connection_id,
             workspace_id,
@@ -1216,11 +1241,16 @@ class _InMemoryInterviewArtifacts:
     def __init__(self, store: InMemoryInterviewStore) -> None:
         self._store = store
 
-    async def add(self, artifact: Artifact) -> None:
-        """@brief 添加统一 Artifact / Add a unified Artifact."""
+    async def add(self, artifact: Artifact, content: bytes) -> None:
+        """@brief 添加统一 Artifact 与已校验内容 / Add a unified Artifact and verified content."""
         key = (artifact.workspace_id, str(artifact.meta.id))
         if key in self._store.artifacts:
             raise ValueError("Artifact already exists")
+        if (
+            len(content) != artifact.size_bytes
+            or hashlib.sha256(content).hexdigest() != artifact.sha256
+        ):
+            raise ValueError("Interview Artifact content identity mismatch")
         self._store.artifacts[key] = artifact
 
 
@@ -2553,8 +2583,8 @@ class _PostgresInterviewArtifacts:
         self._session = session
         self._scope = scope
 
-    async def add(self, artifact: Artifact) -> None:
-        """@brief 添加不含签名 URL 的统一 Artifact metadata / Add unified Artifact metadata without a signed URL.
+    async def add(self, artifact: Artifact, content: bytes) -> None:
+        """@brief 添加统一 Artifact metadata 与可验证内容 / Add unified Artifact metadata and verified content.
 
         @note 外部 provider 的临时签名地址绝不持久化；worker 必须先把内容导入受管
             Artifact storage 并返回同源 ``ApiArtifactContentUrl``。
@@ -2569,27 +2599,46 @@ class _PostgresInterviewArtifacts:
             or artifact.subject.resource_type != "interview_session"
         ):
             raise ValueError("Interview Artifact must be immutable, managed, and Session-bound")
+        if (
+            len(content) != artifact.size_bytes
+            or hashlib.sha256(content).hexdigest() != artifact.sha256
+        ):
+            raise ValueError("Interview Artifact content identity mismatch")
+        storage_key = f"interview/{artifact.workspace_id}/{artifact.meta.id}"
+        artifact_record = ArtifactRecord(
+            id=str(artifact.meta.id),
+            workspace_id=str(artifact.workspace_id),
+            kind=artifact.kind.value,
+            subject_type=artifact.subject.resource_type,
+            subject_id=artifact.subject.id,
+            subject_revision=artifact.subject.revision,
+            media_type=artifact.media_type,
+            size_bytes=artifact.size_bytes,
+            sha256=artifact.sha256,
+            storage_key=storage_key,
+            page_count=artifact.page_count,
+            expires_at=artifact.expires_at,
+            deleted_at=None,
+            created_at=artifact.meta.created_at,
+            updated_at=artifact.meta.updated_at,
+            revision=artifact.meta.revision,
+            extensions={},
+        )
+        self._session.add(artifact_record)
+        # No ORM relationship is declared between the shared metadata/content models.
+        # Flush the parent first so PostgreSQL observes the composite FK while preserving
+        # atomicity inside this still-uncommitted Unit of Work transaction.
+        await self._session.flush((artifact_record,))
         self._session.add(
-            ArtifactRecord(
-                id=str(artifact.meta.id),
+            ArtifactContentRecord(
+                artifact_id=str(artifact.meta.id),
                 workspace_id=str(artifact.workspace_id),
-                kind=artifact.kind.value,
-                subject_type=artifact.subject.resource_type,
-                subject_id=artifact.subject.id,
-                subject_revision=artifact.subject.revision,
+                storage_key=storage_key,
                 media_type=artifact.media_type,
                 size_bytes=artifact.size_bytes,
                 sha256=artifact.sha256,
-                storage_key=(
-                    f"interview/{artifact.workspace_id}/{artifact.meta.id}"
-                ),
-                page_count=artifact.page_count,
-                expires_at=artifact.expires_at,
-                deleted_at=None,
+                content=content,
                 created_at=artifact.meta.created_at,
-                updated_at=artifact.meta.updated_at,
-                revision=artifact.meta.revision,
-                extensions={},
             )
         )
 

@@ -182,7 +182,7 @@ uv run dbctl shell --role migrator
 
 只有 `bootstrap` 可以创建或补全私密 `config.jsonc`。`migrate`、`shell` 与执行态维护命令只读既有配置；配置缺失时直接失败，绝不会偷偷生成一套尚未写入 PostgreSQL 的新密码。`shell` 为本次 psql 创建权限为 `0600` 的临时 `PGPASSFILE`，强制 `--no-password`，继承真实 TTY，并在 psql 退出后清理文件；配置密码不会进入 argv，也不会被外部 `.pgpass` 或 `PGPASSWORD` 覆盖。
 
-首次运行和每次发布都应在受控变更窗口检查 migration revision。`bootstrap` 不能替代 migration；反过来，migration 也不创建缺失的数据库角色。当前单一 head 是 `20260723_0027`；`0008`–`0027` 依次完成 OAuth/身份、V2 租户数据、幂等、Resume、统一 Platform、Knowledge、Agent、Interview、账户删除、取消补偿与 outbox 生命周期迁移。所有 revision 都先验证历史数据可表示性再收紧约束；bootstrap 在每次权限收敛末尾再次撤销 application role 对 `identity.alembic_version` 的直接权限，因此 `bootstrap → migrate → bootstrap` 不会重新打开控制面权限。
+首次运行和每次发布都应在受控变更窗口检查 migration revision。`bootstrap` 不能替代 migration；反过来，migration 也不创建缺失的数据库角色。当前单一 head 是 `20260723_0028`；`0008`–`0028` 依次完成 OAuth/身份、V2 租户数据、幂等、Resume、统一 Platform、Knowledge、Agent、Interview、账户删除、取消补偿、outbox 生命周期与 Knowledge 版本时间约束迁移。所有 revision 都先验证历史数据可表示性再收紧约束；bootstrap 在每次权限收敛末尾再次撤销 application role 对 `identity.alembic_version` 的直接权限，因此 `bootstrap → migrate → bootstrap` 不会重新打开控制面权限。
 
 ### dbctl 操作者输出与故障排查
 
@@ -424,7 +424,10 @@ UNIX_TIMESTAMP
 
 以下点在部署时尤其容易被误解：
 
-- Interview realtime credential 是短期且绑定 session/audience 的签名描述；当前没有录音/录像 finalizer，因此请求 `record_audio` 或 `record_video` 会在创建 Session 前明确失败，transcript-only 流程可用。
+- Interview realtime credential 是短期且绑定 session/audience 的签名描述。内置 WebSocket
+  数据面支持幂等文字/控制消息，以及经过冻结 consent、大小与 SHA-256 校验的
+  MediaRecorder 音视频分块；end worker 把分块内容与受管 Artifact metadata 在同一事务提交。
+  该能力保存浏览器原始容器，不负责服务端转码或混流。
 - Workspace SSE 来自统一 committed outbox，按 Workspace 单调 sequence、至少一次投递，并支持持久 `Last-Event-ID` 重放窗口；最终资源 GET 始终是权威状态。
 - memory 模式的幂等性只在单进程生命周期内有效，且 durable Job/Artifact/Event/Audit 请求会返回 503；完整异步执行、跨重启/跨 worker 重放与账户删除必须使用 PostgreSQL。
 - Dashboard 是运维读模型，不属于产品前端 API。它只暴露低基数的 SRE 指标，不应承载用户内容、prompt、URL 或自由文本。

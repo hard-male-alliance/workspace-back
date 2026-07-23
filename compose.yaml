@@ -49,6 +49,7 @@ x-aiws-runtime-environment: &aiws-runtime-environment
   AIWS_INTERVIEW_REALTIME_SIGNING_KEYS: ${AIWS_INTERVIEW_REALTIME_SIGNING_KEYS:-}
   AIWS_INTERVIEW_SIGNALING_URL: ${AIWS_INTERVIEW_SIGNALING_URL:-}
   AIWS_INTERVIEW_ICE_URLS: ${AIWS_INTERVIEW_ICE_URLS:-}
+  AIWS_INTERVIEW_TURN_SHARED_SECRET: ${AIWS_INTERVIEW_TURN_SHARED_SECRET:-}
 
 x-aiws-image: &aiws-image
   image: ai-job-workspace-backend:${AIWS_IMAGE_TAG:-local}
@@ -79,6 +80,39 @@ x-aiws-runtime-service: &aiws-runtime-service
       max-file: "3"
 
 services:
+  turn:
+    image: coturn/coturn:4.12.0-r0
+    profiles: ["realtime"]
+    restart: unless-stopped
+    command:
+      - --listening-port=3478
+      - --fingerprint
+      - --use-auth-secret
+      - --static-auth-secret=${AIWS_INTERVIEW_TURN_SHARED_SECRET:-}
+      - --realm=${AIWS_INTERVIEW_TURN_REALM:-turn.localhost}
+      - --min-port=49160
+      - --max-port=49200
+      - --no-cli
+      - --no-multicast-peers
+      - --no-tls
+      - --no-dtls
+      - --log-file=stdout
+    ports:
+      - "${AIWS_INTERVIEW_TURN_PORT:-3478}:3478/tcp"
+      - "${AIWS_INTERVIEW_TURN_PORT:-3478}:3478/udp"
+      - "49160-49200:49160-49200/udp"
+    networks:
+      - private
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
   postgres:
     image: pgvector/pgvector:0.8.2-pg17-bookworm
     restart: unless-stopped

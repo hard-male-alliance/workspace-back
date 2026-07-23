@@ -38,6 +38,7 @@ from backend.application.ports.v2_idempotency import (
     IdempotencyScope,
     ReplayableResponse,
 )
+from backend.domain.identity import IdentityUserRecord
 from backend.domain.platform import (
     ApiArtifactContentUrl,
     ApiEvent,
@@ -348,9 +349,7 @@ def test_0017_is_linear_reuses_truth_tables_and_converts_legacy_artifacts() -> N
     upgrade_source = source[
         source.index("def upgrade()") : source.index("def _preflight_downgrade()")
     ]
-    assert upgrade_source.index("_preflight_upgrade()") < upgrade_source.index(
-        "_evolve_jobs()"
-    )
+    assert upgrade_source.index("_preflight_upgrade()") < upgrade_source.index("_evolve_jobs()")
     assert upgrade_source.index("_assert_active_artifact_contents()") < upgrade_source.index(
         "_retire_legacy_artifact_tables()"
     )
@@ -1433,6 +1432,65 @@ async def test_postgres_session_revocation_targets_only_its_bound_family(
     assert families == [
         {"id": "rtfam_bound_a", "revoked": True},
         {"id": "rtfam_bound_b", "revoked": False},
+    ]
+
+
+async def test_postgres_registration_flushes_workspace_before_owner_membership(
+    platform_postgres: _PostgresHarness,
+) -> None:
+    """@brief 真实注册先落租户根再落 owner 成员 / Real registration persists the tenant root before its owner membership."""
+
+    database = AsyncDatabase(
+        AsyncDatabaseOptions(
+            platform_postgres.app_dsn,
+            pool_size=1,
+            max_overflow=0,
+            statement_timeout_ms=5_000,
+            lock_timeout_ms=1_000,
+        )
+    )
+    repository = PostgresHostedIdentityRepository(database, data_region=DataRegion.GLOBAL)
+    user = IdentityUserRecord(
+        id="usr_registration_pg1",
+        subject="registration-postgres-subject-1",
+        email="registration-pg1@example.com",
+        email_verified=True,
+        display_name="Registration PG",
+        locale="en-SG",
+    )
+    try:
+        assert await repository.create_user_with_password(
+            user=user,
+            password_authenticator_id="authn_registration_pg1",
+            password_verifier="argon2id:postgres-registration-test",
+            now=datetime.now(UTC),
+        )
+    finally:
+        await database.aclose()
+
+    rows = platform_postgres.rows(
+        """
+        SELECT usr.default_workspace_id AS workspace_id,
+               workspace.resource_owner_id AS workspace_owner_id,
+               member.user_id AS member_user_id,
+               member.role,
+               member.status
+        FROM identity.users AS usr
+        JOIN identity.workspaces AS workspace
+          ON workspace.id = usr.default_workspace_id
+        JOIN identity.workspace_members AS member
+          ON member.workspace_id = workspace.id AND member.user_id = usr.id
+        WHERE usr.id = 'usr_registration_pg1'
+        """
+    )
+    assert rows == [
+        {
+            "workspace_id": rows[0]["workspace_id"],
+            "workspace_owner_id": user.id,
+            "member_user_id": user.id,
+            "role": "owner",
+            "status": "active",
+        }
     ]
 
 

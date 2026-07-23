@@ -441,6 +441,12 @@ class PostgresKnowledgeWorkerStore:
                 )
                 source.current_version_id = version.id
                 await session.flush()
+                # TimestampedRevisionMixin uses database now() as its on-update fallback.
+                # PostgreSQL now() is the transaction start time and can therefore precede the
+                # application timestamp used to create a new version in this same transaction.
+                # Assign a fresh, explicit completion time so the fallback cannot produce
+                # updated_at < created_at.
+                completed_at = max(datetime.now(UTC), version.created_at)
                 if not created:
                     await session.execute(
                         sa.delete(KnowledgeChunkRecord).where(
@@ -492,23 +498,29 @@ class PostgresKnowledgeWorkerStore:
                     )
                 version.status = "ready"
                 version.parser_metadata = cast(dict[str, Any], dict(prepared.parsed.metadata))
-                version.indexed_at = now
-                version.updated_at = now
+                version.indexed_at = completed_at
+                version.updated_at = completed_at
                 version.revision += 1
                 source.ingestion_state = "ready"
                 source.document_count = 1
                 source.chunk_count = len(prepared.chunks)
-                source.last_success_at = now
+                source.last_success_at = completed_at
                 source.last_problem = None
-                source.updated_at = now
+                source.updated_at = completed_at
                 source.revision += 1
-                await _upsert_ingestion_job(session, claim, version.id, len(prepared.chunks), now)
+                await _upsert_ingestion_job(
+                    session,
+                    claim,
+                    version.id,
+                    len(prepared.chunks),
+                    completed_at,
+                )
                 result_ref: dict[str, JsonValue] = {
                     "resource_type": "knowledge_source_version",
                     "id": version.id,
                     "revision": version.revision,
                 }
-                _succeed_job(job, now, result_refs=[result_ref])
+                _succeed_job(job, completed_at, result_refs=[result_ref])
                 job.completed_units = len(prepared.chunks)
                 job.total_units = len(prepared.chunks)
                 job.progress_unit = "items"

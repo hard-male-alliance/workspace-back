@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import getpass
+import hashlib
+import hmac
 import shutil
 import socket
 import subprocess
@@ -421,6 +424,7 @@ class _NoopMediaFinalizer:
         assert session.view.status is InterviewSessionStatus.ENDING
         assert operation_id.startswith("interview.end:")
         artifact_id = ArtifactId("artifact_endoutput01")
+        content = b"{}"
         return EndSessionOutput(
             (
                 Artifact(
@@ -434,7 +438,7 @@ class _NoopMediaFinalizer:
                     ),
                     "application/json",
                     2,
-                    "e" * 64,
+                    hashlib.sha256(content).hexdigest(),
                     ApiArtifactContentUrl.build(
                         "https://api.example.test",
                         session.workspace_id,
@@ -443,7 +447,8 @@ class _NoopMediaFinalizer:
                     None,
                     session.spec.recording.retention_until,
                 ),
-            )
+            ),
+            (content,),
         )
 
 
@@ -882,6 +887,11 @@ async def test_postgres_interview_creation_connection_and_end_queue_are_atomic(
         b"interview-postgres-signing-key-32-bytes-minimum",
         signaling_url="wss://realtime.example.test/interview",
         lifetime=timedelta(minutes=5),
+        ice_urls=(
+            "stun:turn.example.test:3478",
+            "turn:turn.example.test:3478?transport=udp",
+        ),
+        turn_shared_secret=b"interview-coturn-rest-secret-32-bytes-minimum",
         clock=_FixedClock(),
     )
     ids = _SequentialIds()
@@ -930,6 +940,19 @@ async def test_postgres_interview_creation_connection_and_end_queue_are_atomic(
             audience=ResourceRef("user", principal.user_id),
         )
         assert claims["jti"] == connection.id
+        assert connection.ice_servers[0].urls == ("stun:turn.example.test:3478",)
+        assert connection.ice_servers[0].username is None
+        assert connection.ice_servers[0].credential is None
+        turn = connection.ice_servers[1]
+        assert turn.urls == ("turn:turn.example.test:3478?transport=udp",)
+        assert turn.username is not None
+        assert turn.credential == base64.b64encode(
+            hmac.new(
+                b"interview-coturn-rest-secret-32-bytes-minimum",
+                turn.username.encode("utf-8"),
+                hashlib.sha1,
+            ).digest()
+        ).decode("ascii")
         rotated_gateway = HmacInterviewRealtimeGateway(
             InterviewRealtimeSigningKeyring(
                 "v2",
@@ -1101,6 +1124,17 @@ async def test_postgres_interview_creation_connection_and_end_queue_are_atomic(
                 "pending_end_job_id": None,
                 "job_status": "succeeded",
                 "job_revision": 3,
+            }
+        ]
+        assert interview_postgres.rows(
+            "SELECT media_type, size_bytes, encode(content, 'escape') AS content "
+            "FROM agent.artifact_contents "
+            "WHERE artifact_id = 'artifact_endoutput01'"
+        ) == [
+            {
+                "media_type": "application/json",
+                "size_bytes": 2,
+                "content": "{}",
             }
         ]
         assert interview_postgres.rows(

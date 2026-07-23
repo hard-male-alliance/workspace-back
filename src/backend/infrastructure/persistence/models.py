@@ -1270,9 +1270,7 @@ class ConversationRecord(Base, TenantScopedMixin):
     id: Mapped[str] = mapped_column(String(160), primary_key=True)
     title: Mapped[str | None] = mapped_column(String(300))
     capability: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(
-        String(16), nullable=False, server_default=text("'active'")
-    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'active'"))
     message_sequence: Mapped[int] = mapped_column(
         BigInteger, nullable=False, server_default=text("0")
     )
@@ -1741,9 +1739,7 @@ class ResumeProposalRecord(Base, TenantScopedMixin):
     resume_id: Mapped[str] = mapped_column(
         String(160), ForeignKey("resume.documents.id", ondelete="CASCADE"), nullable=False
     )
-    agent_run_id: Mapped[str | None] = mapped_column(
-        String(160)
-    )
+    agent_run_id: Mapped[str | None] = mapped_column(String(160))
     base_revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     status: Mapped[str] = mapped_column(
@@ -1840,9 +1836,7 @@ class InterviewScenarioRecord(Base, WorkspaceScopedMixin):
 
     id: Mapped[str] = mapped_column(String(160), primary_key=True)
     spec: Mapped[JsonObject] = mapped_column(JSONB, nullable=False)
-    status: Mapped[str] = mapped_column(
-        String(16), nullable=False, server_default=text("'draft'")
-    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'draft'"))
 
 
 class InterviewSessionRecord(Base, WorkspaceScopedMixin):
@@ -1952,9 +1946,7 @@ class InterviewRealtimeConnectionRecord(Base, WorkspaceScopedMixin):
             ondelete="CASCADE",
             name="interview_realtime_connections_session_workspace",
         ),
-        UniqueConstraint(
-            "id", "workspace_id", "session_id", name="interview_connections_scope"
-        ),
+        UniqueConstraint("id", "workspace_id", "session_id", name="interview_connections_scope"),
         Index(
             "ix_interview_realtime_connections_workspace_expiry",
             "workspace_id",
@@ -2042,9 +2034,7 @@ class TranscriptSegmentRecord(Base, WorkspaceScopedMixin):
             "sequence",
             name="transcript_segments_session_sequence",
         ),
-        UniqueConstraint(
-            "id", "workspace_id", "session_id", name="transcript_segments_scope"
-        ),
+        UniqueConstraint("id", "workspace_id", "session_id", name="transcript_segments_scope"),
         CheckConstraint(
             "speaker IN ('candidate', 'interviewer', 'system')", name="transcript_segments_speaker"
         ),
@@ -2671,6 +2661,10 @@ class KnowledgeSourceVersionRecord(Base, TenantScopedMixin):
             "AND (artifact_revision IS NULL OR artifact_revision >= 1)",
             name="knowledge_source_versions_artifact",
         ),
+        CheckConstraint(
+            "updated_at >= created_at",
+            name="knowledge_source_versions_timestamps",
+        ),
         ForeignKeyConstraint(
             ["source_id", "workspace_id"],
             ["knowledge.sources.id", "knowledge.sources.workspace_id"],
@@ -2888,9 +2882,7 @@ class KnowledgeCitationRecord(Base, TenantScopedMixin):
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    run_id: Mapped[str] = mapped_column(
-        String(160), nullable=False
-    )
+    run_id: Mapped[str] = mapped_column(String(160), nullable=False)
     chunk_id: Mapped[str] = mapped_column(
         String(128), ForeignKey("knowledge.chunks.id", ondelete="RESTRICT"), nullable=False
     )
@@ -2947,9 +2939,7 @@ class KnowledgeAccessSnapshotRecord(Base, TenantScopedMixin):
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    agent_run_id: Mapped[str | None] = mapped_column(
-        String(160)
-    )
+    agent_run_id: Mapped[str | None] = mapped_column(String(160))
     interview_session_id: Mapped[str | None] = mapped_column(
         String(128), ForeignKey("interview.sessions.id", ondelete="CASCADE")
     )

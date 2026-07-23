@@ -48,7 +48,7 @@ def test_0026_linearly_precedes_outbox_lifecycle() -> None:
     scripts = ScriptDirectory.from_config(configuration)
     script = scripts.get_revision("20260723_0026")
 
-    assert scripts.get_heads() == ["20260723_0027"]
+    assert scripts.get_heads() == ["20260723_0028"]
     assert script is not None
     assert script.down_revision == "20260723_0025"
     assert script.branch_labels == set()

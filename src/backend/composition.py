@@ -9,7 +9,7 @@ import logging
 import secrets
 import socket
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -73,6 +73,7 @@ from backend.application.ports.agent_v2 import (
     AgentWorkerUnitOfWorkFactory,
 )
 from backend.application.ports.interview_v2 import (
+    InterviewRealtimeCredentialVerifier,
     InterviewRealtimeGateway,
     InterviewReportProvider,
     InterviewUnitOfWorkFactory,
@@ -124,12 +125,14 @@ from backend.domain.connections import ConnectionProvider
 from backend.domain.interview_v2 import (
     CreateRealtimeConnectionSpec,
     InterviewSession,
+    InterviewSessionId,
     RealtimeConnection,
     RealtimeConnectionId,
     RealtimeTransport,
 )
 from backend.domain.knowledge_sources import ModelRegion
 from backend.domain.observability import ResourceMetadata
+from backend.domain.platform import JsonValue
 from backend.domain.ports import (
     AgentRepository,
     ArtifactRepository,
@@ -202,6 +205,7 @@ from backend.infrastructure.interview import (
     PostgresInterviewUnitOfWorkFactory,
     StaticInterviewSessionPolicy,
 )
+from backend.infrastructure.interview_media import LocalInterviewMediaStore
 from backend.infrastructure.interview_report import (
     DeterministicInterviewReportProvider,
     StreamingJsonInterviewReportProvider,
@@ -345,6 +349,14 @@ class _OutboxDispatchService(Protocol):
         """@brief 执行一个有界批次 / Run one bounded pass."""
 
 
+class _InterviewRealtimeAccessGateway(
+    InterviewRealtimeGateway,
+    InterviewRealtimeCredentialVerifier,
+    Protocol,
+):
+    """@brief 控制面签发与数据面验签的同一 keyring 交集 / Shared control/data-plane keyring boundary."""
+
+
 @dataclass(frozen=True, slots=True)
 class _AgentRuntimeComponents:
     """@brief composition 构造的 Agent V2 对象图 / Agent V2 object graph built by composition."""
@@ -420,6 +432,9 @@ class _InterviewRuntimeComponents:
     realtime_gateway: InterviewRealtimeGateway
     """@brief 短期、绑定 audience 的 realtime credential gateway / Short-lived audience-bound realtime credential gateway."""
 
+    realtime_verifier: InterviewRealtimeCredentialVerifier
+    """@brief signaling 数据面使用的同 keyring 验签端口 / Same-keyring verifier used by the signaling data plane."""
+
 
 class _UnavailableInterviewRealtimeGateway:
     """@brief development/test 未配置 signaling 时显式失败 / Explicitly fail when signaling is unconfigured in development/test."""
@@ -448,6 +463,18 @@ class _UnavailableInterviewRealtimeGateway:
     async def revoke(self, connection_id: RealtimeConnectionId) -> None:
         """@brief 未签发凭据时 no-op / No-op when no credential was issued."""
         del connection_id
+
+    async def verify(
+        self,
+        token: str,
+        *,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+        audience: ResourceRef,
+    ) -> Mapping[str, JsonValue]:
+        """@brief 未配置 signaling 时拒绝所有 realtime 凭据 / Reject every realtime credential when signaling is unconfigured."""
+        del token, workspace_id, session_id, audience
+        raise PermissionError("interview realtime signaling is not configured")
 
 
 class _UnavailableKnowledgeCredentialRevoker:
@@ -488,6 +515,8 @@ class BackendContainer:
     agent_v2: V2AgentApplicationService
     interview: InterviewApplicationService
     interview_v2: V2InterviewApplicationService
+    interview_realtime_verifier: InterviewRealtimeCredentialVerifier
+    interview_media_store: LocalInterviewMediaStore
     knowledge: KnowledgeApplicationService
     knowledge_v2: V2KnowledgeApplicationService
     knowledge_local_upload_store: LocalSignedUploadStore | None
@@ -806,11 +835,18 @@ async def build_container(
                 public_uow_factory=resume_v2_uow_factory,
                 upload_reader=knowledge_runtime.upload_reader,
             )
+            interview_media_store = LocalInterviewMediaStore(
+                runtime_root / settings.interview.recording_directory,
+                api_origin=PUBLIC_ORIGIN,
+                maximum_chunk_bytes=settings.interview.media_chunk_max_bytes,
+                maximum_session_bytes=settings.interview.media_session_max_bytes,
+            )
             interview_runtime = _interview_runtime_for(
                 settings,
                 database=database,
                 memory_access_store=memory_access_store,
                 provider=provider,
+                media_store=interview_media_store,
             )
             account_deletion = (
                 AccountDeletionExecutionService(
@@ -856,6 +892,8 @@ async def build_container(
                 agent_v2=agent_runtime.application,
                 interview=InterviewApplicationService(storage, storage, dependencies, locks),
                 interview_v2=interview_runtime.application,
+                interview_realtime_verifier=interview_runtime.realtime_verifier,
+                interview_media_store=interview_media_store,
                 knowledge=knowledge,
                 knowledge_v2=knowledge_runtime.application,
                 knowledge_local_upload_store=knowledge_runtime.local_upload_store,
@@ -1206,6 +1244,7 @@ def _interview_runtime_for(
     database: AsyncDatabase | None,
     memory_access_store: InMemoryAccessStore | None,
     provider: AgentModelProvider,
+    media_store: LocalInterviewMediaStore,
 ) -> _InterviewRuntimeComponents:
     """@brief 组装 Interview V2 应用、短期凭据与 Job worker / Assemble Interview V2 application, short-lived credentials, and Job worker.
 
@@ -1236,6 +1275,7 @@ def _interview_runtime_for(
             V2InterviewApplicationService(memory_uow, realtime_gateway),
             None,
             realtime_gateway,
+            realtime_gateway,
         )
 
     if memory_access_store is not None:
@@ -1255,7 +1295,7 @@ def _interview_runtime_for(
     dispatch_settings = OutboxDispatchSettings()
     worker = InterviewWorkerService(
         postgres_uow,
-        ConsentAwareInterviewMediaFinalizer(),
+        ConsentAwareInterviewMediaFinalizer(media_store),
         _interview_report_provider(settings, provider, primary_model_route),
         service_actor=service_actor,
     )
@@ -1272,7 +1312,7 @@ def _interview_runtime_for(
         required_event_types=INTERVIEW_WORK_EVENT_TYPES,
         settings=dispatch_settings,
     )
-    return _InterviewRuntimeComponents(application, dispatcher, realtime_gateway)
+    return _InterviewRuntimeComponents(application, dispatcher, realtime_gateway, realtime_gateway)
 
 
 def _interview_report_provider(
@@ -1304,10 +1344,11 @@ def _interview_report_provider(
         model_data_region=route.data_region.value,
         allow_external_model_processing=route.external_processing,
         allow_provider_fallback=False,
+        timeout_ms=settings.interview.report_timeout_ms,
     )
 
 
-def _interview_realtime_gateway(settings: BackendSettings) -> InterviewRealtimeGateway:
+def _interview_realtime_gateway(settings: BackendSettings) -> _InterviewRealtimeAccessGateway:
     """@brief 从独立 keyring 构造 realtime gateway / Build a realtime gateway from its independent keyring.
 
     @param settings 已完成环境约束与密钥域隔离的配置 / Configuration already validated for
@@ -1333,6 +1374,11 @@ def _interview_realtime_gateway(settings: BackendSettings) -> InterviewRealtimeG
         lifetime=timedelta(seconds=realtime.credential_ttl_seconds),
         heartbeat_interval_ms=realtime.heartbeat_interval_ms,
         ice_urls=realtime.ice_urls,
+        turn_shared_secret=(
+            realtime.turn_shared_secret.encode("utf-8")
+            if realtime.turn_shared_secret is not None
+            else None
+        ),
     )
 
 

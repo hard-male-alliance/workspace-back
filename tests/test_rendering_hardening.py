@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 import backend.infrastructure.rendering as rendering
+import backend.infrastructure.resume_render_sandbox as render_sandbox
 from backend.config import RendererSettings
 from backend.domain.common import DomainError
 from backend.infrastructure.process_confinement import (
@@ -112,6 +113,21 @@ def test_sandbox_mounts_only_required_read_only_tex_state_and_private_writable_s
     assert "--setenv\x00TMPDIR\x00/work/tmp" in joined
     assert "--bind\x00" + str(tmp_path) + "\x00/work" in joined
     assert "backend.infrastructure.resume_render_sandbox" in argv
+
+
+def test_renderer_landlock_allows_only_the_required_system_paper_definitions() -> None:
+    """@brief 允许 XeLaTeX 读取系统纸张规格而不放开整个 `/etc` / Allow only required system paper definitions.
+
+    Debian 的 ``xdvipdfmx`` 通过 ``/etc/paperspecs`` 解析 ``a4`` 等名称；其他
+    libpaper 布局使用 ``/etc/papersize``。两者均为只读单文件规则，不能以允许整个
+    ``/etc`` 代替。
+    """
+
+    paths = render_sandbox._read_only_paths(Path("/usr/bin/xelatex"), ())
+
+    assert Path("/etc/paperspecs") in paths
+    assert Path("/etc/papersize") in paths
+    assert Path("/etc") not in paths
 
 
 def test_fixed_template_selects_a_packaged_cjk_capable_font() -> None:

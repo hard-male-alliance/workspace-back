@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -37,7 +39,7 @@ from backend.domain.interview_v2 import (
     RealtimeInputReceipt,
     TranscriptSegment,
 )
-from backend.domain.platform import Artifact, AuditEvent, Job, JobId
+from backend.domain.platform import Artifact, AuditEvent, Job, JobId, JsonValue
 from backend.domain.principals import TokenPrincipal, UserId, WorkspaceId
 from backend.domain.resources import ResourceRef
 
@@ -194,14 +196,22 @@ class InterviewSessionPolicyRequest:
 
 @dataclass(frozen=True, slots=True)
 class EndSessionOutput:
-    """@brief 媒体 finalizer 返回的统一 Artifact 集合 / Unified Artifacts returned by the media finalizer."""
+    """@brief 媒体 finalizer 返回的 Artifact 与内容 / Artifacts and content returned by the media finalizer."""
 
     artifacts: tuple[Artifact, ...]
+    contents: tuple[bytes, ...] = ()
 
     def __post_init__(self) -> None:
-        """@brief 校验 Artifact 数量 / Validate Artifact count."""
+        """@brief 校验 Artifact 数量和内容身份 / Validate artifact count and content identity."""
         if len(self.artifacts) > 20:
             raise ValueError("Interview end output cannot exceed 20 Artifacts")
+        if len(self.artifacts) != len(self.contents):
+            raise ValueError("Interview end output must provide content for every Artifact")
+        for artifact, content in zip(self.artifacts, self.contents, strict=True):
+            if len(content) != artifact.size_bytes:
+                raise ValueError("Interview Artifact content size does not match metadata")
+            if hashlib.sha256(content).hexdigest() != artifact.sha256:
+                raise ValueError("Interview Artifact content digest does not match metadata")
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,8 +427,8 @@ class InterviewJobStore(Protocol):
 class InterviewArtifactStore(Protocol):
     """@brief 直接复用统一 platform Artifact 表的 Port / Port directly reusing the unified platform Artifact table."""
 
-    async def add(self, artifact: Artifact) -> None:
-        """@brief 添加统一 Artifact，不建 Interview 平行 Artifact / Add a unified Artifact, never an Interview-specific duplicate."""
+    async def add(self, artifact: Artifact, content: bytes) -> None:
+        """@brief 原子添加统一 Artifact 及其内容 / Atomically add unified Artifact metadata and content."""
 
 
 class InterviewOutbox(Protocol):
@@ -455,6 +465,20 @@ class InterviewRealtimeGateway(Protocol):
 
     async def revoke(self, connection_id: RealtimeConnectionId) -> None:
         """@brief 第二阶段 CAS 失败时撤销孤儿 grant / Revoke an orphan grant after second-phase CAS failure."""
+
+
+class InterviewRealtimeCredentialVerifier(Protocol):
+    """@brief signaling 数据面使用的短期凭据验签端口 / Short-lived credential verifier used by the signaling data plane."""
+
+    async def verify(
+        self,
+        token: str,
+        *,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+        audience: ResourceRef,
+    ) -> Mapping[str, JsonValue]:
+        """@brief 验证签名、期限和 Workspace/Session/audience 绑定 / Verify signature, lifetime, and Workspace/Session/audience bindings."""
 
 
 class InterviewMediaFinalizer(Protocol):
@@ -563,6 +587,7 @@ __all__ = [
     "InterviewPermissionGrant",
     "InterviewPermissionRequest",
     "InterviewPolicyDenied",
+    "InterviewRealtimeCredentialVerifier",
     "InterviewRealtimeGateway",
     "InterviewReportProvider",
     "InterviewRepository",

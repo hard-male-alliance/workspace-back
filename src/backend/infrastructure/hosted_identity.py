@@ -647,21 +647,24 @@ class PostgresHostedIdentityRepository:
                 )
                 session.add(user_record)
                 await session.flush()
-                session.add(
-                    WorkspaceOrmRecord(
-                        id=str(workspace.meta.id),
-                        resource_owner_id=user.id,
-                        name=workspace.name,
-                        slug=workspace.slug,
-                        plan=workspace.plan.value,
-                        data_region=workspace.data_region.value,
-                        default_locale=user.locale,
-                        created_at=now,
-                        updated_at=now,
-                        revision=1,
-                        extensions={},
-                    )
+                workspace_record = WorkspaceOrmRecord(
+                    id=str(workspace.meta.id),
+                    resource_owner_id=user.id,
+                    name=workspace.name,
+                    slug=workspace.slug,
+                    plan=workspace.plan.value,
+                    data_region=workspace.data_region.value,
+                    default_locale=user.locale,
+                    created_at=now,
+                    updated_at=now,
+                    revision=1,
+                    extensions={},
                 )
+                session.add(workspace_record)
+                # WorkspaceMemberOrmRecord intentionally has no ORM relationship to the
+                # Workspace aggregate.  Flush the tenant root explicitly so SQLAlchemy cannot
+                # order the membership INSERT ahead of its foreign-key parent.
+                await session.flush()
                 session.add(
                     WorkspaceMemberOrmRecord(
                         id=str(owner.meta.id),

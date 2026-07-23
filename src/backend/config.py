@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hmac
 import math
 import re
 from dataclasses import dataclass, field
@@ -463,6 +464,7 @@ class InterviewRealtimeSettings:
     @param credential_ttl_seconds 一次性 grant 寿命 / One-time grant lifetime.
     @param heartbeat_interval_ms 客户端心跳间隔 / Client heartbeat interval.
     @param ice_urls 显式 STUN/TURN URI 集 / Explicit STUN/TURN URI set.
+    @param turn_shared_secret coturn TURN REST 临时凭据独立 secret / Independent coturn TURN REST temporary-credential secret.
     """
 
     signing_keyring: Hmac256KeyringSettings
@@ -471,6 +473,7 @@ class InterviewRealtimeSettings:
     credential_ttl_seconds: int
     heartbeat_interval_ms: int
     ice_urls: tuple[str, ...]
+    turn_shared_secret: str | None = field(repr=False)
 
     @property
     def active_signing_key(self) -> bytes | None:
@@ -490,9 +493,18 @@ class InterviewRealtimeSettings:
 
 @dataclass(frozen=True, slots=True)
 class InterviewSettings:
-    """@brief Interview V2 外部实时端口配置 / Interview V2 external realtime-port configuration."""
+    """@brief Interview V2 外部端口配置 / Interview V2 external-port configuration.
+
+    @param realtime 实时信令与 TURN 凭据策略 / Realtime signaling and TURN-credential policy.
+    @param report_timeout_ms 一次模型报告生成的 wall-time 上限 / Whole-call wall-time limit
+        for one model-backed report generation.
+    """
 
     realtime: InterviewRealtimeSettings
+    report_timeout_ms: int
+    recording_directory: Path
+    media_chunk_max_bytes: int
+    media_session_max_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1397,12 +1409,42 @@ def _interview_settings(
         unsafe realtime policy.
     """
 
-    _reject_unknown_keys(mapping, {"realtime"}, "interview")
+    _reject_unknown_keys(
+        mapping,
+        {
+            "realtime",
+            "report_timeout_ms",
+            "recording_directory",
+            "media_chunk_max_bytes",
+            "media_session_max_bytes",
+        },
+        "interview",
+    )
+    report_timeout_ms = _optional_bounded_positive_int(
+        mapping,
+        "report_timeout_ms",
+        default=60_000,
+        maximum=120_000,
+    )
+    chunk_max = _optional_bounded_positive_int(
+        mapping, "media_chunk_max_bytes", default=1_048_576, maximum=8_388_608
+    )
+    session_max = _optional_bounded_positive_int(
+        mapping, "media_session_max_bytes", default=536_870_912, maximum=1_073_741_824
+    )
+    if session_max < chunk_max:
+        raise ConfigurationError(
+            "interview.media_session_max_bytes must not be smaller than media_chunk_max_bytes"
+        )
     return InterviewSettings(
         _interview_realtime_settings(
             mapping.get("realtime"),
             environment=environment,
-        )
+        ),
+        report_timeout_ms,
+        Path(_optional_string(mapping.get("recording_directory")) or "data/interview-media"),
+        chunk_max,
+        session_max,
     )
 
 
@@ -1431,6 +1473,7 @@ def _interview_realtime_settings(
             "credential_ttl_seconds",
             "heartbeat_interval_ms",
             "ice_urls",
+            "turn_shared_secret",
         },
         label,
     )
@@ -1441,7 +1484,10 @@ def _interview_realtime_settings(
     signaling_url = _named_optional_string(mapping, "signaling_url", label)
     signaling_hostname: str | None = None
     if signaling_url is not None:
-        signaling_hostname = _require_interview_signaling_url(signaling_url)
+        signaling_hostname = _require_interview_signaling_url(
+            signaling_url,
+            allow_development_endpoint=environment in _DEVELOPMENT_IDENTITY_ENVIRONMENTS,
+        )
     raw_transports = _unique_string_array(
         mapping.get("allowed_transports"),
         f"{label}.allowed_transports",
@@ -1470,6 +1516,40 @@ def _interview_realtime_settings(
         maximum=20,
     )
     ice_hostnames = tuple(_require_interview_ice_url(url) for url in ice_urls)
+    turn_shared_secret = _optional_secret(
+        mapping.get("turn_shared_secret"),
+        f"{label}.turn_shared_secret",
+    )
+    if (
+        turn_shared_secret is not None
+        and len(turn_shared_secret.encode("utf-8")) < 32
+    ):
+        raise ConfigurationError(
+            "interview.realtime.turn_shared_secret must contain at least 32 bytes"
+        )
+    has_turn_url = any(url.startswith(("turn:", "turns:")) for url in ice_urls)
+    if has_turn_url != (turn_shared_secret is not None):
+        raise ConfigurationError(
+            "interview.realtime.turn_shared_secret must be configured exactly when TURN URLs are present"
+        )
+    active_signing_key = (
+        next(
+            item.key for item in keyring.keys if item.key_id == keyring.active_key_id
+        )
+        if keyring.active_key_id is not None
+        else None
+    )
+    if (
+        turn_shared_secret is not None
+        and active_signing_key is not None
+        and _text_secret_reuses_key_material(
+            turn_shared_secret,
+            (active_signing_key,),
+        )
+    ):
+        raise ConfigurationError(
+            "interview.realtime.turn_shared_secret must not reuse the realtime signing key"
+        )
     deployed = environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS
     has_active_key = keyring.active_key_id is not None
     if has_active_key != (signaling_url is not None):
@@ -1502,6 +1582,7 @@ def _interview_realtime_settings(
         credential_ttl_seconds,
         heartbeat_interval_ms,
         ice_urls,
+        turn_shared_secret,
     )
 
 
@@ -1522,7 +1603,11 @@ def _hmac256_keyring_settings(value: object, label: str) -> Hmac256KeyringSettin
     )
 
 
-def _require_interview_signaling_url(value: str) -> str:
+def _require_interview_signaling_url(
+    value: str,
+    *,
+    allow_development_endpoint: bool,
+) -> str:
     """@brief 校验并返回 signaling hostname / Validate and return the signaling hostname.
 
     @param value signaling URL / Signaling URL.
@@ -1540,7 +1625,7 @@ def _require_interview_signaling_url(value: str) -> str:
     if (
         not value.isascii()
         or any(character.isspace() for character in value)
-        or parsed.scheme not in {"https", "wss"}
+        or parsed.scheme not in {"http", "https", "ws", "wss"}
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
@@ -1551,7 +1636,19 @@ def _require_interview_signaling_url(value: str) -> str:
         raise ConfigurationError(
             f"{label} must be an exact credential-free HTTPS/WSS URL"
         )
-    return parsed.hostname.rstrip(".").lower()
+    hostname = parsed.hostname.rstrip(".").lower()
+    development_endpoint = (
+        parsed.scheme in {"http", "ws"}
+        and hostname == "dev.hmalliances.org"
+        and parsed.port == 9000
+    )
+    if parsed.scheme in {"http", "ws"} and (
+        not allow_development_endpoint or not development_endpoint
+    ):
+        raise ConfigurationError(
+            f"{label} must use HTTPS/WSS except for the contract development endpoint"
+        )
+    return hostname
 
 
 def _require_interview_ice_url(value: str) -> str:
@@ -2560,6 +2657,14 @@ def _reject_cross_feature_key_reuse(
         raise ConfigurationError(
             "Interview realtime and Knowledge HMAC/encryption keys must be distinct"
         )
+    turn_secret = interview.realtime.turn_shared_secret
+    if turn_secret is not None and _text_secret_reuses_key_material(
+        turn_secret,
+        (*email_materials, *knowledge_materials, *interview_materials),
+    ):
+        raise ConfigurationError(
+            "Interview TURN and other feature encryption/HMAC keys must be distinct"
+        )
     idempotency_secret = security.sensitive_idempotency_hmac_secret
     if idempotency_secret is not None and _text_secret_reuses_key_material(
         idempotency_secret,
@@ -2567,6 +2672,14 @@ def _reject_cross_feature_key_reuse(
     ):
         raise ConfigurationError(
             "sensitive-idempotency and feature encryption/HMAC keys must be distinct"
+        )
+    if (
+        idempotency_secret is not None
+        and turn_secret is not None
+        and hmac.compare_digest(idempotency_secret, turn_secret)
+    ):
+        raise ConfigurationError(
+            "sensitive-idempotency and Interview TURN secrets must be distinct"
         )
 
 

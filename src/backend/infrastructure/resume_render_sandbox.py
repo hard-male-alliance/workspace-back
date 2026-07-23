@@ -29,6 +29,7 @@ _SANDBOX_ERROR_EXIT = 70
 _MAXIMUM_FONT_DIRECTORIES = 32
 """@brief allowed font roots 数量上限 / Maximum number of allowed font roots."""
 
+
 def _positive_integer(value: str) -> int:
     """@brief 解析内部正整数 / Parse an internal positive integer.
 
@@ -110,6 +111,8 @@ def _read_only_paths(
     return (
         *python_runtime_read_paths(),
         Path("/etc/fonts"),
+        Path("/etc/papersize"),
+        Path("/etc/paperspecs"),
         Path("/etc/texmf"),
         Path("/var/cache/fontconfig"),
         Path("/var/lib/texmf"),

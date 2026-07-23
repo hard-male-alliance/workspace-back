@@ -404,7 +404,7 @@ _LEXICAL_SQL = (
 SELECT id AS chunk_id,
        source_id,
        version_id,
-       COALESCE(origin #>> '{metadata,path}', origin ->> 'path', 'chunk/' || ordinal::text) AS locator,
+       COALESCE(origin #>> '{{metadata,path}}', origin ->> 'path', 'chunk/' || ordinal::text) AS locator,
        left(text_content, 4000) AS quote,
        LEAST(1.0, GREATEST(0.0,
            ts_rank_cd(
@@ -427,7 +427,7 @@ _DENSE_SQL = (
 SELECT chunk.id AS chunk_id,
        chunk.source_id,
        chunk.version_id,
-       COALESCE(chunk.origin #>> '{metadata,path}', chunk.origin ->> 'path',
+       COALESCE(chunk.origin #>> '{{metadata,path}}', chunk.origin ->> 'path',
                 'chunk/' || chunk.ordinal::text) AS locator,
        left(chunk.text_content, 4000) AS quote,
        LEAST(1.0, GREATEST(0.0,

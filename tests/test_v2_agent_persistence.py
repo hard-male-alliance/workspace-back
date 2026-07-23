@@ -332,7 +332,7 @@ INSERT INTO identity.workspaces (
 INSERT INTO agent.outbox_events (
     id, workspace_id, resource_owner_id, aggregate_type, aggregate_id,
     subject_revision, event_type, sequence, occurred_at, payload, trace_id,
-    replay_expires_at, status, created_at, updated_at, revision, extensions
+    replay_expires_at, status, next_attempt_at, created_at, updated_at, revision, extensions
 ) VALUES
 (
     'event_agentdispatch1', 'workspace_dispatch01', 'user_dispatchowner1',
@@ -340,6 +340,7 @@ INSERT INTO agent.outbox_events (
     '2026-07-23T00:00:00Z',
     '{"actor_id":"user_dispatchowner1","run_id":"agent_run_dispatch01","job_id":"agent_job_dispatch01"}',
     NULL, '2027-07-23T00:00:00Z', 'pending', '2026-07-23T00:00:00Z',
+    '2026-07-23T00:00:00Z',
     '2026-07-23T00:00:00Z', 1, '{}'
 ),
 (
@@ -348,6 +349,7 @@ INSERT INTO agent.outbox_events (
     '2026-07-23T00:00:00.500000Z',
     '{"actor_id":"user_dispatchowner1","run_id":"agent_run_dispatch01","run_revision":4,"job_id":"agent_job_dispatch01","job_revision":4,"approval_id":"approval_dispatch01","approval_revision":2,"tool_call_id":"tool_call_dispatch01","decision":"approve"}',
     NULL, '2027-07-23T00:00:00Z', 'pending', '2026-07-23T00:00:00Z',
+    '2026-07-23T00:00:00Z',
     '2026-07-23T00:00:00Z', 1, '{}'
 ),
 (
@@ -355,6 +357,7 @@ INSERT INTO agent.outbox_events (
     'knowledge_source', 'source_dispatch0001', 1, 'knowledge_source.job_created', 0,
     '2026-07-23T00:00:01Z', '{"job_id":"knowledge_job_dispatch01"}', NULL,
     '2027-07-23T00:00:01Z', 'pending', '2026-07-23T00:00:01Z',
+    '2026-07-23T00:00:01Z',
     '2026-07-23T00:00:01Z', 1, '{}'
 ),
 (
@@ -362,6 +365,7 @@ INSERT INTO agent.outbox_events (
     'interview_session', 'interview_dispatch01', 1, 'interview.report.queued', 0,
     '2026-07-23T00:00:02Z', '{"job_id":"interview_job_dispatch01"}', NULL,
     '2027-07-23T00:00:02Z', 'pending', '2026-07-23T00:00:02Z',
+    '2026-07-23T00:00:02Z',
     '2026-07-23T00:00:02Z', 1, '{}'
 );
 COMMIT;

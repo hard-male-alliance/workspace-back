@@ -439,7 +439,8 @@ class FakeArtifacts:
     def __init__(self, state: State) -> None:
         self.state = state
 
-    async def add(self, artifact: Artifact) -> None:
+    async def add(self, artifact: Artifact, content: bytes) -> None:
+        assert len(content) == artifact.size_bytes
         self.state.artifacts.append(artifact)
 
 
