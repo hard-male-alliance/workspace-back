@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -14,6 +15,7 @@ from starlette.websockets import WebSocketDisconnect
 
 import backend.api.interview_realtime as realtime_module
 from backend.api.interview_realtime import router_interview_realtime
+from backend.application.interview_v2 import RealtimeCoachingContext
 from backend.domain.interview_v2 import (
     CandidateUtteranceInput,
     RealtimeControl,
@@ -67,6 +69,7 @@ class _Service:
     media_authorizations: list[tuple[str, str, str, str, str]] = field(
         default_factory=list
     )
+    coaching_media_kinds: list[str | None] = field(default_factory=list)
 
     async def ingest_realtime_input(
         self, audience: ResourceRef, envelope: RealtimeInputEnvelope
@@ -100,6 +103,32 @@ class _Service:
             )
         )
 
+    async def prepare_realtime_coaching(
+        self,
+        audience: ResourceRef,
+        workspace_id: str,
+        session_id: str,
+        connection_id: str,
+        *,
+        media_kind: str | None = None,
+    ) -> RealtimeCoachingContext:
+        assert audience.id == USER_ID
+        assert str(workspace_id) == WORKSPACE_ID
+        assert str(session_id) == SESSION_ID
+        assert str(connection_id) == CONNECTION_ID
+        self.coaching_media_kinds.append(media_kind)
+        return RealtimeCoachingContext(
+            "Backend interview",
+            "Assess practical backend engineering",
+            "technical",
+            "medium",
+            ("Python", "databases"),
+            "zh-CN",
+            True,
+            (),
+            "global",
+        )
+
 
 @dataclass(slots=True)
 class _MediaStore:
@@ -111,21 +140,79 @@ class _MediaStore:
 
 
 @dataclass(slots=True)
+class _Coach:
+    transcriptions: list[bytes] = field(default_factory=list)
+    frames: list[bytes] = field(default_factory=list)
+    followups: list[tuple[str, str | None]] = field(default_factory=list)
+    histories: list[tuple[tuple[str, str], ...]] = field(default_factory=list)
+
+    async def transcribe_audio(
+        self,
+        content: bytes,
+        media_type: str,
+        locale: str,
+        *,
+        operation_id: str,
+    ) -> str:
+        assert media_type == "audio/webm"
+        assert locale == "zh-CN"
+        assert operation_id.startswith("input_")
+        self.transcriptions.append(content)
+        return "我使用指标和日志定位了数据库连接池耗尽。"
+
+    async def observe_frame(
+        self,
+        content: bytes,
+        media_type: str,
+        *,
+        operation_id: str,
+    ) -> str:
+        assert media_type == "image/jpeg"
+        assert operation_id.startswith("input_")
+        self.frames.append(content)
+        return "候选人正在展示一张系统架构图。"
+
+    async def stream_followup(
+        self,
+        context: RealtimeCoachingContext,
+        candidate_text: str,
+        visual_observation: str | None,
+        live_history: tuple[tuple[str, str], ...],
+        *,
+        operation_id: str,
+    ) -> AsyncIterator[str]:
+        assert context.interview_type == "technical"
+        assert operation_id.endswith(":followup")
+        self.followups.append((candidate_text, visual_observation))
+        self.histories.append(live_history)
+        yield "你如何确认"
+        yield "连接池是根因？"
+
+
+@dataclass(slots=True)
 class _Container:
     settings: object
     interview_v2: _Service
     interview_realtime_verifier: _Verifier
     interview_media_store: _MediaStore
+    interview_realtime_coach: _Coach
 
 
 def _client(*, origins: tuple[str, ...] = ("http://127.0.0.1:5173",)) -> tuple[TestClient, _Container]:
     app = FastAPI()
     app.include_router(router_interview_realtime)
     container = _Container(
-        SimpleNamespace(network=SimpleNamespace(cors_allowed_origins=origins)),
+        SimpleNamespace(
+            network=SimpleNamespace(cors_allowed_origins=origins),
+            interview=SimpleNamespace(
+                media_analysis_max_audio_bytes=1024 * 1024,
+                video_frame_max_bytes=1024 * 1024,
+            ),
+        ),
         _Service(),
         _Verifier(),
         _MediaStore(),
+        _Coach(),
     )
     app.state.container = container
     return TestClient(app), container
@@ -179,6 +266,17 @@ def test_websocket_auth_control_text_and_replay_flow() -> None:
         }
         socket.send_json(utterance)
         assert socket.receive_json()["replayed"] is False
+        assert socket.receive_json() == {
+            "type": "interviewer_start",
+            "in_reply_to": "input_candidate00001",
+        }
+        assert socket.receive_json()["delta"] == "你如何确认"
+        assert socket.receive_json()["delta"] == "连接池是根因？"
+        assert socket.receive_json() == {
+            "type": "interviewer_followup",
+            "in_reply_to": "input_candidate00001",
+            "text": "你如何确认连接池是根因？",
+        }
         socket.send_json(utterance)
         assert socket.receive_json() == {
             "type": "ack",
@@ -201,6 +299,167 @@ def test_websocket_auth_control_text_and_replay_flow() -> None:
         container.interview_v2.calls[-1].payload.control
         is RealtimeControl.DISCONNECTED
     )
+    assert container.interview_realtime_coach.followups == [
+        ("请介绍一次后端故障排查经历。", None)
+    ]
+
+
+def test_websocket_streams_audio_transcript_and_contextual_followup() -> None:
+    """Ordered audio fragments are transcribed once on final and produce a streamed question."""
+    client, container = _client()
+    chunks = (b"webm-header", b"webm-final")
+    with client.websocket_connect(
+        "/realtime/v2/interview",
+        subprotocols=[PROTOCOL],
+        headers={"Origin": "http://127.0.0.1:5173"},
+    ) as socket:
+        _authenticate(socket)
+        socket.receive_json()
+        for sequence, content in enumerate(chunks, start=1):
+            socket.send_json(
+                {
+                    "type": "realtime_audio",
+                    "input_id": "input_audio_answer01",
+                    "sequence": sequence,
+                    "final": sequence == len(chunks),
+                    "media_type": "audio/webm",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "start_ms": 1_000,
+                    "end_ms": 4_000,
+                }
+            )
+            socket.send_bytes(content)
+            assert socket.receive_json() == {
+                "type": "audio_ack",
+                "input_id": "input_audio_answer01",
+                "sequence": sequence,
+                "final": sequence == len(chunks),
+            }
+        transcript = socket.receive_json()
+        assert transcript["type"] == "transcript_final"
+        assert transcript["text"] == "我使用指标和日志定位了数据库连接池耗尽。"
+        assert socket.receive_json()["type"] == "interviewer_start"
+        assert socket.receive_json()["type"] == "interviewer_delta"
+        assert socket.receive_json()["type"] == "interviewer_delta"
+        assert socket.receive_json()["type"] == "interviewer_followup"
+
+    assert container.interview_realtime_coach.transcriptions == [b"".join(chunks)]
+    assert isinstance(container.interview_v2.calls[1].payload, CandidateUtteranceInput)
+    assert container.interview_v2.calls[1].payload.start_ms == 1_000
+
+
+def test_websocket_camera_keyframe_informs_next_followup() -> None:
+    """A sampled camera frame is analyzed and passed only as bounded context to the next turn."""
+    client, container = _client()
+    frame = b"jpeg-frame"
+    with client.websocket_connect(
+        "/realtime/v2/interview",
+        subprotocols=[PROTOCOL],
+        headers={"Origin": "http://127.0.0.1:5173"},
+    ) as socket:
+        _authenticate(socket)
+        socket.receive_json()
+        socket.send_json(
+            {
+                "type": "video_frame",
+                "input_id": "input_video_frame001",
+                "sequence": 1,
+                "media_type": "image/jpeg",
+                "sha256": hashlib.sha256(frame).hexdigest(),
+                "captured_at_ms": 2_000,
+            }
+        )
+        socket.send_bytes(frame)
+        assert socket.receive_json()["type"] == "video_ack"
+        socket.send_json(
+            {
+                "type": "candidate_utterance",
+                "input_id": "input_after_video01",
+                "text": "这是我设计的高可用架构。",
+                "start_ms": 2_100,
+                "end_ms": 4_000,
+            }
+        )
+        assert socket.receive_json()["type"] == "ack"
+        assert socket.receive_json()["type"] == "interviewer_start"
+        socket.receive_json()
+        socket.receive_json()
+        assert socket.receive_json()["type"] == "interviewer_followup"
+
+    assert container.interview_realtime_coach.frames == [frame]
+    assert container.interview_realtime_coach.followups[-1] == (
+        "这是我设计的高可用架构。",
+        "候选人正在展示一张系统架构图。",
+    )
+
+
+def test_websocket_rejects_out_of_order_audio_before_provider_call() -> None:
+    """An out-of-order fragment closes the protocol without sending bytes to STT."""
+    client, container = _client()
+    content = b"late-fragment"
+    with client.websocket_connect(
+        "/realtime/v2/interview",
+        subprotocols=[PROTOCOL],
+        headers={"Origin": "http://127.0.0.1:5173"},
+    ) as socket:
+        _authenticate(socket)
+        socket.receive_json()
+        socket.send_json(
+            {
+                "type": "realtime_audio",
+                "input_id": "input_audio_order001",
+                "sequence": 2,
+                "final": True,
+                "media_type": "audio/webm",
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "start_ms": 0,
+                "end_ms": 100,
+            }
+        )
+        socket.send_bytes(content)
+        assert socket.receive_json() == {
+            "type": "error",
+            "code": "realtime.invalid_message",
+        }
+        with pytest.raises(WebSocketDisconnect) as raised:
+            socket.receive_json()
+        assert raised.value.code == 4400
+    assert container.interview_realtime_coach.transcriptions == []
+
+
+def test_websocket_carries_bounded_live_history_into_the_next_turn() -> None:
+    """Generated questions remain available to subsequent turns without durable storage."""
+    client, container = _client()
+    with client.websocket_connect(
+        "/realtime/v2/interview",
+        subprotocols=[PROTOCOL],
+        headers={"Origin": "http://127.0.0.1:5173"},
+    ) as socket:
+        _authenticate(socket)
+        socket.receive_json()
+        for index, text in enumerate(("第一轮回答", "第二轮回答"), start=1):
+            socket.send_json(
+                {
+                    "type": "candidate_utterance",
+                    "input_id": f"input_history_turn0{index}",
+                    "text": text,
+                    "start_ms": index * 1_000,
+                    "end_ms": index * 1_000 + 500,
+                }
+            )
+            assert socket.receive_json()["type"] == "ack"
+            assert socket.receive_json()["type"] == "interviewer_start"
+            socket.receive_json()
+            socket.receive_json()
+            assert socket.receive_json()["type"] == "interviewer_followup"
+
+    assert container.interview_realtime_coach.histories == [
+        (),
+        (
+            ("candidate", "第一轮回答"),
+            ("interviewer", "你如何确认连接池是根因？"),
+        ),
+    ]
 
 
 def test_websocket_consent_authorizes_and_persists_bounded_media_chunk() -> None:

@@ -38,6 +38,7 @@ from backend.domain.interview_v2 import (
     RealtimeInputLedgerRecord,
     RealtimeInputReceipt,
     TranscriptSegment,
+    TranscriptSpeaker,
 )
 from backend.domain.platform import Artifact, AuditEvent, Job, JobId, JsonValue
 from backend.domain.principals import TokenPrincipal, UserId, WorkspaceId
@@ -212,6 +213,40 @@ class EndSessionOutput:
                 raise ValueError("Interview Artifact content size does not match metadata")
             if hashlib.sha256(content).hexdigest() != artifact.sha256:
                 raise ValueError("Interview Artifact content digest does not match metadata")
+
+
+@dataclass(frozen=True, slots=True)
+class AnalyzedMediaSegment:
+    """Provider-neutral text evidence derived from one immutable media Artifact."""
+
+    source_ref: ResourceRef
+    speaker: TranscriptSpeaker
+    start_ms: int
+    end_ms: int
+    text: str
+
+    def __post_init__(self) -> None:
+        """Validate provenance by constructing the domain object at persistence time."""
+        if (
+            self.source_ref.resource_type != "artifact"
+            or self.source_ref.revision is None
+        ):
+            raise ValueError("analyzed media provenance requires an exact Artifact")
+        if self.start_ms < 0 or self.end_ms < self.start_ms:
+            raise ValueError("analyzed media time range is invalid")
+        if not self.text or len(self.text) > 20_000:
+            raise ValueError("analyzed media text is empty or too large")
+
+
+@dataclass(frozen=True, slots=True)
+class InterviewMediaAnalysis:
+    """Bounded transcript evidence produced from consented audio/video."""
+
+    segments: tuple[AnalyzedMediaSegment, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.segments) > 2_000:
+            raise ValueError("Interview media analysis contains too many segments")
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +534,20 @@ class InterviewMediaFinalizer(Protocol):
         """
 
 
+class InterviewMediaAnalyzer(Protocol):
+    """Analyze finalized media outside a database transaction."""
+
+    async def analyze(
+        self,
+        session: InterviewSession,
+        media: EndSessionOutput,
+        existing_transcript: tuple[TranscriptSegment, ...],
+        *,
+        operation_id: InterviewWorkerOperationId,
+    ) -> InterviewMediaAnalysis:
+        """Return derived evidence under the Session's frozen consent and model policy."""
+
+
 class InterviewReportProvider(Protocol):
     """@brief 外部 Report evaluation provider / External Report-evaluation provider."""
 
@@ -574,11 +623,14 @@ class InterviewUnitOfWorkFactory(Protocol):
 
 
 __all__ = [
+    "AnalyzedMediaSegment",
     "EndSessionOutput",
     "InterviewArtifactStore",
     "InterviewAuditSink",
     "InterviewCasMismatch",
     "InterviewJobStore",
+    "InterviewMediaAnalysis",
+    "InterviewMediaAnalyzer",
     "InterviewOutbox",
     "InterviewPage",
     "InterviewPageRequest",

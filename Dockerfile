@@ -38,6 +38,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         bubblewrap \
         ca-certificates \
+        ffmpeg \
         fonts-noto-cjk \
         libseccomp2 \
         postgresql-client \

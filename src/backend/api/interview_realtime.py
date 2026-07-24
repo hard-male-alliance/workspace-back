@@ -9,9 +9,11 @@ Transcript consent 决定。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol, cast
 
@@ -38,6 +40,7 @@ from backend.domain.interview_v2 import (
 )
 from backend.domain.principals import WorkspaceId
 from backend.domain.resources import ResourceRef
+from backend.infrastructure.interview_realtime_coaching import RealtimeInterviewCoach
 from workspace_shared.ids import new_opaque_id
 
 router_interview_realtime = APIRouter()
@@ -55,6 +58,7 @@ class _RealtimeContainer(Protocol):
     interview_v2: InterviewApplicationService
     interview_realtime_verifier: InterviewRealtimeCredentialVerifier
     interview_media_store: _MediaCaptureStore
+    interview_realtime_coach: RealtimeInterviewCoach
 
 
 class _MediaCaptureStore(Protocol):
@@ -74,16 +78,29 @@ class _MediaCaptureStore(Protocol):
     ) -> bool: ...
 
 
+@dataclass(slots=True)
+class _AudioAccumulator:
+    """Bounded ordered bytes for one candidate answer."""
+
+    media_type: str
+    start_ms: int
+    next_sequence: int = 1
+    content: bytearray = field(default_factory=bytearray)
+
+
 @router_interview_realtime.websocket("/realtime/v2/interview")
 async def interview_realtime(websocket: WebSocket) -> None:
     """@brief 验证一次性 grant 并把实时文字输入原子提交给 Interview / Verify a one-time grant and atomically submit realtime text input to Interview."""
     container = cast(_RealtimeContainer, websocket.app.state.container)
-    disconnect_context: tuple[
-        WorkspaceId,
-        InterviewSessionId,
-        ResourceRef,
-        RealtimeConnectionId,
-    ] | None = None
+    disconnect_context: (
+        tuple[
+            WorkspaceId,
+            InterviewSessionId,
+            ResourceRef,
+            RealtimeConnectionId,
+        ]
+        | None
+    ) = None
     if not _origin_allowed(websocket, container.settings.network.cors_allowed_origins):
         await websocket.close(code=4403, reason="origin_not_allowed")
         return
@@ -122,36 +139,167 @@ async def interview_realtime(websocket: WebSocket) -> None:
                 "sequence": receipt.sequence,
             }
         )
+        audio: dict[RealtimeInputId, _AudioAccumulator] = {}
+        last_video_sequence = 0
+        latest_visual_observation: str | None = None
+        live_history: list[tuple[str, str]] = []
         while True:
             frame = await _receive_object(websocket)
             if frame.get("type") == "media_chunk":
-                header = _media_header(frame)
+                media_header = _media_header(frame)
                 content = await websocket.receive_bytes()
                 await container.interview_v2.authorize_media_capture(
                     audience,
                     workspace_id,
                     session_id,
                     connection_id,
-                    header[1],
+                    media_header[1],
                 )
                 replayed = await container.interview_media_store.append(
                     workspace_id=workspace_id,
                     session_id=str(session_id),
-                    input_id=str(header[0]),
-                    kind=header[1],
-                    sequence=header[2],
-                    media_type=header[3],
+                    input_id=str(media_header[0]),
+                    kind=media_header[1],
+                    sequence=media_header[2],
+                    media_type=media_header[3],
                     content=content,
-                    sha256=header[4],
+                    sha256=media_header[4],
                 )
                 await websocket.send_json(
                     {
                         "type": "media_ack",
-                        "input_id": str(header[0]),
-                        "sequence": header[2],
+                        "input_id": str(media_header[0]),
+                        "sequence": media_header[2],
                         "replayed": replayed,
                     }
                 )
+                continue
+            if frame.get("type") == "realtime_audio":
+                audio_header = _realtime_audio_header(frame)
+                content = await websocket.receive_bytes()
+                _verify_binary(content, audio_header.sha256)
+                accumulator = audio.get(audio_header.input_id)
+                if accumulator is None:
+                    if audio_header.sequence != 1:
+                        raise _ProtocolFailure("realtime.audio_sequence_out_of_order")
+                    accumulator = _AudioAccumulator(
+                        audio_header.media_type,
+                        audio_header.start_ms,
+                    )
+                    audio[audio_header.input_id] = accumulator
+                if (
+                    audio_header.sequence != accumulator.next_sequence
+                    or audio_header.media_type != accumulator.media_type
+                    or audio_header.start_ms != accumulator.start_ms
+                ):
+                    raise _ProtocolFailure("realtime.audio_sequence_out_of_order")
+                if (
+                    len(accumulator.content) + len(content)
+                    > container.settings.interview.media_analysis_max_audio_bytes
+                ):
+                    raise _ProtocolFailure("realtime.audio_too_large")
+                accumulator.content.extend(content)
+                accumulator.next_sequence += 1
+                await websocket.send_json(
+                    {
+                        "type": "audio_ack",
+                        "input_id": str(audio_header.input_id),
+                        "sequence": audio_header.sequence,
+                        "final": audio_header.final,
+                    }
+                )
+                if not audio_header.final:
+                    continue
+                del audio[audio_header.input_id]
+                try:
+                    context = await container.interview_v2.prepare_realtime_coaching(
+                        audience,
+                        workspace_id,
+                        session_id,
+                        connection_id,
+                        media_kind="audio",
+                    )
+                    transcript = await container.interview_realtime_coach.transcribe_audio(
+                        bytes(accumulator.content),
+                        accumulator.media_type,
+                        context.locale,
+                        operation_id=str(audio_header.input_id),
+                    )
+                    receipt = await container.interview_v2.ingest_realtime_input(
+                        audience,
+                        _envelope(
+                            workspace_id,
+                            session_id,
+                            connection_id,
+                            audio_header.input_id,
+                            CandidateUtteranceInput(
+                                transcript,
+                                audio_header.start_ms,
+                                audio_header.end_ms,
+                            ),
+                        ),
+                    )
+                    await websocket.send_json(
+                        {
+                            "type": "transcript_final",
+                            "input_id": str(audio_header.input_id),
+                            "text": transcript,
+                            "sequence": receipt.sequence,
+                            "replayed": receipt.replayed,
+                        }
+                    )
+                    if not receipt.replayed:
+                        context = await container.interview_v2.prepare_realtime_coaching(
+                            audience,
+                            workspace_id,
+                            session_id,
+                            connection_id,
+                        )
+                        await _stream_followup(
+                            websocket,
+                            container.interview_realtime_coach,
+                            context,
+                            audio_header.input_id,
+                            transcript,
+                            latest_visual_observation,
+                            live_history,
+                        )
+                except (InterviewApplicationError, OSError, RuntimeError) as error:
+                    await _turn_error(websocket, audio_header.input_id, error)
+                continue
+            if frame.get("type") == "video_frame":
+                video_header = _video_frame_header(frame)
+                content = await websocket.receive_bytes()
+                _verify_binary(content, video_header.sha256)
+                if video_header.sequence <= last_video_sequence:
+                    raise _ProtocolFailure("realtime.video_sequence_out_of_order")
+                if len(content) > container.settings.interview.video_frame_max_bytes:
+                    raise _ProtocolFailure("realtime.video_frame_too_large")
+                last_video_sequence = video_header.sequence
+                try:
+                    await container.interview_v2.prepare_realtime_coaching(
+                        audience,
+                        workspace_id,
+                        session_id,
+                        connection_id,
+                        media_kind="video",
+                    )
+                    latest_visual_observation = (
+                        await container.interview_realtime_coach.observe_frame(
+                            content,
+                            video_header.media_type,
+                            operation_id=str(video_header.input_id),
+                        )
+                    )
+                    await websocket.send_json(
+                        {
+                            "type": "video_ack",
+                            "input_id": str(video_header.input_id),
+                            "sequence": video_header.sequence,
+                        }
+                    )
+                except (InterviewApplicationError, OSError, RuntimeError) as error:
+                    await _turn_error(websocket, video_header.input_id, error)
                 continue
             input_id, payload = _input(frame)
             receipt = await container.interview_v2.ingest_realtime_input(
@@ -172,6 +320,25 @@ async def interview_realtime(websocket: WebSocket) -> None:
                     "replayed": receipt.replayed,
                 }
             )
+            if isinstance(payload, CandidateUtteranceInput) and not receipt.replayed:
+                try:
+                    context = await container.interview_v2.prepare_realtime_coaching(
+                        audience,
+                        workspace_id,
+                        session_id,
+                        connection_id,
+                    )
+                    await _stream_followup(
+                        websocket,
+                        container.interview_realtime_coach,
+                        context,
+                        input_id,
+                        payload.text,
+                        latest_visual_observation,
+                        live_history,
+                    )
+                except (InterviewApplicationError, OSError, RuntimeError) as error:
+                    await _turn_error(websocket, input_id, error)
     except WebSocketDisconnect:
         if disconnect_context is not None:
             await _record_disconnect(container, disconnect_context)
@@ -182,12 +349,32 @@ async def interview_realtime(websocket: WebSocket) -> None:
         await _fail(websocket, "realtime.input_id_reused", 4409)
     except InterviewApplicationError as error:
         await _fail(websocket, error.code, 4409)
-    except (PermissionError, ValueError, TypeError, _ProtocolFailure):
+    except PermissionError, ValueError, TypeError, _ProtocolFailure:
         await _fail(websocket, "realtime.invalid_message", 4400)
 
 
 class _ProtocolFailure(ValueError):
     """@brief 不向 peer 回显解析细节的协议失败 / Protocol failure whose parsing detail is never reflected to the peer."""
+
+
+@dataclass(frozen=True, slots=True)
+class _RealtimeAudioHeader:
+    input_id: RealtimeInputId
+    sequence: int
+    final: bool
+    media_type: str
+    sha256: str
+    start_ms: int
+    end_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class _VideoFrameHeader:
+    input_id: RealtimeInputId
+    sequence: int
+    media_type: str
+    sha256: str
+    captured_at_ms: int
 
 
 async def _receive_object(websocket: WebSocket) -> Mapping[str, object]:
@@ -208,13 +395,17 @@ def _authentication(
     value: Mapping[str, object],
 ) -> tuple[WorkspaceId, InterviewSessionId, ResourceRef, str]:
     """@brief 解析首帧并保持 token 不进入 URL 或日志 / Parse the first frame while keeping the token out of URLs and logs."""
-    if set(value) != {
-        "type",
-        "workspace_id",
-        "session_id",
-        "audience_id",
-        "ephemeral_token",
-    } or value.get("type") != "authenticate":
+    if (
+        set(value)
+        != {
+            "type",
+            "workspace_id",
+            "session_id",
+            "audience_id",
+            "ephemeral_token",
+        }
+        or value.get("type") != "authenticate"
+    ):
         raise _ProtocolFailure("realtime.authentication_required")
     workspace_id = WorkspaceId(_opaque(value.get("workspace_id"), "workspace_id"))
     session_id = InterviewSessionId(_opaque(value.get("session_id"), "session_id"))
@@ -287,6 +478,160 @@ def _media_header(
     return input_id, kind, sequence, media_type, digest
 
 
+def _realtime_audio_header(value: Mapping[str, object]) -> _RealtimeAudioHeader:
+    if set(value) != {
+        "type",
+        "input_id",
+        "sequence",
+        "final",
+        "media_type",
+        "sha256",
+        "start_ms",
+        "end_ms",
+    }:
+        raise _ProtocolFailure("realtime.invalid_audio_header")
+    input_id = RealtimeInputId(_opaque(value.get("input_id"), "input_id"))
+    sequence = value.get("sequence")
+    final = value.get("final")
+    media_type = value.get("media_type")
+    digest = value.get("sha256")
+    start_ms = value.get("start_ms")
+    end_ms = value.get("end_ms")
+    if (
+        isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence < 1
+        or not isinstance(final, bool)
+        or media_type not in {"audio/webm", "audio/ogg", "audio/mp4"}
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[a-f0-9]{64}", digest) is None
+        or isinstance(start_ms, bool)
+        or not isinstance(start_ms, int)
+        or isinstance(end_ms, bool)
+        or not isinstance(end_ms, int)
+        or start_ms < 0
+        or end_ms < start_ms
+    ):
+        raise _ProtocolFailure("realtime.invalid_audio_header")
+    return _RealtimeAudioHeader(
+        input_id,
+        sequence,
+        final,
+        media_type,
+        digest,
+        start_ms,
+        end_ms,
+    )
+
+
+def _video_frame_header(value: Mapping[str, object]) -> _VideoFrameHeader:
+    if set(value) != {
+        "type",
+        "input_id",
+        "sequence",
+        "media_type",
+        "sha256",
+        "captured_at_ms",
+    }:
+        raise _ProtocolFailure("realtime.invalid_video_frame_header")
+    input_id = RealtimeInputId(_opaque(value.get("input_id"), "input_id"))
+    sequence = value.get("sequence")
+    media_type = value.get("media_type")
+    digest = value.get("sha256")
+    captured_at_ms = value.get("captured_at_ms")
+    if (
+        isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence < 1
+        or media_type not in {"image/jpeg", "image/png", "image/webp"}
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[a-f0-9]{64}", digest) is None
+        or isinstance(captured_at_ms, bool)
+        or not isinstance(captured_at_ms, int)
+        or captured_at_ms < 0
+    ):
+        raise _ProtocolFailure("realtime.invalid_video_frame_header")
+    return _VideoFrameHeader(
+        input_id,
+        sequence,
+        media_type,
+        digest,
+        captured_at_ms,
+    )
+
+
+def _verify_binary(content: bytes, expected_sha256: str) -> None:
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise _ProtocolFailure("realtime.binary_digest_mismatch")
+
+
+async def _stream_followup(
+    websocket: WebSocket,
+    coach: RealtimeInterviewCoach,
+    context: object,
+    input_id: RealtimeInputId,
+    candidate_text: str,
+    visual_observation: str | None,
+    live_history: list[tuple[str, str]],
+) -> None:
+    from backend.application.interview_v2 import RealtimeCoachingContext
+
+    if not isinstance(context, RealtimeCoachingContext):
+        raise RuntimeError("realtime coaching context is invalid")
+    await websocket.send_json({"type": "interviewer_start", "in_reply_to": str(input_id)})
+    chunks: list[str] = []
+    async for chunk in coach.stream_followup(
+        context,
+        candidate_text,
+        visual_observation,
+        tuple(live_history[-40:]),
+        operation_id=f"{input_id}:followup",
+    ):
+        chunks.append(chunk)
+        await websocket.send_json(
+            {
+                "type": "interviewer_delta",
+                "in_reply_to": str(input_id),
+                "delta": chunk,
+            }
+        )
+    followup = "".join(chunks)
+    await websocket.send_json(
+        {
+            "type": "interviewer_followup",
+            "in_reply_to": str(input_id),
+            "text": followup,
+        }
+    )
+    live_history.extend(
+        (
+            ("candidate", candidate_text),
+            ("interviewer", followup),
+        )
+    )
+    if len(live_history) > 40:
+        del live_history[:-40]
+
+
+async def _turn_error(
+    websocket: WebSocket,
+    input_id: RealtimeInputId,
+    error: Exception,
+) -> None:
+    code = (
+        error.code
+        if isinstance(error, InterviewApplicationError)
+        else "realtime.inference_unavailable"
+    )
+    await websocket.send_json(
+        {
+            "type": "turn_error",
+            "input_id": str(input_id),
+            "code": code,
+        }
+    )
+
+
 def _envelope(
     workspace_id: WorkspaceId,
     session_id: InterviewSessionId,
@@ -324,7 +669,7 @@ async def _fail(websocket: WebSocket, code: str, close_code: int) -> None:
     try:
         await websocket.send_json({"type": "error", "code": code})
         await websocket.close(code=close_code, reason=code[:120])
-    except (RuntimeError, OSError, WebSocketDisconnect):
+    except RuntimeError, OSError, WebSocketDisconnect:
         return
 
 
@@ -351,7 +696,7 @@ async def _record_disconnect(
                 payload,
             ),
         )
-    except (InterviewApplicationError, OSError, RuntimeError):
+    except InterviewApplicationError, OSError, RuntimeError:
         # The socket is already gone. Lease expiry and Session maintenance are the durable
         # recovery boundary, so a failed observability marker must not mask disconnect.
         return

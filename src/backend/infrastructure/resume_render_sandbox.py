@@ -130,6 +130,7 @@ def _xelatex_environment(workdir: Path) -> dict[str, str]:
 
     return {
         "HOME": str(workdir),
+        "XDG_CACHE_HOME": str(workdir / "cache"),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PATH": "/usr/bin:/bin",
@@ -160,7 +161,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         font_directories = _font_directories(argv[6])
         if not workdir.is_dir() or not executable.is_file():
             raise ValueError("renderer sandbox paths are invalid")
-        for name in ("texmf-config", "texmf-var", "tmp"):
+        for name in ("cache", "cache/fontconfig", "texmf-config", "texmf-var", "tmp"):
             target = workdir / name
             target.mkdir(mode=0o700, exist_ok=True)
         os.chdir(workdir)
