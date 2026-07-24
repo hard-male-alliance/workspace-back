@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
@@ -16,6 +17,7 @@ from backend.application.interview_v2 import (
     EndInterviewSessionCommand,
     InterviewApplicationService,
     InterviewConflict,
+    InterviewMediaCapabilities,
     InterviewMutationContext,
     InterviewPortProtocolError,
     InterviewPreconditionFailed,
@@ -25,8 +27,10 @@ from backend.application.interview_v2 import (
     InvalidInterviewCommand,
 )
 from backend.application.ports.interview_v2 import (
+    AnalyzedMediaSegment,
     EndSessionOutput,
     InterviewCasMismatch,
+    InterviewMediaAnalysis,
     InterviewPage,
     InterviewPageRequest,
     InterviewPermission,
@@ -82,6 +86,7 @@ from backend.domain.interview_v2 import (
     RubricScore,
     ScoreScale,
     TranscriptSegment,
+    TranscriptSpeaker,
     realtime_input_fingerprint,
 )
 from backend.domain.knowledge_retrieval import (
@@ -92,7 +97,16 @@ from backend.domain.knowledge_retrieval import (
     KnowledgeSelectionMode,
 )
 from backend.domain.knowledge_sources import ModelRegion
-from backend.domain.platform import Artifact, AuditEvent, Job, JobId, JobStatus
+from backend.domain.platform import (
+    ApiArtifactContentUrl,
+    Artifact,
+    ArtifactId,
+    ArtifactKind,
+    AuditEvent,
+    Job,
+    JobId,
+    JobStatus,
+)
 from backend.domain.principals import (
     ClientId,
     ResourceMeta,
@@ -571,6 +585,72 @@ class FakeMediaFinalizer:
         return EndSessionOutput(())
 
 
+class RecordedAudioFinalizer:
+    """Return one immutable audio Artifact for media-analysis integration tests."""
+
+    def __init__(self, state: State) -> None:
+        self.state = state
+
+    async def finalize(
+        self,
+        session: InterviewSession,
+        *,
+        operation_id: InterviewWorkerOperationId,
+    ) -> EndSessionOutput:
+        assert self.state.active_transactions == 0
+        content = b"OggS-consented-candidate-answer"
+        artifact_id = ArtifactId("artifact_interviewaudio01")
+        artifact = Artifact(
+            ResourceMeta(artifact_id, 1, NOW, NOW),
+            session.workspace_id,
+            ArtifactKind.INTERVIEW_AUDIO,
+            ResourceRef("interview_session", session.meta.id, session.meta.revision),
+            "audio/ogg",
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+            ApiArtifactContentUrl.build(
+                "https://api.example.test",
+                session.workspace_id,
+                artifact_id,
+            ),
+            expires_at=session.spec.recording.retention_until,
+        )
+        self.state.media_finalize_calls += 1
+        self.state.media_operation_ids.append(operation_id)
+        return EndSessionOutput((artifact,), (content,))
+
+
+class FakeMediaAnalyzer:
+    """Derive one candidate segment with exact Artifact provenance."""
+
+    def __init__(self, state: State) -> None:
+        self.state = state
+
+    async def analyze(
+        self,
+        session: InterviewSession,
+        media: EndSessionOutput,
+        existing_transcript: tuple[TranscriptSegment, ...],
+        *,
+        operation_id: InterviewWorkerOperationId,
+    ) -> InterviewMediaAnalysis:
+        assert self.state.active_transactions == 0
+        assert existing_transcript == ()
+        assert operation_id.startswith("interview.end:")
+        artifact = media.artifacts[0]
+        return InterviewMediaAnalysis(
+            (
+                AnalyzedMediaSegment(
+                    ResourceRef("artifact", artifact.meta.id, artifact.meta.revision),
+                    TranscriptSpeaker.CANDIDATE,
+                    0,
+                    2_400,
+                    "我通过幂等键、事务性 Outbox 和租约实现了可靠任务处理。",
+                ),
+            )
+        )
+
+
 class RetryableMediaFinalizer:
     """@brief 返回可重试分类失败的 media fake / Media fake returning a classified retryable failure."""
 
@@ -811,6 +891,115 @@ async def test_session_creation_rejects_unconfigured_recording_before_persistenc
 
 
 @pytest.mark.asyncio
+async def test_end_job_atomically_persists_media_analysis_for_report_evidence() -> None:
+    """Audio-derived text is committed with its Artifact and consumed by the report."""
+
+    state = State()
+    factory = FakeUowFactory(state)
+    ids = DeterministicIds()
+    service = InterviewApplicationService(
+        factory,
+        FakeRealtimeGateway(state),
+        media_capabilities=InterviewMediaCapabilities(
+            audio_recording=True,
+            video_recording=True,
+        ),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+    worker = InterviewWorkerService(
+        factory,
+        RecordedAudioFinalizer(state),
+        FakeReportProvider(state),
+        FakeMediaAnalyzer(state),
+        service_actor=ResourceRef("service", "interview_worker_service01"),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+    scenario = await service.create_scenario(
+        PRINCIPAL,
+        WORKSPACE,
+        CreateInterviewScenarioCommand(_scenario_spec()),
+        CONTEXT,
+    )
+    active = await service.update_scenario(
+        PRINCIPAL,
+        WORKSPACE,
+        scenario.meta.id,
+        InterviewScenarioPatch({"status": InterviewScenarioStatus.ACTIVE}),
+        expected_revision=scenario.meta.revision,
+        context=CONTEXT,
+    )
+    command = _session_command(active.meta.id)
+    created = await service.create_session(
+        PRINCIPAL,
+        WORKSPACE,
+        replace(
+            command,
+            recording=replace(command.recording, record_audio=True),
+        ),
+        CONTEXT,
+    )
+    connection = await service.create_realtime_connection(
+        PRINCIPAL,
+        WORKSPACE,
+        created.meta.id,
+        CreateRealtimeConnectionSpec((RealtimeTransport.WEBRTC,), ("opus",), ()),
+        CONTEXT,
+    )
+    control = RealtimeControlInput(RealtimeControl.MEDIA_STARTED)
+    await service.ingest_realtime_input(
+        ResourceRef("user", PRINCIPAL.user_id),
+        RealtimeInputEnvelope(
+            RealtimeInputId("input_mediaanalysis01"),
+            WORKSPACE,
+            created.meta.id,
+            connection.id,
+            NOW,
+            control,
+            realtime_input_fingerprint(control),
+        ),
+    )
+    current = state.sessions[created.meta.id]
+    end_job = await service.create_end_request(
+        PRINCIPAL,
+        WORKSPACE,
+        created.meta.id,
+        EndInterviewSessionCommand(EndInterviewReason.COMPLETED),
+        expected_revision=current.meta.revision,
+        context=CONTEXT,
+    )
+    await worker.execute_end_job(WORKSPACE, created.meta.id, end_job.meta.id)
+
+    transcript = state.transcript[created.meta.id]
+    assert len(state.artifacts) == 1
+    assert len(transcript) == 1
+    assert transcript[0].source_ref == ResourceRef(
+        "artifact",
+        state.artifacts[0].meta.id,
+        state.artifacts[0].meta.revision,
+    )
+    assert transcript[0].speaker is TranscriptSpeaker.CANDIDATE
+    assert state.sessions[created.meta.id].view.status is InterviewSessionStatus.COMPLETED
+    assert state.jobs[end_job.meta.id].status is JobStatus.SUCCEEDED
+
+    report_job = await service.create_report_job(
+        PRINCIPAL,
+        WORKSPACE,
+        created.meta.id,
+        CreateInterviewReportJobCommand("1"),
+        CONTEXT,
+    )
+    report = await worker.execute_report_job(
+        WORKSPACE,
+        created.meta.id,
+        report_job.meta.id,
+    )
+    assert report.draft.rubric_scores[0].evidence[0].segment_id == transcript[0].id
+    assert report.draft.rubric_scores[0].evidence[0].quote == transcript[0].text
+
+
+@pytest.mark.asyncio
 async def test_all_twelve_routes_and_workers_form_one_strict_lifecycle() -> None:
     state = State()
     service, worker, _gateway = _services(state)
@@ -883,6 +1072,32 @@ async def test_all_twelve_routes_and_workers_form_one_strict_lifecycle() -> None
     assert utterance.text not in repr(state.realtime_inputs)
     transcript = await service.get_transcript(PRINCIPAL, WORKSPACE, session_id, page)
     assert transcript.items == tuple(state.transcript[session_id])
+    stored_session = state.sessions[session_id]
+    state.sessions[session_id] = replace(
+        stored_session,
+        spec=replace(
+            stored_session.spec,
+            inference=replace(
+                stored_session.spec.inference,
+                allow_external_model_processing=True,
+            ),
+        ),
+        grant=replace(
+            stored_session.grant,
+            external_model_processing=True,
+        ),
+    )
+    coaching = await service.prepare_realtime_coaching(
+        audience,
+        WORKSPACE,
+        session_id,
+        connection.id,
+        media_kind="audio",
+    )
+    assert coaching.scenario_name == "Distributed systems"
+    assert coaching.focus_areas == ("consistency",)
+    assert coaching.transcript[-1].text == utterance.text
+    assert coaching.data_region == "cn"
 
     active_session = state.sessions[session_id]
     end_job = await service.create_end_request(

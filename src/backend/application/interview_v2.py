@@ -13,7 +13,10 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from backend.application.ports.interview_v2 import (
+    EndSessionOutput,
     InterviewCasMismatch,
+    InterviewMediaAnalysis,
+    InterviewMediaAnalyzer,
     InterviewMediaFinalizer,
     InterviewPage,
     InterviewPageRequest,
@@ -128,6 +131,36 @@ class NewOpaqueIdFactory:
     def __call__(self, prefix: str) -> str:
         """@brief 生成新 ID / Generate a new ID."""
         return new_opaque_id(prefix)
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeCoachingContext:
+    """Authorized, bounded context for one low-latency interviewer turn."""
+
+    scenario_name: str
+    scenario_description: str
+    interview_type: str
+    difficulty: str
+    focus_areas: tuple[str, ...]
+    locale: str
+    allow_barge_in: bool
+    transcript: tuple[TranscriptSegment, ...]
+    data_region: str
+
+
+class _NoopInterviewMediaAnalyzer:
+    """Default analyzer for deployments that do not derive transcript evidence from media."""
+
+    async def analyze(
+        self,
+        session: InterviewSession,
+        media: EndSessionOutput,
+        existing_transcript: tuple[TranscriptSegment, ...],
+        *,
+        operation_id: InterviewWorkerOperationId,
+    ) -> InterviewMediaAnalysis:
+        del session, media, existing_transcript, operation_id
+        return InterviewMediaAnalysis()
 
 
 class InterviewApplicationError(Exception):
@@ -255,9 +288,9 @@ class InterviewMediaCapabilities:
         @raise InvalidInterviewCommand 请求了部署无法完成的 recording 时抛出 / Raised when recording is requested but unavailable in this deployment.
         """
 
-        unavailable = (
-            consent.record_audio and not self.audio_recording
-        ) or (consent.record_video and not self.video_recording)
+        unavailable = (consent.record_audio and not self.audio_recording) or (
+            consent.record_video and not self.video_recording
+        )
         if unavailable:
             raise InvalidInterviewCommand(
                 "interview.recording_unavailable",
@@ -705,9 +738,7 @@ class InterviewApplicationService:
                     job,
                     EndSessionJobSpec(session_id, command.reason, before.spec.recording),
                 )
-                await uow.outbox.add(
-                    self._queued_record(after, job, principal.user_id, now)
-                )
+                await uow.outbox.add(self._queued_record(after, job, principal.user_id, now))
                 await uow.audit.add(
                     self._audit(
                         principal,
@@ -804,7 +835,10 @@ class InterviewApplicationService:
                     "the Session already has an Interview Report",
                 )
             frozen = session.spec.rubric_snapshot
-            if command.rubric_version is not None and command.rubric_version != frozen.rubric_version:
+            if (
+                command.rubric_version is not None
+                and command.rubric_version != frozen.rubric_version
+            ):
                 raise InterviewConflict(
                     "interview_report.rubric_mismatch",
                     "the requested Rubric version does not match the frozen Session Rubric",
@@ -824,9 +858,7 @@ class InterviewApplicationService:
                 job,
                 ReportJobSpec(session_id, frozen.rubric_id, frozen.rubric_version),
             )
-            await uow.outbox.add(
-                self._queued_record(session, job, principal.user_id, now)
-            )
+            await uow.outbox.add(self._queued_record(session, job, principal.user_id, now))
             await uow.audit.add(
                 self._audit(
                     principal,
@@ -968,11 +1000,7 @@ class InterviewApplicationService:
             lease = await uow.repository.get_connection_lease(
                 workspace_id, session_id, connection_id
             )
-            if (
-                lease is None
-                or lease.audience != audience
-                or now >= lease.expires_at
-            ):
+            if lease is None or lease.audience != audience or now >= lease.expires_at:
                 raise InterviewResourceNotFound("realtime_connection")
             session = await self._session(uow, workspace_id, session_id)
             if session.view.status not in {
@@ -996,6 +1024,87 @@ class InterviewApplicationService:
                     "recording consent does not allow this media kind",
                 )
             await uow.commit()
+
+    async def prepare_realtime_coaching(
+        self,
+        audience: ResourceRef,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+        connection_id: RealtimeConnectionId,
+        *,
+        media_kind: str | None = None,
+    ) -> RealtimeCoachingContext:
+        """Authorize one live inference turn and return only bounded interview context."""
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            lease = await uow.repository.get_connection_lease(
+                workspace_id, session_id, connection_id
+            )
+            if lease is None or lease.audience != audience or now >= lease.expires_at:
+                raise InterviewResourceNotFound("realtime_connection")
+            session = await self._session(uow, workspace_id, session_id)
+            if session.view.status is not InterviewSessionStatus.ACTIVE:
+                raise InterviewConflict(
+                    "interview_session.not_active",
+                    "realtime coaching requires an active Session",
+                )
+            scenario = await self._scenario(
+                uow,
+                workspace_id,
+                session.spec.scenario_id,
+            )
+            if scenario.meta.revision != session.spec.scenario_revision:
+                raise InterviewConflict(
+                    "interview_session.scenario_revision_mismatch",
+                    "the frozen Scenario revision is unavailable",
+                )
+            if not scenario.spec.allow_followups:
+                raise InterviewConflict(
+                    "interview_session.followups_disabled",
+                    "the Scenario does not allow follow-up questions",
+                )
+            if (
+                not session.grant.external_model_processing
+                or not session.spec.inference.allow_external_model_processing
+            ):
+                raise InterviewConflict(
+                    "interview_session.external_processing_not_allowed",
+                    "live interview inference is not allowed for this Session",
+                )
+            if media_kind is not None:
+                allowed = (
+                    session.spec.media.user_audio
+                    if media_kind == "audio"
+                    else session.spec.media.user_video
+                    if media_kind == "video"
+                    else False
+                )
+                if not allowed:
+                    raise InterviewConflict(
+                        "interview_session.media_input_forbidden",
+                        "the Session does not allow this live media input",
+                    )
+            transcript = (
+                await uow.repository.load_transcript_snapshot(
+                    workspace_id,
+                    session_id,
+                    maximum_segments=2_000,
+                )
+                if session.spec.recording.store_transcript
+                else ()
+            )
+            await uow.commit()
+            return RealtimeCoachingContext(
+                scenario_name=scenario.spec.name,
+                scenario_description=scenario.spec.description,
+                interview_type=scenario.spec.interview_type,
+                difficulty=scenario.spec.difficulty.value,
+                focus_areas=scenario.spec.focus_areas,
+                locale=session.spec.locale,
+                allow_barge_in=scenario.spec.allow_barge_in,
+                transcript=transcript[-40:],
+                data_region=session.spec.inference.data_region.value,
+            )
 
     async def _authorize(
         self,
@@ -1098,6 +1207,7 @@ class InterviewWorkerService:
         uow_factory: InterviewUnitOfWorkFactory,
         media_finalizer: InterviewMediaFinalizer,
         report_provider: InterviewReportProvider,
+        media_analyzer: InterviewMediaAnalyzer | None = None,
         *,
         service_actor: ResourceRef,
         clock: Clock | None = None,
@@ -1114,6 +1224,7 @@ class InterviewWorkerService:
             raise ValueError("Interview worker actor must be an unversioned service ref")
         self._uow_factory = uow_factory
         self._media_finalizer = media_finalizer
+        self._media_analyzer = media_analyzer or _NoopInterviewMediaAnalyzer()
         self._report_provider = report_provider
         self._clock = clock or UtcClock()
         self._ids = id_factory or NewOpaqueIdFactory()
@@ -1150,10 +1261,7 @@ class InterviewWorkerService:
             raise ValueError("Interview worker attempt bounds are invalid")
         async with self._uow_factory() as probe:
             job = await _worker_job(probe, workspace_id, job_id, for_update=False)
-            if (
-                job.subject.resource_type != "interview_session"
-                or job.subject.id != session_id
-            ):
+            if job.subject.resource_type != "interview_session" or job.subject.id != session_id:
                 raise InterviewPortProtocolError(
                     "interview.job_binding_mismatch",
                     "the persisted Interview Job is not bound to the claimed Session",
@@ -1277,11 +1385,7 @@ class InterviewWorkerService:
                     "Interview worker retries exhausted",
                     "The Interview operation could not be completed after bounded retries.",
                 )
-                running_job = (
-                    job.start(at=failed_at)
-                    if job.status is JobStatus.QUEUED
-                    else job
-                )
+                running_job = job.start(at=failed_at) if job.status is JobStatus.QUEUED else job
                 if running_job is not job:
                     await uow.jobs.save(
                         running_job,
@@ -1390,6 +1494,15 @@ class InterviewWorkerService:
                     )
                 else:
                     started_job = job
+                existing_transcript = (
+                    await first.repository.load_transcript_snapshot(
+                        workspace_id,
+                        session_id,
+                        maximum_segments=self._maximum_report_segments,
+                    )
+                    if session.spec.recording.store_transcript
+                    else ()
+                )
                 await first.commit()
         except InterviewCasMismatch as error:
             raise InterviewConflict(
@@ -1403,6 +1516,13 @@ class InterviewWorkerService:
                 operation_id=_worker_operation_id(started_job),
             )
             validate_artifacts_for_session(output.artifacts, session)
+            analysis = await self._media_analyzer.analyze(
+                session,
+                output,
+                existing_transcript,
+                operation_id=_worker_operation_id(started_job),
+            )
+            _validate_media_analysis(analysis, output, session)
         except InterviewWorkerPortFailure as error:
             if error.retryable:
                 raise InterviewWorkerRetry(
@@ -1451,6 +1571,24 @@ class InterviewWorkerService:
                     strict=True,
                 ):
                     await second.artifacts.add(artifact, content)
+                for analyzed in analysis.segments:
+                    reservation = await second.repository.allocate_transcript_sequence(
+                        workspace_id,
+                        session_id,
+                    )
+                    await second.repository.add_transcript_segment(
+                        TranscriptSegment(
+                            id=TranscriptSegmentId(self._ids("segment")),
+                            workspace_id=workspace_id,
+                            session_id=session_id,
+                            sequence=reservation.sequence,
+                            source_ref=analyzed.source_ref,
+                            speaker=analyzed.speaker,
+                            start_ms=analyzed.start_ms,
+                            end_ms=analyzed.end_ms,
+                            text=analyzed.text,
+                        )
+                    )
                 completed = current.finish_end(at=finished_at)
                 completed_job = current_job.succeed(
                     [
@@ -1514,8 +1652,7 @@ class InterviewWorkerService:
                 if job.status is JobStatus.SUCCEEDED:
                     report_id = session.view.report_id
                     if report_id is None or not any(
-                        result.resource_type == "interview_report"
-                        and result.id == report_id
+                        result.resource_type == "interview_report" and result.id == report_id
                         for result in job.result_refs
                     ):
                         raise InterviewPortProtocolError(
@@ -1720,10 +1857,7 @@ class InterviewWorkerService:
                 if job.status.is_terminal:
                     await uow.commit()
                     return
-                if (
-                    job.subject.resource_type != "interview_session"
-                    or job.subject.id != session_id
-                ):
+                if job.subject.resource_type != "interview_session" or job.subject.id != session_id:
                     raise InterviewPortProtocolError(
                         "interview.job_binding_mismatch",
                         "the exhausted Job is not bound to the claimed Session",
@@ -2040,10 +2174,7 @@ def _validate_transcript_snapshot(
     session_id: InterviewSessionId,
 ) -> None:
     """@brief 校验有界 Transcript 快照 / Validate a bounded Transcript snapshot."""
-    if any(
-        item.workspace_id != workspace_id or item.session_id != session_id
-        for item in segments
-    ):
+    if any(item.workspace_id != workspace_id or item.session_id != session_id for item in segments):
         raise InterviewPortProtocolError(
             "interview_transcript.scope_violation",
             "Transcript repository returned a cross-Session segment",
@@ -2060,6 +2191,43 @@ def _validate_transcript_snapshot(
             "interview_transcript.order_violation",
             "Transcript repository returned duplicate or unstable sequence ordering",
         )
+
+
+def _validate_media_analysis(
+    analysis: InterviewMediaAnalysis,
+    output: EndSessionOutput,
+    session: InterviewSession,
+) -> None:
+    """Validate derived evidence against consent and finalized Artifact identity."""
+    if analysis.segments and not session.spec.recording.store_transcript:
+        raise InterviewPortProtocolError(
+            "interview_media.transcript_consent_missing",
+            "media analysis cannot be retained without Transcript consent",
+        )
+    artifact_by_ref = {
+        ResourceRef("artifact", artifact.meta.id, artifact.meta.revision): artifact
+        for artifact in output.artifacts
+    }
+    for segment in analysis.segments:
+        artifact = artifact_by_ref.get(segment.source_ref)
+        if artifact is None:
+            raise InterviewPortProtocolError(
+                "interview_media.analysis_source_mismatch",
+                "media analysis referenced an Artifact outside the finalized Session output",
+            )
+        expected_speaker = (
+            TranscriptSpeaker.CANDIDATE
+            if artifact.kind.value == "interview_audio"
+            else TranscriptSpeaker.SYSTEM
+        )
+        if (
+            artifact.kind.value not in {"interview_audio", "interview_video"}
+            or segment.speaker is not expected_speaker
+        ):
+            raise InterviewPortProtocolError(
+                "interview_media.analysis_kind_mismatch",
+                "media analysis speaker does not match its Artifact kind",
+            )
 
 
 def _workspace_ref(workspace_id: WorkspaceId) -> ResourceRef:

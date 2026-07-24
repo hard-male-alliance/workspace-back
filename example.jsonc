@@ -136,6 +136,17 @@
     "recording_directory": "data/interview-media",
     "media_chunk_max_bytes": 1048576,
     "media_session_max_bytes": 536870912,
+    // 使用与 ai 相同的 OpenRouter endpoint/key；留空会关闭对应分析能力。
+    "stt_model": "openai/whisper-large-v3",
+    "vision_model": "qwen/qwen3-vl-8b-instruct",
+    "media_analysis_timeout_ms": 120000,
+    "media_analysis_max_audio_bytes": 26214400,
+    "media_analysis_max_video_bytes": 52428800,
+    // 视频在受限 ffmpeg 子进程中按固定间隔抽帧，再交给 vision model。
+    "video_frame_interval_seconds": 5,
+    "video_max_frames": 24,
+    "video_frame_max_bytes": 1048576,
+    "ffmpeg_command": "ffmpeg",
     "realtime": {
       // 公开模板不伪造可持久 secret；development/test 未配置时组合根 fail closed。
       // staging/production 必须配置 active key 与对应的无 padding 32-byte base64url key。
@@ -159,7 +170,8 @@
     "timeout_ms": 30000,
     "max_input_bytes": 1048576,
     "max_output_bytes": 10485760,
-    "memory_limit_bytes": 536870912,
+    // CJK TTC 在多个字号/字重下编译真实多段简历需要约 512 MiB 以上虚拟地址空间。
+    "memory_limit_bytes": 1073741824,
     // 为空时 XeLaTeX 适配器只使用内置受控模板，不接受用户路径。
     "allowed_font_directories": [],
     "artifact_directory": "artifacts"

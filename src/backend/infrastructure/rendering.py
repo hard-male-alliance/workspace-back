@@ -394,18 +394,158 @@ def _safe_template(document: dict[str, Any]) -> str:
     @param document 已验证 SIR / Validated SIR.
     @return 无用户 TeX 命令的固定模板 / Fixed template containing no user TeX commands.
     """
-    title = _latex_escape(str(document.get("title", "")))
-    full_name = _latex_escape(str(document.get("profile", {}).get("full_name", "")))
+    profile = _mapping(document.get("profile"))
+    document_title = _latex_escape(_text(document.get("title")))
+    full_name = _latex_escape(_text(profile.get("full_name")))
+    headline = _latex_paragraph(_text(profile.get("headline")))
+    profile_summary = _latex_rich_text(profile.get("summary"))
+    contacts = tuple(
+        rendered
+        for value in _sequence(profile.get("contacts"))
+        if (rendered := _latex_contact(value))
+    )
+    body: list[str] = [
+        "\\begin{center}\n",
+        f"{{\\LARGE\\bfseries {full_name}}}\\\\[4pt]\n",
+    ]
+    if headline:
+        body.append(f"{{\\large {headline}}}\\\\[4pt]\n")
+    if document_title:
+        body.append(f"{{\\small {document_title}}}\\\\[4pt]\n")
+    if contacts:
+        body.append(f"{{\\small {' \\quad | \\quad '.join(contacts)}}}\n")
+    body.append("\\end{center}\n")
+    if profile_summary:
+        body.extend(
+            (
+                "\\section*{Professional Summary}\n",
+                f"{profile_summary}\n",
+            )
+        )
+    for raw_section in _sequence(document.get("sections")):
+        section = _mapping(raw_section)
+        if not section or section.get("visible") is False:
+            continue
+        section_title = _latex_escape(_text(section.get("title")))
+        content = _latex_rich_text(section.get("content"))
+        items = tuple(
+            rendered
+            for value in _sequence(section.get("items"))
+            if (rendered := _latex_item(value))
+        )
+        if not section_title or (not content and not items):
+            continue
+        body.append(f"\\section*{{{section_title}}}\n")
+        if content:
+            body.append(f"{content}\n")
+        body.extend(items)
     return (
         "\\documentclass[10pt]{article}\n"
         "\\usepackage{fontspec}\n"
+        "\\usepackage[margin=16mm]{geometry}\n"
         "\\setmainfont{Noto Sans CJK SC}\n"
-        "\\pagestyle{empty}\n"
+        "\\setlength{\\parindent}{0pt}\n"
+        "\\setlength{\\parskip}{4pt}\n"
+        "\\setcounter{secnumdepth}{0}\n"
+        "\\pagestyle{plain}\n"
         "\\begin{document}\n"
-        f"\\section*{{{title}}}\n"
-        f"{full_name}\n"
-        "\\end{document}\n"
+        + "".join(body)
+        + "\\end{document}\n"
     )
+
+
+def _mapping(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _sequence(value: object) -> tuple[object, ...]:
+    return tuple(value) if isinstance(value, list | tuple) else ()
+
+
+def _text(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _latex_paragraph(value: str) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return "\\par\n".join(_latex_escape(part.strip()) for part in normalized.split("\n"))
+
+
+def _latex_rich_text(value: object) -> str:
+    return _latex_paragraph(_text(_mapping(value).get("text")))
+
+
+def _latex_contact(value: object) -> str:
+    contact = _mapping(value)
+    raw_value = _text(contact.get("value")).strip()
+    if not raw_value:
+        return ""
+    label = _text(contact.get("label")).strip() or _text(contact.get("kind")).strip()
+    rendered_value = _latex_escape(raw_value)
+    return (
+        f"{_latex_escape(label)}: {rendered_value}"
+        if label
+        else rendered_value
+    )
+
+
+def _latex_item(value: object) -> str:
+    item = _mapping(value)
+    if not item or item.get("visible") is False:
+        return ""
+    title = _latex_escape(_text(item.get("title")))
+    organization = _latex_escape(_text(item.get("organization")))
+    subtitle = _latex_escape(_text(item.get("subtitle")))
+    location = _latex_escape(_text(item.get("location")))
+    date_range = _latex_date_range(item.get("date_range"))
+    primary = " — ".join(part for part in (title, organization) if part)
+    secondary = " · ".join(part for part in (subtitle, location) if part)
+    lines: list[str] = []
+    if primary or date_range:
+        lines.append(
+            f"\\textbf{{{primary}}}"
+            + (f"\\hfill {date_range}" if date_range else "")
+            + "\\\\\n"
+        )
+    if secondary:
+        lines.append(f"\\textit{{{secondary}}}\\\\\n")
+    summary = _latex_rich_text(item.get("summary"))
+    if summary:
+        lines.append(f"{summary}\n")
+    highlights = tuple(
+        rendered
+        for raw_highlight in _sequence(item.get("highlights"))
+        if (rendered := _latex_rich_text(raw_highlight))
+    )
+    if highlights:
+        lines.append("\\begin{itemize}\n")
+        lines.extend(f"\\item {highlight}\n" for highlight in highlights)
+        lines.append("\\end{itemize}\n")
+    skills = tuple(
+        _latex_escape(raw_skill)
+        for raw_value in _sequence(item.get("skills"))
+        if (raw_skill := _text(raw_value).strip())
+    )
+    if skills:
+        lines.append(f"\\textbf{{Skills:}} {', '.join(skills)}\n")
+    url = _text(item.get("url")).strip()
+    if url:
+        lines.append(f"\\textbf{{Link:}} {_latex_escape(url)}\n")
+    lines.append("\\medskip\n")
+    return "".join(lines)
+
+
+def _latex_date_range(value: object) -> str:
+    date_range = _mapping(value)
+    if not date_range:
+        return ""
+    start = _text(date_range.get("start")).strip()
+    end = _text(date_range.get("end")).strip()
+    if not start and not end:
+        return ""
+    rendered_start = _latex_escape(start)
+    rendered_end = _latex_escape("Present" if end == "present" else end)
+    return " -- ".join(part for part in (rendered_start, rendered_end) if part)
 
 
 def _latex_escape(value: str) -> str:

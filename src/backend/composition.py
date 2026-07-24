@@ -40,6 +40,7 @@ from backend.application.interview_v2 import (
     InterviewApplicationService as V2InterviewApplicationService,
 )
 from backend.application.interview_v2 import (
+    InterviewMediaCapabilities,
     InterviewPortProtocolError,
     InterviewWorkerService,
 )
@@ -206,6 +207,14 @@ from backend.infrastructure.interview import (
     StaticInterviewSessionPolicy,
 )
 from backend.infrastructure.interview_media import LocalInterviewMediaStore
+from backend.infrastructure.interview_media_analysis import (
+    OpenRouterInterviewMediaAnalyzer,
+    interview_media_analyzer_for,
+)
+from backend.infrastructure.interview_realtime_coaching import (
+    ProviderRealtimeInterviewCoach,
+    RealtimeInterviewCoach,
+)
 from backend.infrastructure.interview_report import (
     DeterministicInterviewReportProvider,
     StreamingJsonInterviewReportProvider,
@@ -435,6 +444,12 @@ class _InterviewRuntimeComponents:
     realtime_verifier: InterviewRealtimeCredentialVerifier
     """@brief signaling 数据面使用的同 keyring 验签端口 / Same-keyring verifier used by the signaling data plane."""
 
+    media_analyzer: OpenRouterInterviewMediaAnalyzer | None
+    """Lifespan-owned external media analyzer, absent when capability is disabled."""
+
+    realtime_coach: RealtimeInterviewCoach
+    """Private WebSocket low-latency transcription and follow-up provider."""
+
 
 class _UnavailableInterviewRealtimeGateway:
     """@brief development/test 未配置 signaling 时显式失败 / Explicitly fail when signaling is unconfigured in development/test."""
@@ -517,6 +532,7 @@ class BackendContainer:
     interview_v2: V2InterviewApplicationService
     interview_realtime_verifier: InterviewRealtimeCredentialVerifier
     interview_media_store: LocalInterviewMediaStore
+    interview_realtime_coach: RealtimeInterviewCoach
     knowledge: KnowledgeApplicationService
     knowledge_v2: V2KnowledgeApplicationService
     knowledge_local_upload_store: LocalSignedUploadStore | None
@@ -582,6 +598,7 @@ async def build_container(
     platform_content_store: ArtifactContentStore
     platform_event_feed: PlatformEventFeed
     memory_access_store: InMemoryAccessStore | None = None
+    interview_media_analyzer: OpenRouterInterviewMediaAnalyzer | None = None
     data_region = DataRegion(settings.workspace_default_data_region)
     try:
         if settings.database.mode == "postgresql":
@@ -668,6 +685,7 @@ async def build_container(
                 None,
                 database,
                 telemetry_database,
+                None,
             )
         except BaseException:
             database_initialization_error.add_note(
@@ -702,6 +720,7 @@ async def build_container(
                 telemetry,
                 database,
                 telemetry_database,
+                None,
             )
         except BaseException:
             runtime_initialization_error.add_note(
@@ -848,6 +867,7 @@ async def build_container(
                 provider=provider,
                 media_store=interview_media_store,
             )
+            interview_media_analyzer = interview_runtime.media_analyzer
             account_deletion = (
                 AccountDeletionExecutionService(
                     PostgresAccountDeletionExecutionPort(
@@ -894,6 +914,7 @@ async def build_container(
                 interview_v2=interview_runtime.application,
                 interview_realtime_verifier=interview_runtime.realtime_verifier,
                 interview_media_store=interview_media_store,
+                interview_realtime_coach=interview_runtime.realtime_coach,
                 knowledge=knowledge,
                 knowledge_v2=knowledge_runtime.application,
                 knowledge_local_upload_store=knowledge_runtime.local_upload_store,
@@ -1053,6 +1074,7 @@ async def build_container(
                 telemetry,
                 database,
                 telemetry_database,
+                interview_media_analyzer,
             )
         except BaseException as error:
             shutdown_failures.append(error)
@@ -1130,9 +1152,7 @@ def _agent_runtime_for(
                 candidate_multiplier=settings.knowledge.search.candidate_multiplier,
             )
         )
-        application = V2AgentApplicationService(
-            cast(AgentUnitOfWorkFactory, postgres_public_uow)
-        )
+        application = V2AgentApplicationService(cast(AgentUnitOfWorkFactory, postgres_public_uow))
         worker = AgentWorkerService(
             cast(AgentWorkerUnitOfWorkFactory, postgres_worker_uow),
             model_adapter,
@@ -1168,16 +1188,12 @@ def _agent_runtime_for(
         policy_store=policy_store,
         model_routes=model_routes,
     )
-    application = V2AgentApplicationService(
-        cast(AgentUnitOfWorkFactory, memory_public_uow)
-    )
+    application = V2AgentApplicationService(cast(AgentUnitOfWorkFactory, memory_public_uow))
     worker = AgentWorkerService(
         cast(AgentWorkerUnitOfWorkFactory, memory_worker_uow),
         model_adapter,
         tool_executor,
-        knowledge_retriever=GrantedAgentKnowledgeRetriever(
-            MemoryHybridKnowledgeSearch(())
-        ),
+        knowledge_retriever=GrantedAgentKnowledgeRetriever(MemoryHybridKnowledgeSearch(())),
         tool_registry=tool_registry,
     )
     dispatcher = InMemoryAgentDispatchService(store, worker)
@@ -1276,6 +1292,8 @@ def _interview_runtime_for(
             None,
             realtime_gateway,
             realtime_gateway,
+            None,
+            ProviderRealtimeInterviewCoach(provider, None),
         )
 
     if memory_access_store is not None:
@@ -1291,12 +1309,26 @@ def _interview_runtime_for(
             service_actor=service_actor,
         ),
     )
-    application = V2InterviewApplicationService(postgres_uow, realtime_gateway)
+    application = V2InterviewApplicationService(
+        postgres_uow,
+        realtime_gateway,
+        media_capabilities=InterviewMediaCapabilities(
+            audio_recording=True,
+            video_recording=True,
+        ),
+    )
     dispatch_settings = OutboxDispatchSettings()
+    media_analyzer = interview_media_analyzer_for(
+        settings.ai,
+        settings.interview,
+        settings.network,
+        environment=settings.environment,
+    )
     worker = InterviewWorkerService(
         postgres_uow,
         ConsentAwareInterviewMediaFinalizer(media_store),
         _interview_report_provider(settings, provider, primary_model_route),
+        media_analyzer,
         service_actor=service_actor,
     )
     handler = InterviewJobOutboxHandler(
@@ -1312,7 +1344,14 @@ def _interview_runtime_for(
         required_event_types=INTERVIEW_WORK_EVENT_TYPES,
         settings=dispatch_settings,
     )
-    return _InterviewRuntimeComponents(application, dispatcher, realtime_gateway, realtime_gateway)
+    return _InterviewRuntimeComponents(
+        application,
+        dispatcher,
+        realtime_gateway,
+        realtime_gateway,
+        media_analyzer,
+        ProviderRealtimeInterviewCoach(provider, media_analyzer),
+    )
 
 
 def _interview_report_provider(
@@ -2320,10 +2359,12 @@ async def _close_runtime_resources(
     telemetry: ObservabilityPipeline | None,
     database: AsyncDatabase | None,
     telemetry_database: AsyncDatabase | None,
+    interview_media_analyzer: OpenRouterInterviewMediaAnalyzer | None = None,
 ) -> None:
     """@brief 尽力关闭全部资源并在最后保留首个失败 / Close every resource and preserve the first failure.
 
     @param provider 可空模型 provider / Optional model provider.
+    @param interview_media_analyzer 可空音视频分析 provider / Optional audio/video-analysis provider.
     @param logging_runtime 可空日志资源 / Optional logging resources.
     @param telemetry 可空、但若已创建则必须最终刷新的遥测管线 / Optional telemetry pipeline that must receive a final flush attempt once created.
     @param database 可空业务数据库 / Optional business database.
@@ -2340,6 +2381,11 @@ async def _close_runtime_resources(
     if provider is not None:
         try:
             await _close_provider(provider)
+        except BaseException as error:
+            failures.append(error)
+    if interview_media_analyzer is not None:
+        try:
+            await interview_media_analyzer.aclose()
         except BaseException as error:
             failures.append(error)
     if logging_runtime is not None:
