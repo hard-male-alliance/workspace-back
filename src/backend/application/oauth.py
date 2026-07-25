@@ -56,10 +56,13 @@ class OAuthAuthorizationService:
         repository: OAuthAuthorizationRequestRepository,
         settings: OAuthSettings,
         token_signer: OAuthTokenIssuerVerifier,
+        *,
+        authorization_response_issuer: str,
     ) -> None:
         self._repository = repository
         self._settings = settings
         self._token_signer = token_signer
+        self._authorization_response_issuer = authorization_response_issuer
         self._clients = {client.client_id: client for client in settings.public_clients}
 
     async def begin_authorization(
@@ -196,7 +199,13 @@ class OAuthAuthorizationService:
             )
         parsed = urlsplit(request.redirect_uri)
         query = parse_qsl(parsed.query, keep_blank_values=True)
-        query.extend((("code", raw_code), ("state", request.state)))
+        query.extend(
+            (
+                ("code", raw_code),
+                ("state", request.state),
+                ("iss", self._authorization_response_issuer),
+            )
+        )
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), ""))
 
     async def exchange_authorization_code(

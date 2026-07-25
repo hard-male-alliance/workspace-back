@@ -791,6 +791,7 @@ async def build_container(
                 oauth_repository,
                 settings.oauth,
                 oauth_token_signer,
+                authorization_response_issuer=PUBLIC_ORIGIN,
             )
             identity_email_runtime = _identity_email_runtime_for(
                 settings,

@@ -58,6 +58,7 @@ def _authorize_and_complete(
     )
     query = parse_qs(urlsplit(callback).query)
     assert query["state"] == ["state-token-flow"]
+    assert query["iss"] == ["https://api.hmalliances.org"]
     return query["code"][0]
 
 
