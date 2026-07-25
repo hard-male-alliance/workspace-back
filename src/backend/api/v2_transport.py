@@ -16,7 +16,7 @@ from typing import Annotated, cast
 from fastapi import Path, Query, Request
 from fastapi.responses import Response
 
-from backend.api.constants import PROTECTED_RESOURCE_METADATA_URL
+from backend.api.constants import PROTECTED_RESOURCE_METADATA_URL, PUBLIC_ORIGIN
 from backend.api.v2_http import (
     JSON_MEDIA_TYPE,
     MERGE_PATCH_MEDIA_TYPE,
@@ -319,7 +319,9 @@ def replayable_json(
     if etag:
         headers.append(("ETag", strong_etag(payload)))
     if location is not None:
-        headers.append(("Location", location))
+        if not location.startswith("/api/v2/"):
+            raise ValueError("API v2 replayable Location must be a canonical API path")
+        headers.append(("Location", f"{PUBLIC_ORIGIN}{location}"))
     return ReplayableResponse(
         status_code,
         tuple(headers),

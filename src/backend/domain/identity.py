@@ -6,6 +6,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 
+def canonicalize_email(value: str) -> str:
+    """Return the single canonical email representation used by identity persistence."""
+
+    return value.strip().lower()
+
+
 def utc_timestamp(value: datetime) -> str:
     """Render the v2 contract's canonical UTC ``Z`` timestamp."""
 

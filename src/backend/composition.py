@@ -801,6 +801,9 @@ async def build_container(
                 hosted_identity_repository,
                 oauth_service,
                 identity_email_runtime.sender,
+                demo_password_auth_enabled=(
+                    settings.hosted_identity.demo_password_auth_enabled
+                ),
                 breached_password_checker=breached_password_checker,
                 lifetime_seconds=settings.hosted_identity.flow_ttl_seconds,
                 email_code_ttl_seconds=settings.hosted_identity.email_code_ttl_seconds,

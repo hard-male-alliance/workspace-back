@@ -161,6 +161,7 @@ class PasswordBreachSettings:
 class HostedIdentitySettings:
     """Hosted identity security lifetimes and delivery settings."""
 
+    demo_password_auth_enabled: bool
     flow_ttl_seconds: int
     email_code_ttl_seconds: int
     email_code_max_attempts: int
@@ -3504,6 +3505,7 @@ def _hosted_identity_settings(value: object, environment: str) -> HostedIdentity
                 "hosted_identity configuration is required outside development/test"
             )
         return HostedIdentitySettings(
+            demo_password_auth_enabled=False,
             flow_ttl_seconds=600,
             email_code_ttl_seconds=600,
             email_code_max_attempts=5,
@@ -3515,6 +3517,15 @@ def _hosted_identity_settings(value: object, environment: str) -> HostedIdentity
             password_breach=PasswordBreachSettings("disabled", 3_000, 21_600, 4_096),
         )
     mapping = require_mapping(value, "hosted_identity")
+    demo_password_auth_enabled = mapping.get("demo_password_auth_enabled", False)
+    if not isinstance(demo_password_auth_enabled, bool):
+        raise ConfigurationError(
+            "hosted_identity.demo_password_auth_enabled must be a boolean"
+        )
+    if demo_password_auth_enabled and environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS:
+        raise ConfigurationError(
+            "hosted_identity.demo_password_auth_enabled is restricted to development/test"
+        )
     flow_ttl = _require_positive_int(mapping, "flow_ttl_seconds")
     code_ttl = _require_positive_int(mapping, "email_code_ttl_seconds")
     attempts = _require_positive_int(mapping, "email_code_max_attempts")
@@ -3600,6 +3611,7 @@ def _hosted_identity_settings(value: object, environment: str) -> HostedIdentity
             "hosted_identity.password_breach.mode must be pwned_passwords outside development/test"
         )
     return HostedIdentitySettings(
+        demo_password_auth_enabled,
         flow_ttl,
         code_ttl,
         attempts,
