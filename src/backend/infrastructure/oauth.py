@@ -111,6 +111,7 @@ class InMemoryOAuthAuthorizationRequestRepository:
         refresh_token_id: str | None,
         refresh_token_hash: str | None,
         refresh_expires_at: datetime | None,
+        origin_cutover_at: datetime | None = None,
     ) -> AuthorizationCodeExchange | None:
         async with self._lock:
             code = self._codes.get(code_hash)
@@ -124,6 +125,10 @@ class InMemoryOAuthAuthorizationRequestRepository:
                 or request.client_id != client_id
                 or request.redirect_uri != redirect_uri
                 or request.code_challenge != verifier_challenge
+                or (
+                    origin_cutover_at is not None
+                    and request.created_at < origin_cutover_at
+                )
             ):
                 return None
             code["consumed_at"] = now
@@ -141,6 +146,7 @@ class InMemoryOAuthAuthorizationRequestRepository:
                     "client_id": client_id,
                     "login_session_id": code["login_session_id"],
                     "scopes": request.scopes,
+                    "created_at": now,
                     "revoked_at": None,
                     "reuse_detected_at": None,
                 }
@@ -170,6 +176,7 @@ class InMemoryOAuthAuthorizationRequestRepository:
         replacement_token_id: str,
         replacement_token_hash: str,
         replacement_expires_at: datetime,
+        origin_cutover_at: datetime | None = None,
     ) -> RefreshTokenRotation | None:
         reuse_detected = False
         rotation: RefreshTokenRotation | None = None
@@ -183,6 +190,10 @@ class InMemoryOAuthAuthorizationRequestRepository:
                 family["revoked_at"] is not None
                 or token["expires_at"] <= now
                 or family["client_id"] != client_id
+                or (
+                    origin_cutover_at is not None
+                    and family["created_at"] < origin_cutover_at
+                )
             ):
                 return None
             if token["consumed_at"] is not None:
@@ -363,6 +374,7 @@ class PostgresOAuthAuthorizationRequestRepository:
         refresh_token_id: str | None,
         refresh_token_hash: str | None,
         refresh_expires_at: datetime | None,
+        origin_cutover_at: datetime | None = None,
     ) -> AuthorizationCodeExchange | None:
         async with self._database.unscoped_transaction() as session:
             code = await session.scalar(
@@ -378,6 +390,10 @@ class PostgresOAuthAuthorizationRequestRepository:
                 or code.client_id != client_id
                 or code.redirect_uri != redirect_uri
                 or code.code_challenge != verifier_challenge
+                or (
+                    origin_cutover_at is not None
+                    and code.created_at < origin_cutover_at
+                )
             ):
                 return None
             code.consumed_at = now
@@ -428,6 +444,7 @@ class PostgresOAuthAuthorizationRequestRepository:
         replacement_token_id: str,
         replacement_token_hash: str,
         replacement_expires_at: datetime,
+        origin_cutover_at: datetime | None = None,
     ) -> RefreshTokenRotation | None:
         reuse_detected = False
         rotation: RefreshTokenRotation | None = None
@@ -451,6 +468,10 @@ class PostgresOAuthAuthorizationRequestRepository:
                 family.revoked_at is not None
                 or token.expires_at <= now
                 or family.client_id != client_id
+                or (
+                    origin_cutover_at is not None
+                    and family.created_at < origin_cutover_at
+                )
             ):
                 return None
             if token.consumed_at is not None:

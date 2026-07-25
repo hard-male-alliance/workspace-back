@@ -730,7 +730,7 @@ class HostedIdentityService:
                     credential=_registration_credential(credential),
                     expected_challenge=raw_challenge,
                     expected_rp_id="api.hmalliances.org",
-                    expected_origin="https://api.hmalliances.org:8022",
+                    expected_origin="https://api.hmalliances.org",
                     require_user_presence=True,
                     require_user_verification=True,
                 )
@@ -774,7 +774,7 @@ class HostedIdentityService:
                 credential=_authentication_credential(credential),
                 expected_challenge=raw_challenge,
                 expected_rp_id="api.hmalliances.org",
-                expected_origin="https://api.hmalliances.org:8022",
+                expected_origin="https://api.hmalliances.org",
                 credential_public_key=_unb64(passkey.verifier),
                 credential_current_sign_count=current_count,
                 require_user_verification=True,

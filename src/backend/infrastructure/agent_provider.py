@@ -710,7 +710,7 @@ def _problem(
     """
 
     return ProblemDetails(
-        type_uri="https://api.hmalliances.org:8022/problems/" + code.replace(".", "/"),
+        type_uri="https://api.hmalliances.org/problems/" + code.replace(".", "/"),
         title=title,
         status=status,
         code=code,

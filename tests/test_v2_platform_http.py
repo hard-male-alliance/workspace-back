@@ -254,7 +254,7 @@ def _artifact() -> Artifact:
         len(CONTENT),
         CONTENT_SHA256,
         ApiArtifactContentUrl.build(
-            "https://api.hmalliances.org:8022",
+            "https://api.hmalliances.org",
             WORKSPACE_ID,
             ARTIFACT_ID,
         ),

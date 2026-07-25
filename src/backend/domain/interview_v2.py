@@ -1409,8 +1409,10 @@ def _require_realtime_url(value: str) -> None:
     production = parsed.scheme in {"https", "wss"} and parsed.hostname is not None
     development = (
         parsed.scheme in {"http", "ws"}
-        and parsed.hostname == "dev.hmalliances.org"
-        and parsed.port == 9000
+        and (
+            (parsed.hostname == "dev.hmalliances.org" and parsed.port == 9000)
+            or (parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port == 8000)
+        )
     )
     if parsed.username or not (production or development):
         raise InterviewDomainError("realtime signaling URL is invalid")

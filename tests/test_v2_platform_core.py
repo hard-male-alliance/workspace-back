@@ -143,7 +143,7 @@ def _problem() -> ProblemDetails:
     @return 结构化 problem / Structured problem.
     """
     return ProblemDetails(
-        "https://api.hmalliances.org:8022/problems/job/render-failed",
+        "https://api.hmalliances.org/problems/job/render-failed",
         "Render failed",
         503,
         "job.render_failed",
@@ -194,7 +194,7 @@ def _artifact(
         len(PAYLOAD),
         digest,
         ApiArtifactContentUrl.build(
-            "https://api.hmalliances.org:8022",
+            "https://api.hmalliances.org",
             workspace_id,
             artifact_id,
         ),
@@ -335,7 +335,7 @@ def test_artifact_content_location_digest_media_and_source_map_are_coherent() ->
     with pytest.raises(PlatformDomainError, match="exactly identify"):
         ApiArtifactContentUrl(
             "https://evil.example/api/v2/workspaces/ws_00000001/artifacts/artifact_00000001/content",
-            "https://api.hmalliances.org:8022",
+            "https://api.hmalliances.org",
             WORKSPACE_ID,
             ARTIFACT_ID,
         )

@@ -2531,7 +2531,7 @@ def _service_ref() -> ResourceRef:
 def _tool_approval_expired_problem(request_id: str) -> ProblemDetails:
     """@brief 构造不泄漏工具参数的 expiry ProblemDetails / Build expiry ProblemDetails without tool-argument leakage."""
     return ProblemDetails(
-        type_uri="https://api.hmalliances.org:8022/problems/agent/tool-approval-expired",
+        type_uri="https://api.hmalliances.org/problems/agent/tool-approval-expired",
         title="Tool approval expired",
         status=409,
         code="tool_approval.expired",
@@ -2548,7 +2548,7 @@ def _unexpected_provider_problem(run_id: AgentRunId) -> ProblemDetails:
     @return 可安全持久化的问题 / Problem safe to persist.
     """
     return ProblemDetails(
-        type_uri="https://api.hmalliances.org:8022/problems/agent/provider-failed",
+        type_uri="https://api.hmalliances.org/problems/agent/provider-failed",
         title="Model provider failed",
         status=503,
         code="agent.provider_failed",
@@ -2565,7 +2565,7 @@ def _provider_protocol_problem(run_id: AgentRunId) -> ProblemDetails:
     @return 不包含模型原文的问题 / Problem containing no model output.
     """
     return ProblemDetails(
-        type_uri="https://api.hmalliances.org:8022/problems/agent/provider-protocol-error",
+        type_uri="https://api.hmalliances.org/problems/agent/provider-protocol-error",
         title="Model provider returned an invalid structured response",
         status=502,
         code="agent.provider_protocol_error",
@@ -2583,7 +2583,7 @@ def _authorization_revoked_problem(run_id: AgentRunId) -> ProblemDetails:
     """
     return ProblemDetails(
         type_uri=(
-            "https://api.hmalliances.org:8022/problems/"
+            "https://api.hmalliances.org/problems/"
             "agent/execution-authorization-revoked"
         ),
         title="Agent execution is no longer authorized",
@@ -2602,7 +2602,7 @@ def _knowledge_retrieval_problem(run_id: AgentRunId) -> ProblemDetails:
     @return 可安全持久化的问题 / Safely persistable problem.
     """
     return ProblemDetails(
-        type_uri="https://api.hmalliances.org:8022/problems/agent/knowledge-unavailable",
+        type_uri="https://api.hmalliances.org/problems/agent/knowledge-unavailable",
         title="Authorized Knowledge retrieval is unavailable",
         status=503,
         code="agent.knowledge_retrieval_failed",
@@ -2619,7 +2619,7 @@ def _tool_unavailable_problem(run_id: AgentRunId) -> ProblemDetails:
     @return 明确且不暴露 invocation 的问题 / Explicit problem without invocation data.
     """
     return ProblemDetails(
-        type_uri="https://api.hmalliances.org:8022/problems/agent/tool-unavailable",
+        type_uri="https://api.hmalliances.org/problems/agent/tool-unavailable",
         title="Requested Agent tool is unavailable",
         status=422,
         code="agent.tool_unavailable",
@@ -2637,7 +2637,7 @@ def _tool_rejected_problem(event_id: AgentOutboxId) -> ProblemDetails:
     """
 
     return ProblemDetails(
-        type_uri="https://api.hmalliances.org:8022/problems/agent/tool-call-rejected",
+        type_uri="https://api.hmalliances.org/problems/agent/tool-call-rejected",
         title="Tool call rejected",
         status=409,
         code="tool_approval.rejected",
@@ -2655,7 +2655,7 @@ def _tool_execution_failed_problem(event_id: AgentOutboxId) -> ProblemDetails:
     """
 
     return ProblemDetails(
-        type_uri="https://api.hmalliances.org:8022/problems/agent/tool-execution-failed",
+        type_uri="https://api.hmalliances.org/problems/agent/tool-execution-failed",
         title="Tool execution failed",
         status=503,
         code="agent.tool_execution_failed",
@@ -2673,7 +2673,7 @@ def _dispatch_exhausted_problem(event_id: AgentOutboxId) -> ProblemDetails:
         text or private payload data.
     """
     return ProblemDetails(
-        type_uri="https://api.hmalliances.org:8022/problems/agent/dispatch-exhausted",
+        type_uri="https://api.hmalliances.org/problems/agent/dispatch-exhausted",
         title="Agent execution could not be completed",
         status=503,
         code="agent.dispatch_exhausted",

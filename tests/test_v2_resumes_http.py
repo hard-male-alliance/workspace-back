@@ -606,7 +606,7 @@ def test_resume_crud_revisions_operations_and_jobs_follow_the_published_contract
             WORKSPACE_ID,
             "upload_http_000001",
             completed_at=NOW,
-            expires_at=NOW + timedelta(days=1),
+            expires_at=max(NOW, datetime.now(UTC)) + timedelta(days=1),
         )
         imported = harness.client.post(
             f"/api/v2/workspaces/{WORKSPACE_ID}/resume-import-jobs",

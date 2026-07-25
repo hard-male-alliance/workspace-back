@@ -572,6 +572,8 @@ async def build_container(
         settings.oauth.signing_private_key_paths,
         runtime_root=runtime_root,
         allow_generate=settings.environment in {"development", "test"},
+        origin_cutover_at=settings.oauth.origin_cutover_at,
+        legacy_access_token_accept_until=settings.oauth.legacy_access_token_accept_until,
     )
     supervisor = BoundedTaskSupervisor(
         (

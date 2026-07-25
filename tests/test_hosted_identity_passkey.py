@@ -16,7 +16,7 @@ from backend.api.constants import PUBLIC_ORIGIN
 from backend.api.identity import IDENTITY_BROWSER_COOKIE
 
 _CSRF_PATTERN = re.compile(r'data-csrf-token="([A-Za-z0-9_-]+)"')
-_ORIGIN = "https://api.hmalliances.org:8022"
+_ORIGIN = "https://api.hmalliances.org"
 _RP_ID = "api.hmalliances.org"
 _PASSWORD = "correct horse battery staple"
 

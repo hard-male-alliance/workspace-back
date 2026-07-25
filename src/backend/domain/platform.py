@@ -987,7 +987,11 @@ def _require_network_origin(value: str) -> None:
     except ValueError as exc:
         raise PlatformDomainError("API origin is invalid") from exc
     is_https = parsed.scheme == "https" and parsed.hostname is not None
-    is_dev = value == "http://dev.hmalliances.org:9000"
+    is_dev = value in {
+        "http://dev.hmalliances.org:9000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+    }
     if (
         not (is_https or is_dev)
         or parsed.username is not None

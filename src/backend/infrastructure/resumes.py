@@ -157,7 +157,7 @@ _RECEIPT_RETENTION = timedelta(days=30)
 _EVENT_RETENTION = timedelta(days=30)
 """@brief Resume 通知的 replay 保留期 / Replay retention for Resume notifications."""
 
-_DEFAULT_ARTIFACT_API_ORIGIN = "https://api.hmalliances.org:8022"
+_DEFAULT_ARTIFACT_API_ORIGIN = "https://api.hmalliances.org"
 """@brief 未显式注入时使用的契约公开 Origin / Contract public Origin used when not explicitly injected."""
 
 type _MutablePlatformJson = (

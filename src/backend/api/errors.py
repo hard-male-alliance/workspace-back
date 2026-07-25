@@ -136,7 +136,7 @@ def api_problem_response(request: Request, problem: Problem) -> JSONResponse:
             status_code=problem.status,
             content={
                 "type": (
-                    "https://api.hmalliances.org:8022/problems/" + problem.code.replace(".", "/")
+                    "https://api.hmalliances.org/problems/" + problem.code.replace(".", "/")
                 ),
                 "title": problem.title,
                 "status": problem.status,

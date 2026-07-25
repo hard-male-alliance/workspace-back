@@ -80,7 +80,7 @@ def _production_root() -> dict[str, Any]:
 
     root = _postgres_root()
     root["environment"] = "production"
-    root["network"]["public_base_url"] = "https://api.hmalliances.org:8022"
+    root["network"]["public_base_url"] = "https://api.hmalliances.org"
     root["resume_rendering"]["adapter"] = "xelatex"
     root["ai"].update(
         {
@@ -143,7 +143,7 @@ def _production_root() -> dict[str, Any]:
                 "active_key_id": "interview-2026-07",
                 "keys": {"interview-2026-07": _encoded_key(20)},
             },
-            "signaling_url": "wss://realtime.hmalliances.org/v2/interview",
+            "signaling_url": "wss://api.hmalliances.org/realtime/v2/interview",
         }
     )
     return root

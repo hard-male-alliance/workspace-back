@@ -167,7 +167,7 @@ def _artifact() -> Artifact:
         len(CONTENT),
         sha256(CONTENT).hexdigest(),
         ApiArtifactContentUrl.build(
-            "https://api.hmalliances.org:8022",
+            "https://api.hmalliances.org",
             WORKSPACE_ID,
             ARTIFACT_ID,
         ),
@@ -1174,7 +1174,7 @@ async def test_postgres_platform_adapters_complete_authorized_product_flow(
     )
     factory = PostgresPlatformUnitOfWorkFactory(
         database,
-        api_origin="https://api.hmalliances.org:8022",
+        api_origin="https://api.hmalliances.org",
         event_poll_interval=0.01,
     )
     service = PlatformApplicationService(

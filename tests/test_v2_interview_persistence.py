@@ -1215,7 +1215,7 @@ async def test_generic_job_cancellation_atomically_cancels_queued_interview_end(
     )
     platform_factory = PostgresPlatformUnitOfWorkFactory(
         database,
-        api_origin="https://api.hmalliances.org:8022",
+        api_origin="https://api.hmalliances.org",
         event_poll_interval=0.01,
     )
     platform = PlatformApplicationService(
