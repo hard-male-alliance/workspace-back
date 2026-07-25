@@ -34,6 +34,8 @@ from backend.domain.common import DomainError
 from backend.domain.platform import ProblemDetails
 from backend.domain.ports import ModelProvider
 from backend.domain.resources import ResourceRef
+from backend.domain.resume_editing import build_resume_edit_policy
+from backend.domain.resume_quality import analyze_resume_quality
 from backend.domain.resumes import ResumeDocument
 
 _MAX_OUTPUT_CHARACTERS = 200_000
@@ -354,6 +356,17 @@ def _provider_request(request: AgentProviderRequest) -> dict[str, Any]:
     resume_root_id: str | None = None
     if request.resume_context is not None:
         resume_root_id = request.resume_context.resume_ref.id
+        quality_report = analyze_resume_quality(request.resume_context.document)
+        user_instruction = "\n".join(
+            part.text
+            for part in request.input_message.content
+            if isinstance(part, TextContentPart)
+        )
+        edit_policy = build_resume_edit_policy(
+            request.resume_context.document,
+            user_instruction,
+            has_authorized_evidence=bool(request.knowledge_evidence),
+        )
         messages.append(
             {
                 "role": "tool",
@@ -364,6 +377,20 @@ def _provider_request(request: AgentProviderRequest) -> dict[str, Any]:
                             "Return reviewable operation drafts only. "
                             "Do not claim that the Resume was changed."
                         ),
+                        "quality_report": {
+                            "score": quality_report.score,
+                            "diagnostics": [
+                                {
+                                    "code": diagnostic.code,
+                                    "severity": diagnostic.severity.value,
+                                    "message": diagnostic.message,
+                                    "entity_id": diagnostic.entity_id,
+                                    "field_path": list(diagnostic.field_path),
+                                }
+                                for diagnostic in quality_report.diagnostics
+                            ],
+                        },
+                        "edit_policy": edit_policy.as_provider_policy(),
                         "resume_ref": {
                             "type": request.resume_context.resume_ref.resource_type,
                             "id": request.resume_context.resume_ref.id,

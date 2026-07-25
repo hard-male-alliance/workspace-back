@@ -54,6 +54,40 @@ _BUILTIN_TEMPLATE_MANIFESTS: tuple[dict[str, Any], ...] = (
         },
         "extensions": {},
     },
+    {
+        "id": "tpl_ats_v1",
+        "created_at": "2026-07-24T00:00:00Z",
+        "updated_at": "2026-07-24T00:00:00Z",
+        "revision": 1,
+        "template_version": "1.0",
+        "name": "ATS Single Column",
+        "description": "A restrained single-column template optimized for text extraction and applicant tracking systems.",
+        "preview_asset_url": None,
+        "supported_locales": ["zh-CN", "zh-SG", "en-US"],
+        "supported_page_sizes": ["A4", "LETTER"],
+        "supported_output_formats": ["pdf"],
+        "supported_section_kinds": _SUPPORTED_SECTION_KINDS,
+        "zones": [
+            {
+                "zone_id": "main",
+                "label_key": "template.zone.main",
+                "accepted_section_kinds": _SUPPORTED_SECTION_KINDS,
+                "max_sections": 100,
+            }
+        ],
+        "font_family_tokens": ["body.default"],
+        "date_format_tokens": ["yyyy_mm"],
+        "bullet_style_tokens": ["bullet.default"],
+        "settings": [],
+        "capabilities": {
+            "supports_photo": False,
+            "supports_sidebar": False,
+            "supports_custom_sections": True,
+            "supports_source_map": True,
+            "max_columns": 1,
+        },
+        "extensions": {"ats_friendly": True},
+    },
 )
 
 

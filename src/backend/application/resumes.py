@@ -25,6 +25,7 @@ from backend.domain.principals import (
     WorkspaceAction,
     WorkspaceId,
 )
+from backend.domain.resume_comparison import ResumeComparison, compare_resumes
 from backend.domain.resume_jobs import (
     RenderFormat,
     RenderMode,
@@ -506,6 +507,43 @@ class ResumeApplicationService:
             if item is None:
                 raise ResumeResourceNotFound("resume_revision")
             return item
+
+    async def compare_revisions(
+        self,
+        principal: TokenPrincipal,
+        workspace_id: WorkspaceId,
+        left_resume_id: ResumeId,
+        left_revision: int,
+        right_resume_id: ResumeId,
+        right_revision: int,
+    ) -> ResumeComparison:
+        """Compare two exact authorized snapshots without exposing field values."""
+
+        async with self._uow_factory() as uow:
+            await self._authorize(
+                uow,
+                principal,
+                workspace_id,
+                WorkspaceAction.READ_RESUME_REVISIONS,
+            )
+            left = await uow.repository.get_revision(
+                workspace_id,
+                left_resume_id,
+                left_revision,
+            )
+            right = await uow.repository.get_revision(
+                workspace_id,
+                right_resume_id,
+                right_revision,
+            )
+            if left is None or right is None:
+                raise ResumeResourceNotFound("resume_revision")
+            if (
+                left.document.workspace_id != workspace_id
+                or right.document.workspace_id != workspace_id
+            ):
+                raise ResumeResourceNotFound("resume_revision")
+            return compare_resumes(left.document, right.document)
 
     async def apply_operations(
         self,

@@ -789,6 +789,16 @@ async def test_application_crud_writes_revisions_outbox_and_enforces_cas() -> No
     )
     assert [item.revision for item in revisions.items] == [1, 2]
     assert (await service.get_revision(principal, WORKSPACE_ID, created.meta.id, 1)).document.title == "Backend Resume"
+    comparison = await service.compare_revisions(
+        principal,
+        WORKSPACE_ID,
+        created.meta.id,
+        1,
+        created.meta.id,
+        2,
+    )
+    assert comparison.changed is True
+    assert comparison.findings[0].field_paths == (("title",),)
 
     with pytest.raises(ResumePreconditionFailed):
         await service.update_resume_metadata(
@@ -806,6 +816,47 @@ async def test_application_crud_writes_revisions_outbox_and_enforces_cas() -> No
     )
     assert len(store.events) == 3
     assert store.commits == 3
+
+
+@pytest.mark.asyncio
+async def test_create_resume_can_atomically_derive_an_independent_variant() -> None:
+    """A variant copies content but receives independent identity, revision, and metadata."""
+
+    store = MemoryStore()
+    service = _service(store)
+    principal = _principal("resume.read", "resume.write")
+    source = await service.create_resume(
+        principal,
+        WORKSPACE_ID,
+        CreateResumeCommand("通用后端简历", "zh-CN", TEMPLATE_REF),
+    )
+
+    variant = await service.create_resume(
+        principal,
+        WORKSPACE_ID,
+        CreateResumeCommand(
+            "国际化后端简历",
+            "en-US",
+            TEMPLATE_REF,
+            clone_from_resume_id=source.meta.id,
+        ),
+    )
+
+    persisted_source = await service.get_resume(
+        principal,
+        WORKSPACE_ID,
+        source.meta.id,
+    )
+    assert variant.meta.id != source.meta.id
+    assert variant.meta.revision == 1
+    assert variant.title == "国际化后端简历"
+    assert variant.locale == "en-US"
+    assert variant.profile == source.profile
+    assert variant.sections == source.sections
+    assert variant.knowledge_source_id is None
+    assert persisted_source.title == "通用后端简历"
+    assert persisted_source.locale == "zh-CN"
+    assert store.commits == 2
 
 
 @pytest.mark.asyncio
