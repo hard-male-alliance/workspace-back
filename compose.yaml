@@ -206,7 +206,7 @@ services:
       - runtime_config:/var/lib/aiws-config:ro
       - application_data:/var/lib/aiws
     ports:
-      - "127.0.0.1:${AIWS_BACKEND_PORT:-9000}:9000"
+      - "127.0.0.1:${AIWS_BACKEND_PORT:-8000}:8000"
     healthcheck:
       test:
         - CMD
@@ -214,7 +214,7 @@ services:
         - -c
         - >-
           import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:9000/_internal/healthz', timeout=2).read()
+          urllib.request.urlopen('http://127.0.0.1:8000/_internal/healthz', timeout=2).read()
       interval: 10s
       timeout: 3s
       retries: 6

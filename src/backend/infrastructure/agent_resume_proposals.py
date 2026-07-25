@@ -717,7 +717,7 @@ def _durable_runtime_failure(request_id: str) -> AgentProposalFailure:
     return AgentProposalFailure(
         ProblemDetails(
             type_uri=(
-                "https://api.hmalliances.org:8022/problems/"
+                "https://api.hmalliances.org/problems/"
                 "service/durable_runtime_required"
             ),
             title="This operation requires the durable service runtime",
@@ -746,7 +746,7 @@ def _proposal_failure(
 
     return AgentProposalFailure(
         ProblemDetails(
-            type_uri="https://api.hmalliances.org:8022/problems/" + code.replace(".", "/"),
+            type_uri="https://api.hmalliances.org/problems/" + code.replace(".", "/"),
             title=title,
             status=status,
             code=code,

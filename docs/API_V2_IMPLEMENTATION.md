@@ -258,8 +258,8 @@ retention 语义，因此没有被强塞进通用 outbox 表。
 
 ## 8. 部署语义
 
-Production origin、issuer 和 resource 固定为 `https://api.hmalliances.org:8022`；应用只监听
-`127.0.0.1:9000`。Nginx 覆盖 `Forwarded/X-Forwarded-*`、剥离 legacy/mock identity headers、
+Production origin、issuer 和 resource 固定为 `https://api.hmalliances.org`；应用只监听
+`127.0.0.1:8000`。Nginx 覆盖 `Forwarded/X-Forwarded-*`、剥离 legacy/mock identity headers、
 为 SSE 禁用 buffering，并将内部 health 固定在 loopback 运维 listener。
 
 staging/production 配置解析器拒绝：memory database、V1、mock/placeholder 模型、mock embedding、
@@ -271,8 +271,8 @@ mock renderer、非 HTTPS provider endpoint、memory email、禁用的 breach ch
 Bubblewrap，以非 root、read-only filesystem、drop-all-capabilities 运行。staging/production
 启动时真实探测 Landlock ABI ≥ 3 与 libseccomp；任一缺失都会 fail closed，Bubblewrap 不可用则
 仅失去额外 mount-namespace 层。Compose 对共享 runtime service 设置 `pids_limit: 256`，且不增加
-`CAP_SYS_ADMIN`、不使用 `seccomp=unconfined`。Compose 只把 9000/8010 映射到 loopback；公网
-8022 TLS 由反向代理拥有。
+`CAP_SYS_ADMIN`、不使用 `seccomp=unconfined`。Compose 只把 8000/8010 映射到 loopback；公网
+标准 HTTPS 443 TLS 由反向代理拥有。
 
 ## 9. 明确限制
 

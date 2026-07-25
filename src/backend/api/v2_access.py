@@ -1310,7 +1310,7 @@ def _account_deletion(deletion: AccountDeletion) -> dict[str, JsonValue]:
     if isinstance(deletion, FailedAccountDeletion):
         failure = deletion.failure
         problem = {
-            "type": ("https://api.hmalliances.org:8022/problems/" + failure.code.replace(".", "/")),
+            "type": ("https://api.hmalliances.org/problems/" + failure.code.replace(".", "/")),
             "title": "Account deletion failed",
             "status": 500,
             "detail": failure.detail,

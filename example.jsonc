@@ -20,11 +20,14 @@
   "network": {
     // Nginx 后的内部监听地址和端口；客户端不可假设可直连。
     "bind_host": "127.0.0.1",
-    "bind_port": 9000,
+    "bind_port": 8000,
     // 生成短期回调/连接描述时使用的外部基址。
-    "public_base_url": "http://dev.hmalliances.org:9000",
+    "public_base_url": "http://127.0.0.1:8000",
     // 浏览器可访问产品 API 的精确 Origin；生产建议同源部署并保留空数组。
-    "cors_allowed_origins": [],
+    "cors_allowed_origins": [
+      "http://127.0.0.1:5173",
+      "http://localhost:5173"
+    ],
     // 仅显式开启 V1 trusted_proxy_hmac 迁移面时使用；V2 Bearer 身份不读取该列表。
     "trusted_proxy_cidrs": ["127.0.0.1/32"],
     // 统一为所有外部 HTTP 客户端配置的可选代理；null 表示禁用。
@@ -83,7 +86,7 @@
         "mode": "local",
         "local": {
           "directory": "data/knowledge-blobs",
-          "public_origin": "http://dev.hmalliances.org:9000",
+          "public_origin": "http://127.0.0.1:8000",
           "signing_hmac_key": null
         },
         "s3": null
@@ -272,6 +275,9 @@
     "authorization_code_ttl_seconds": 60,
     "access_token_ttl_seconds": 600,
     "refresh_token_ttl_seconds": 2592000,
+    // 8022 迁移窗口只允许同时配置两个绝对 UTC 时刻；null 表示不接受 legacy token。
+    "origin_cutover_at": null,
+    "legacy_access_token_accept_until": null,
     // 第一把是当前签名 key，其余为轮换重叠期验证 key；production 必须预先安全挂载。
     "signing_private_key_paths": ["data/oauth-signing-key.pem"],
     "public_clients": [

@@ -44,6 +44,13 @@ from backend.domain.upload_sessions import (
 from backend.infrastructure.persistence.database import AsyncDatabase
 
 _LOCAL_UPLOAD_ORIGIN: Final[str] = "http://dev.hmalliances.org:9000"
+_LOCAL_UPLOAD_ORIGINS: Final[frozenset[str]] = frozenset(
+    {
+        _LOCAL_UPLOAD_ORIGIN,
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+    }
+)
 """@brief 契约允许的隔离本地上传 origin / Contract-allowed isolated local-upload origin."""
 
 _quota_metadata = sa.MetaData(schema="knowledge")
@@ -1010,7 +1017,7 @@ def _require_upload_origin(value: str) -> None:
         or parsed.query
         or parsed.fragment
         or not parsed.hostname
-        or (parsed.scheme != "https" and exact_origin != _LOCAL_UPLOAD_ORIGIN)
+        or (parsed.scheme != "https" and exact_origin not in _LOCAL_UPLOAD_ORIGINS)
     ):
         raise ValueError("local upload public origin must be HTTPS or the isolated test origin")
 

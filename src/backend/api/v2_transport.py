@@ -605,7 +605,7 @@ def problem_payload(request: Request, problem: Problem) -> dict[str, JsonValue]:
         if _EXTENSION_KEY.fullmatch(key) is not None
     }
     return {
-        "type": "https://api.hmalliances.org:8022/problems/" + problem.code.replace(".", "/"),
+        "type": "https://api.hmalliances.org/problems/" + problem.code.replace(".", "/"),
         "title": problem.title,
         "status": problem.status,
         "detail": problem.detail,

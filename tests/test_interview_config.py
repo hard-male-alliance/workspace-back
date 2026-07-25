@@ -51,7 +51,7 @@ def _configured_development_root() -> dict[str, Any]:
                 "active_key_id": "interview-2026-07",
                 "keys": {"interview-2026-07": _encoded_key(20)},
             },
-            "signaling_url": "wss://realtime.hmalliances.org/v2/interview",
+            "signaling_url": "wss://api.hmalliances.org/realtime/v2/interview",
             "ice_urls": [
                 "stun:stun.hmalliances.org:3478",
                 "turns:turn.hmalliances.org:5349?transport=tcp",
@@ -70,7 +70,7 @@ def _production_root() -> dict[str, Any]:
 
     root = _configured_development_root()
     root["environment"] = "production"
-    root["network"]["public_base_url"] = "https://api.hmalliances.org:8022"
+    root["network"]["public_base_url"] = "https://api.hmalliances.org"
     root["resume_rendering"]["adapter"] = "xelatex"
     root["ai"].update(
         {
@@ -176,7 +176,7 @@ def test_configured_realtime_decodes_key_and_preserves_transport_policy(
 
     assert settings.interview.realtime.active_signing_key == bytes([20]) * 32
     assert settings.interview.realtime.signaling_url == (
-        "wss://realtime.hmalliances.org/v2/interview"
+        "wss://api.hmalliances.org/realtime/v2/interview"
     )
     assert settings.interview.realtime.ice_urls[1].startswith("turns:")
     assert settings.interview.realtime.turn_shared_secret == _encoded_key(21)

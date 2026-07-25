@@ -229,6 +229,7 @@ class OAuthAuthorizationService:
             refresh_token_id=new_opaque_id("rt"),
             refresh_token_hash=_secret_hash(refresh_token),
             refresh_expires_at=now + timedelta(seconds=self._settings.refresh_token_ttl_seconds),
+            origin_cutover_at=self._settings.origin_cutover_at,
         )
         if exchange is None:
             raise OAuthTokenError("invalid_grant", "Authorization code is invalid or expired")
@@ -279,6 +280,7 @@ class OAuthAuthorizationService:
                 replacement_token_hash=_secret_hash(replacement),
                 replacement_expires_at=now
                 + timedelta(seconds=self._settings.refresh_token_ttl_seconds),
+                origin_cutover_at=self._settings.origin_cutover_at,
             )
         except RefreshTokenReuseDetected as error:
             raise OAuthTokenError(

@@ -8,6 +8,7 @@ import hmac
 import math
 import re
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
@@ -33,8 +34,11 @@ _DEVELOPMENT_IDENTITY_ENVIRONMENTS = frozenset({"development", "test"})
 _SUPPORTED_ENVIRONMENTS = frozenset({"development", "test", "staging", "production"})
 """@brief 唯一允许的部署环境标签 / Only supported deployment-environment labels."""
 
-_PRODUCTION_PUBLIC_ORIGIN = "https://api.hmalliances.org:8022"
+_PRODUCTION_PUBLIC_ORIGIN = "https://api.hmalliances.org"
 """@brief API Standard V2 冻结的生产公开 Origin / Production public origin frozen by API Standard V2."""
+
+_PRODUCTION_REALTIME_URL = "wss://api.hmalliances.org/realtime/v2/interview"
+"""@brief API Standard V2 冻结的生产 Realtime endpoint / Frozen production realtime endpoint."""
 
 _MAX_TRUSTED_PROXY_CLOCK_SKEW_SECONDS = 600
 """@brief 允许的最大身份断言时钟偏差 / Maximum permitted identity-assertion clock skew in seconds."""
@@ -86,6 +90,8 @@ class OAuthSettings:
     authorization_code_ttl_seconds: int
     access_token_ttl_seconds: int
     refresh_token_ttl_seconds: int
+    origin_cutover_at: datetime | None
+    legacy_access_token_accept_until: datetime | None
     signing_private_key_paths: tuple[Path, ...]
     public_clients: tuple[OAuthPublicClientSettings, ...]
 
@@ -1041,6 +1047,24 @@ def _optional_string(value: object) -> str | None:
     raise ConfigurationError("configuration value must be a string or null")
 
 
+def _optional_utc_timestamp(value: object, label: str) -> datetime | None:
+    """Read a nullable RFC 3339 UTC instant without accepting local-time ambiguity."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ConfigurationError(f"{label} must be an RFC 3339 UTC timestamp ending in Z or null")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise ConfigurationError(
+            f"{label} must be an RFC 3339 UTC timestamp ending in Z or null"
+        ) from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ConfigurationError(f"{label} must be an RFC 3339 UTC timestamp ending in Z or null")
+    return parsed.astimezone(UTC)
+
+
 def _database_dsn(
     database: dict[str, Any],
     *,
@@ -1629,6 +1653,10 @@ def _interview_realtime_settings(
         raise ConfigurationError(
             "interview.realtime.signaling_url cannot use a development placeholder host"
         )
+    if environment == "production" and signaling_url != _PRODUCTION_REALTIME_URL:
+        raise ConfigurationError(
+            "interview.realtime.signaling_url must match the API V2 production realtime URL"
+        )
     if deployed and any(_is_development_endpoint_host(hostname) for hostname in ice_hostnames):
         raise ConfigurationError(
             "interview.realtime.ice_urls cannot use development placeholder hosts"
@@ -1697,8 +1725,10 @@ def _require_interview_signaling_url(
     hostname = parsed.hostname.rstrip(".").lower()
     development_endpoint = (
         parsed.scheme in {"http", "ws"}
-        and hostname == "dev.hmalliances.org"
-        and parsed.port == 9000
+        and (
+            (hostname == "dev.hmalliances.org" and parsed.port == 9000)
+            or (hostname in {"127.0.0.1", "localhost"} and parsed.port == 8000)
+        )
     )
     if parsed.scheme in {"http", "ws"} and (
         not allow_development_endpoint or not development_endpoint
@@ -2920,11 +2950,17 @@ def _require_local_upload_origin(value: str) -> None:
         or parsed.fragment
         or (
             parsed.scheme != "https"
-            and exact_origin != "http://dev.hmalliances.org:9000"
+            and exact_origin
+            not in {
+                "http://dev.hmalliances.org:9000",
+                "http://127.0.0.1:8000",
+                "http://localhost:8000",
+            }
         )
     ):
         raise ConfigurationError(
-            "knowledge.uploads.storage.local.public_origin must be HTTPS or the isolated dev origin"
+            "knowledge.uploads.storage.local.public_origin must be HTTPS or an allowed "
+            "isolated development origin"
         )
 
 
@@ -3153,6 +3189,8 @@ def _oauth_settings(value: object, environment: str) -> OAuthSettings:
             authorization_code_ttl_seconds=60,
             access_token_ttl_seconds=600,
             refresh_token_ttl_seconds=2_592_000,
+            origin_cutover_at=None,
+            legacy_access_token_accept_until=None,
             signing_private_key_paths=(Path("data/oauth-signing-key.pem"),),
             public_clients=(
                 OAuthPublicClientSettings(
@@ -3174,6 +3212,20 @@ def _oauth_settings(value: object, environment: str) -> OAuthSettings:
         )
 
     mapping = require_mapping(value, "oauth")
+    _reject_unknown_keys(
+        mapping,
+        {
+            "authorization_request_ttl_seconds",
+            "authorization_code_ttl_seconds",
+            "access_token_ttl_seconds",
+            "refresh_token_ttl_seconds",
+            "origin_cutover_at",
+            "legacy_access_token_accept_until",
+            "signing_private_key_paths",
+            "public_clients",
+        },
+        "oauth",
+    )
     ttl_seconds = _require_positive_int(mapping, "authorization_request_ttl_seconds")
     if ttl_seconds > 900:
         raise ConfigurationError("oauth.authorization_request_ttl_seconds must not exceed 900")
@@ -3195,6 +3247,31 @@ def _oauth_settings(value: object, environment: str) -> OAuthSettings:
         raise ConfigurationError("oauth.access_token_ttl_seconds must not exceed 900")
     if refresh_ttl_seconds > 31_536_000:
         raise ConfigurationError("oauth.refresh_token_ttl_seconds must not exceed 31536000")
+    origin_cutover_at = _optional_utc_timestamp(
+        mapping.get("origin_cutover_at"),
+        "oauth.origin_cutover_at",
+    )
+    legacy_accept_until = _optional_utc_timestamp(
+        mapping.get("legacy_access_token_accept_until"),
+        "oauth.legacy_access_token_accept_until",
+    )
+    if (origin_cutover_at is None) != (legacy_accept_until is None):
+        raise ConfigurationError(
+            "oauth.origin_cutover_at and oauth.legacy_access_token_accept_until "
+            "must both be configured or both be null"
+        )
+    if origin_cutover_at is not None and legacy_accept_until is not None:
+        if legacy_accept_until <= origin_cutover_at:
+            raise ConfigurationError(
+                "oauth.legacy_access_token_accept_until must be after oauth.origin_cutover_at"
+            )
+        if legacy_accept_until > origin_cutover_at + timedelta(
+            seconds=access_ttl_seconds + 30
+        ):
+            raise ConfigurationError(
+                "oauth legacy access-token window must not exceed the access-token lifetime "
+                "plus clock skew"
+            )
     raw_key_paths = mapping.get("signing_private_key_paths")
     if not isinstance(raw_key_paths, list) or not raw_key_paths:
         raise ConfigurationError("oauth.signing_private_key_paths must be a non-empty string array")
@@ -3213,6 +3290,8 @@ def _oauth_settings(value: object, environment: str) -> OAuthSettings:
         code_ttl_seconds,
         access_ttl_seconds,
         refresh_ttl_seconds,
+        origin_cutover_at,
+        legacy_accept_until,
         tuple(key_paths),
         clients,
     )

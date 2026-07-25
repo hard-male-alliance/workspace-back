@@ -46,10 +46,10 @@ def test_v2_publication_files_and_fixed_origins_are_frozen() -> None:
         "examples.jsonc",
         "schema.jsonc",
     }
-    assert PUBLIC_ORIGIN == "https://api.hmalliances.org:8022"
+    assert PUBLIC_ORIGIN == "https://api.hmalliances.org"
     assert TEST_RESOURCE_SERVER_ORIGIN == "http://dev.hmalliances.org:9000"
     assert PROTECTED_RESOURCE_METADATA_URL == (
-        "https://api.hmalliances.org:8022/.well-known/oauth-protected-resource"
+        "https://api.hmalliances.org/.well-known/oauth-protected-resource"
     )
 
 

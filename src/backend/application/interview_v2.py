@@ -2280,7 +2280,7 @@ def _worker_problem(
         recommends initiating a new operation.
     """
     return ProblemDetails(
-        type_uri=f"https://api.hmalliances.org:8022/problems/interview/{code.replace('.', '-')}",
+        type_uri=f"https://api.hmalliances.org/problems/interview/{code.replace('.', '-')}",
         title=title,
         status=500,
         code=code,

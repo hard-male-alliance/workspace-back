@@ -600,7 +600,11 @@ def _require_upload_url(value: str) -> None:
         raise UploadDomainError("upload URL cannot contain userinfo or a fragment")
     production = parsed.scheme == "https" and bool(parsed.hostname)
     isolated_test = (
-        parsed.scheme == "http" and parsed.hostname == "dev.hmalliances.org" and parsed.port == 9000
+        parsed.scheme == "http"
+        and (
+            (parsed.hostname == "dev.hmalliances.org" and parsed.port == 9000)
+            or (parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port == 8000)
+        )
     )
     if not (production or isolated_test):
         raise UploadDomainError("upload URL must use HTTPS or the fixed isolated test origin")

@@ -74,8 +74,9 @@ class OAuthAuthorizationRequestRepository(Protocol):
         refresh_token_id: str | None,
         refresh_token_hash: str | None,
         refresh_expires_at: datetime | None,
+        origin_cutover_at: datetime | None = None,
     ) -> AuthorizationCodeExchange | None:
-        """Consume a matching code and create its refresh family in one transaction."""
+        """Consume a matching post-cutover code and create its refresh family atomically."""
 
     async def rotate_refresh_token(
         self,
@@ -85,8 +86,9 @@ class OAuthAuthorizationRequestRepository(Protocol):
         replacement_token_id: str,
         replacement_token_hash: str,
         replacement_expires_at: datetime,
+        origin_cutover_at: datetime | None = None,
     ) -> RefreshTokenRotation | None:
-        """Rotate once, revoking the family on reuse of a consumed token."""
+        """Rotate a post-cutover family once, revoking it on ancestor reuse."""
 
     async def revoke_refresh_token(self, token_hash: str) -> None:
         """Revoke the complete refresh family if the opaque token is known."""

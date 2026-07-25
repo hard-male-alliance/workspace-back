@@ -94,7 +94,7 @@ docker compose run --rm migrate
 
 docker compose up --detach backend
 docker compose ps
-curl --fail http://127.0.0.1:9000/_internal/healthz
+curl --fail http://127.0.0.1:8000/_internal/healthz
 ```
 
 `bootstrap` 固定使用 `--access-mode prompt`：容器之间不存在可继承的宿主 `sudo`/Unix peer 身份，因此它通过私有 Compose 网络连接 `postgres`，只在 TTY 中读取一次管理员密码。密码不会进入 argv、应用镜像或 `config.jsonc`；`config.jsonc` 只保存 `dbctl` 自动生成的三个最小权限登录角色凭证。重复执行 bootstrap 会按 `dbctl` 的幂等计划收敛现状，而不是依赖“仅空 volume 执行一次”的镜像初始化脚本。
@@ -118,8 +118,8 @@ docker compose run --rm migrate
 生产部署前必须至少完成这些修改：
 
 1. 替换 `.env` 中 PostgreSQL 管理密码与 Dashboard token；app、migrator、dashboard 数据库密码由 `dbctl bootstrap` 生成并保存在私有配置 volume，不在 `.env` 维护第二份状态。
-2. 设置 `AIWS_ENVIRONMENT=production`、至少 32 bytes 且相互独立的 cursor/idempotency/邮件/Connection/Interview 密钥，以及冻结的 `https://api.hmalliances.org:8022` public origin。V2 Resource Server 自行密码学验证 OAuth access token，不接受代理伪造 Workspace 身份。
-3. 在宿主 loopback `:9000` 前部署 TLS Nginx；挂载 `/etc/aiws/tls/fullchain.pem` 与 `privkey.pem`，只公开 Hosted Identity、OAuth/OIDC、`/userinfo` 和 `/api/v2/`。公网 V1、docs、Dashboard 与 health 一律 404。
+2. 设置 `AIWS_ENVIRONMENT=production`、至少 32 bytes 且相互独立的 cursor/idempotency/邮件/Connection/Interview 密钥，以及冻结的 `https://api.hmalliances.org` public origin。V2 Resource Server 自行密码学验证 OAuth access token，不接受代理伪造 Workspace 身份。
+3. 在宿主 loopback `:8000` 前部署 TLS Nginx；挂载 `/etc/aiws/tls/fullchain.pem` 与 `privkey.pem`，只公开 Hosted Identity、OAuth/OIDC、`/userinfo` 和 `/api/v2/`。公网 V1、docs、Dashboard 与 health 一律 404。
 4. 设置真实模型与 embedding provider、HTTPS base URL、明确的数据地域、模型 revision/dimension 和 API key；production 配置仍含 mock/placeholder 时启动失败。
 5. 镜像同时安装 Debian `texlive-xetex`、`fonts-noto-cjk`、`libseccomp2` 与 `bubblewrap`。不可信 Resume/Knowledge 文件 parser 与 XeLaTeX renderer 均在独立 session/进程组中运行，并在加载 parser/compiler 前施加 Landlock 文件系统 allowlist、libseccomp syscall denylist、CPU/地址空间/文件/FD 限制和墙钟超时；Compose 另以 `pids_limit: 256` 限制整个容器进程树。Bubblewrap 仅在真实能力探针成功时作为附加层，不是强隔离成立的必要条件。Landlock 或 libseccomp 缺失时 staging/production 启动失败，绝不退化为不受限子进程。
 
@@ -377,7 +377,7 @@ session/user 状态与 scope。路径中的 Workspace 从不由客户端 header 
 
 Nginx 覆盖 `Forwarded`/`X-Forwarded-*`，删除所有 legacy HMAC、Dashboard 与 `X-Mock-*` 私有头，
 再将 Bearer token 原样交给 backend。Hosted Identity、OAuth 与 WebAuthn 必须经 TLS；production
-origin 固定为 `https://api.hmalliances.org:8022`。
+origin 固定为 `https://api.hmalliances.org`。
 
 ## Legacy V1 并行迁移边界：trusted proxy HMAC
 

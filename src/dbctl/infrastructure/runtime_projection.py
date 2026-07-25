@@ -16,7 +16,7 @@ from .private_files import atomic_write_private_text
 _PRIVATE_DIRECTORY_MODE: Final[int] = 0o700
 """@brief 运行投影父目录的创建权限 / Creation mode for the runtime projection directory."""
 
-_API_V2_PRODUCTION_ORIGIN: Final[str] = "https://api.hmalliances.org:8022"
+_API_V2_PRODUCTION_ORIGIN: Final[str] = "https://api.hmalliances.org"
 """@brief API Standard V2 冻结的生产公开 Origin / Production public origin frozen by API Standard V2."""
 
 
@@ -70,12 +70,12 @@ def build_runtime_config(
     network.update(
         {
             "bind_host": "0.0.0.0",
-            "bind_port": 9000,
+            "bind_port": 8000,
             "public_base_url": (
                 _API_V2_PRODUCTION_ORIGIN
                 if environment == "production"
                 else _optional_text(environ, "AIWS_PUBLIC_BASE_URL")
-                or str(network.get("public_base_url", "http://127.0.0.1:9000"))
+                or str(network.get("public_base_url", "http://127.0.0.1:8000"))
             ),
             "cors_allowed_origins": _optional_json_string_list(
                 environ,
@@ -91,6 +91,14 @@ def build_runtime_config(
         }
     )
     root["network"] = network
+
+    oauth = require_mapping(root.get("oauth"), "oauth")
+    oauth["origin_cutover_at"] = _optional_text(environ, "AIWS_OAUTH_ORIGIN_CUTOVER_AT")
+    oauth["legacy_access_token_accept_until"] = _optional_text(
+        environ,
+        "AIWS_OAUTH_LEGACY_ACCESS_TOKEN_ACCEPT_UNTIL",
+    )
+    root["oauth"] = oauth
 
     knowledge = require_mapping(root.get("knowledge"), "knowledge")
     connections = require_mapping(

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Final
 
-ACCESS_TOKEN_USER_ID_CLAIM: Final[str] = "https://api.hmalliances.org:8022/claims/user_id"
+ACCESS_TOKEN_USER_ID_CLAIM: Final[str] = "https://api.hmalliances.org/claims/user_id"
 """@brief access token 的本地用户绑定 claim / Local user-binding claim for access tokens."""
 
 

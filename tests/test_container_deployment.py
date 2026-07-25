@@ -8,6 +8,7 @@ import os
 import stat
 from collections.abc import Mapping
 from contextlib import chdir
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,9 @@ def _container_environment() -> dict[str, str]:
 
     return {
         "AIWS_ENVIRONMENT": "production",
-        "AIWS_PUBLIC_BASE_URL": "https://api.hmalliances.org:8022",
+        "AIWS_PUBLIC_BASE_URL": "https://api.hmalliances.org",
+        "AIWS_OAUTH_ORIGIN_CUTOVER_AT": "2026-07-25T08:00:00Z",
+        "AIWS_OAUTH_LEGACY_ACCESS_TOKEN_ACCEPT_UNTIL": "2026-07-25T08:10:00Z",
         "AIWS_IDENTITY_MODE": "disabled",
         "AIWS_CURSOR_HMAC_SECRET": "test-only-cursor-secret-with-at-least-32-bytes",
         "AIWS_SENSITIVE_IDEMPOTENCY_HMAC_SECRET": (
@@ -86,7 +89,7 @@ def _container_environment() -> dict[str, str]:
         "AIWS_INTERVIEW_REALTIME_SIGNING_KEYS": (
             '{"interview-key-2026-07":"FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQ"}'
         ),
-        "AIWS_INTERVIEW_SIGNALING_URL": ("wss://realtime.hmalliances.org/v2/interview"),
+        "AIWS_INTERVIEW_SIGNALING_URL": ("wss://api.hmalliances.org/realtime/v2/interview"),
         "AIWS_INTERVIEW_ICE_URLS": (
             '["stun:stun.hmalliances.org:3478","turns:turn.hmalliances.org:5349?transport=tcp"]'
         ),
@@ -152,8 +155,12 @@ def test_runtime_projection_preserves_dbctl_credentials(tmp_path: Path) -> None:
     assert backend.environment == "production"
     assert backend.database.mode == "postgresql"
     assert backend.network.bind_host == "0.0.0.0"
-    assert backend.network.bind_port == 9000
-    assert backend.network.public_base_url == "https://api.hmalliances.org:8022"
+    assert backend.network.bind_port == 8000
+    assert backend.network.public_base_url == "https://api.hmalliances.org"
+    assert backend.oauth.origin_cutover_at == datetime(2026, 7, 25, 8, 0, tzinfo=UTC)
+    assert backend.oauth.legacy_access_token_accept_until == datetime(
+        2026, 7, 25, 8, 10, tzinfo=UTC
+    )
     assert not backend.api.legacy_v1_enabled
     assert backend.security.identity_mode == "disabled"
     assert backend.security.trusted_proxy_hmac_secret is None
@@ -184,7 +191,7 @@ def test_runtime_projection_preserves_dbctl_credentials(tmp_path: Path) -> None:
     assert backend.interview.realtime.signing_keyring.active_key_id == ("interview-key-2026-07")
     assert backend.interview.realtime.active_signing_key == bytes([20]) * 32
     assert backend.interview.realtime.signaling_url == (
-        "wss://realtime.hmalliances.org/v2/interview"
+        "wss://api.hmalliances.org/realtime/v2/interview"
     )
     assert backend.interview.realtime.ice_urls[1].startswith("turns:")
     assert backend.interview.realtime.turn_shared_secret == (
@@ -768,7 +775,7 @@ def test_development_projection_preserves_explicit_interview_realtime_config(
                 "active_key_id": "interview-dev-2026-07",
                 "keys": {"interview-dev-2026-07": ("FBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQ")},
             },
-            "signaling_url": "wss://realtime.hmalliances.org/v2/interview",
+            "signaling_url": "wss://api.hmalliances.org/realtime/v2/interview",
         }
     )
     source_path.write_text(json.dumps(source), encoding="utf-8")
@@ -794,7 +801,7 @@ def test_development_projection_preserves_explicit_interview_realtime_config(
         == "interview-dev-2026-07"
     )
     assert runtime["interview"]["realtime"]["signaling_url"] == (
-        "wss://realtime.hmalliances.org/v2/interview"
+        "wss://api.hmalliances.org/realtime/v2/interview"
     )
 
 
@@ -809,17 +816,17 @@ def test_docker_dbinit_only_changes_connection_endpoint() -> None:
 
 
 def test_nginx_exposes_only_the_frozen_v2_tls_surface() -> None:
-    """@brief Nginx 对齐 :8022→:9000 且只公开 OAuth/Identity/API V2 / Nginx aligns :8022-to-:9000 and exposes only OAuth, Identity, and API V2."""
+    """@brief Nginx 对齐 :443→:8000 且只公开 OAuth/Identity/API V2 / Nginx aligns :443-to-:8000 and exposes only OAuth, Identity, and API V2."""
 
     source = (PROJECT_ROOT / "deploy/nginx/ai-job-workspace.conf").read_text(encoding="utf-8")
 
-    assert "listen 8022 ssl http2;" in source
+    assert "listen 443 ssl http2;" in source
     assert "server_name api.hmalliances.org;" in source
     assert "ssl_certificate /etc/aiws/tls/fullchain.pem;" in source
     assert "ssl_certificate_key /etc/aiws/tls/privkey.pem;" in source
     assert "ssl_protocols TLSv1.2 TLSv1.3;" in source
     assert "Strict-Transport-Security" in source
-    assert "server 127.0.0.1:9000;" in source
+    assert "server 127.0.0.1:8000;" in source
     for boundary in (
         "location = /.well-known/openid-configuration",
         "location = /.well-known/oauth-protected-resource",
@@ -836,6 +843,7 @@ def test_nginx_exposes_only_the_frozen_v2_tls_surface() -> None:
     assert 'proxy_set_header Upgrade $http_upgrade;' in source
     assert 'proxy_set_header Connection "upgrade";' in source
     assert 'proxy_set_header Forwarded "";' in source
+    assert "proxy_set_header X-Forwarded-Port 443;" in source
     assert "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for" not in source
 
 

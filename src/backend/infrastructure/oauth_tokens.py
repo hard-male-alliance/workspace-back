@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import stat
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,15 +19,48 @@ from backend.api.constants import PUBLIC_ORIGIN
 from backend.domain.oauth import ACCESS_TOKEN_USER_ID_CLAIM, OAuthTokenValidationError
 from workspace_shared.ids import new_opaque_id
 
+_LEGACY_ACCESS_TOKEN_ORIGIN = "https://api.hmalliances.org:8022"
+_LEGACY_ACCESS_TOKEN_USER_ID_CLAIM = f"{_LEGACY_ACCESS_TOKEN_ORIGIN}/claims/user_id"
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyAccessTokenPolicy:
+    """Bounded, independently removable verifier policy for pre-cutover access tokens."""
+
+    origin_cutover_at: datetime
+    accept_until: datetime
+
 
 class OAuthTokenSigner:
     """Sign with the first configured RSA key and verify against the full rotation set."""
 
-    def __init__(self, private_keys: tuple[rsa.RSAPrivateKey, ...]) -> None:
+    def __init__(
+        self,
+        private_keys: tuple[rsa.RSAPrivateKey, ...],
+        *,
+        origin_cutover_at: datetime | None = None,
+        legacy_access_token_accept_until: datetime | None = None,
+    ) -> None:
         if not private_keys:
             raise ValueError("at least one OAuth signing key is required")
+        if (origin_cutover_at is None) != (legacy_access_token_accept_until is None):
+            raise ValueError("legacy access-token migration timestamps must be configured together")
+        if origin_cutover_at is not None and legacy_access_token_accept_until is not None:
+            if (
+                origin_cutover_at.tzinfo is None
+                or legacy_access_token_accept_until.tzinfo is None
+                or legacy_access_token_accept_until <= origin_cutover_at
+            ):
+                raise ValueError("legacy access-token migration timestamps are invalid")
+            legacy_policy = _LegacyAccessTokenPolicy(
+                origin_cutover_at.astimezone(UTC),
+                legacy_access_token_accept_until.astimezone(UTC),
+            )
+        else:
+            legacy_policy = None
         self._keys = {self._kid(key): key for key in private_keys}
         self._active_kid = self._kid(private_keys[0])
+        self._legacy_policy = legacy_policy
 
     @classmethod
     def from_paths(
@@ -35,6 +69,8 @@ class OAuthTokenSigner:
         *,
         runtime_root: Path,
         allow_generate: bool,
+        origin_cutover_at: datetime | None = None,
+        legacy_access_token_accept_until: datetime | None = None,
     ) -> OAuthTokenSigner:
         """Load rotation keys, generating only the first development key when explicitly allowed."""
 
@@ -44,7 +80,11 @@ class OAuthTokenSigner:
             if not path.exists() and allow_generate and index == 0:
                 _generate_private_key_file(path)
             keys.append(_load_private_key_file(path))
-        return cls(tuple(keys))
+        return cls(
+            tuple(keys),
+            origin_cutover_at=origin_cutover_at,
+            legacy_access_token_accept_until=legacy_access_token_accept_until,
+        )
 
     @property
     def jwks(self) -> dict[str, list[dict[str, str]]]:
@@ -132,10 +172,10 @@ class OAuthTokenSigner:
         """Verify signature, type, issuer, audience, time and required access-token claims."""
 
         claims = self._verify(token, expected_type="at+jwt")
-        current = int((now or datetime.now(UTC)).timestamp())
+        current_time = (now or datetime.now(UTC)).astimezone(UTC)
+        current = int(current_time.timestamp())
         required_strings = (
             "sub",
-            ACCESS_TOKEN_USER_ID_CLAIM,
             "jti",
             "client_id",
             "scope",
@@ -144,8 +184,6 @@ class OAuthTokenSigner:
             not isinstance(claims.get(name), str) or not claims[name] for name in required_strings
         ):
             raise OAuthTokenValidationError("access token is missing a required claim")
-        if claims.get("iss") != PUBLIC_ORIGIN or claims.get("aud") != PUBLIC_ORIGIN:
-            raise OAuthTokenValidationError("access token issuer or audience is invalid")
         for name in ("exp", "nbf", "iat"):
             if isinstance(claims.get(name), bool) or not isinstance(claims.get(name), int):
                 raise OAuthTokenValidationError("access token time claim is invalid")
@@ -153,6 +191,26 @@ class OAuthTokenSigner:
             raise OAuthTokenValidationError("access token is outside its validity window")
         if claims["iat"] > claims["exp"]:
             raise OAuthTokenValidationError("access token validity window is invalid")
+        issuer = claims.get("iss")
+        audience = claims.get("aud")
+        if issuer == PUBLIC_ORIGIN and audience == PUBLIC_ORIGIN:
+            user_id_claim = ACCESS_TOKEN_USER_ID_CLAIM
+        elif issuer == _LEGACY_ACCESS_TOKEN_ORIGIN and audience == _LEGACY_ACCESS_TOKEN_ORIGIN:
+            policy = self._legacy_policy
+            if (
+                policy is None
+                or current_time >= policy.accept_until
+                or datetime.fromtimestamp(claims["iat"], UTC) >= policy.origin_cutover_at
+            ):
+                raise OAuthTokenValidationError("legacy access token is outside migration policy")
+            user_id_claim = _LEGACY_ACCESS_TOKEN_USER_ID_CLAIM
+        else:
+            raise OAuthTokenValidationError("access token issuer or audience is invalid")
+        user_id = claims.get(user_id_claim)
+        if not isinstance(user_id, str) or not user_id:
+            raise OAuthTokenValidationError("access token is missing a required claim")
+        if user_id_claim != ACCESS_TOKEN_USER_ID_CLAIM:
+            claims[ACCESS_TOKEN_USER_ID_CLAIM] = user_id
         return claims
 
     def _sign(self, claims: dict[str, Any], *, token_type: str) -> str:

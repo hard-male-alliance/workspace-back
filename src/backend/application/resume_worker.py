@@ -772,7 +772,7 @@ def _derived_resume_id(operation_id: str) -> ResumeId:
 def _worker_problem(job_id: JobId, code: str, *, retryable: bool) -> ProblemDetails:
     """@brief 构造不泄漏异常正文的 Job problem / Build a Job problem without exception text."""
     return ProblemDetails(
-        type_uri=f"https://api.hmalliances.org:8022/problems/resume/{code.replace('.', '-')}",
+        type_uri=f"https://api.hmalliances.org/problems/resume/{code.replace('.', '-')}",
         title="Resume job failed",
         status=500,
         code=code,

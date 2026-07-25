@@ -126,9 +126,9 @@ work。
 冻结拓扑是：
 
 ```text
-https://api.hmalliances.org:8022
+https://api.hmalliances.org
     -> Nginx TLS / forwarded-header overwrite / public route allowlist
-    -> http://127.0.0.1:9000
+    -> http://127.0.0.1:8000
 ```
 
 Nginx 只公开 discovery、OAuth、Hosted Identity、`/userinfo` 和 `/api/v2/`；SSE 单独关闭
@@ -142,7 +142,7 @@ staging/production 配置为 `true` 会启动失败。旧 V1 模块和部分兼�
 
 staging/production 配置会 fail closed，至少要求：PostgreSQL、真实模型和 embedding endpoint、
 非 mock XeLaTeX renderer、SMTP + 加密邮件 outbox、泄露密码检查、持久 cursor/幂等密钥、
-Knowledge 持久存储/扫描策略，以及启用 realtime 时的独立 signing keyring。容器监听 9000，
+Knowledge 持久存储/扫描策略，以及启用 realtime 时的独立 signing keyring。容器监听 8000，
 运行镜像包含 XeLaTeX、Noto CJK、libseccomp2 与可选 Bubblewrap。启动时必须真实验证 Linux
 Landlock ABI ≥ 3 与 libseccomp；Compose 以 `pids_limit: 256` 限制容器进程树，不增加
 `CAP_SYS_ADMIN`，也不关闭默认 seccomp。Bubblewrap 仅在真实 probe 成功时叠加，缺失不会诱导
