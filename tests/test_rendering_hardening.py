@@ -59,6 +59,54 @@ def _resume_document() -> dict[str, Any]:
     }
 
 
+def test_safe_template_renders_full_resume_content_and_escapes_tex() -> None:
+    """The production template includes real sections without interpreting user TeX."""
+
+    document = {
+        **_resume_document(),
+        "title": "Backend & Platform",
+        "profile": {
+            "full_name": "Klee",
+            "headline": "Python Engineer",
+            "summary": {"text": "Builds safe APIs at 99.9% uptime."},
+            "contacts": [{"value": "klee@example.com"}],
+        },
+        "sections": [
+            {
+                "id": "section_experience_01",
+                "title": "Experience",
+                "visible": True,
+                "items": [
+                    {
+                        "id": "item_experience_001",
+                        "visible": True,
+                        "title": "Backend Engineer",
+                        "organization": "ACME_Cloud",
+                        "date_range": {
+                            "start": {"value": "2024-01"},
+                            "end": None,
+                            "present": True,
+                        },
+                        "summary": {"text": "Owned API delivery."},
+                        "highlights": [{"text": "Reduced latency by 35%."}],
+                        "skills": ["Python", "PostgreSQL"],
+                    }
+                ],
+            }
+        ],
+    }
+
+    latex = rendering._safe_template(document)
+
+    assert "Backend Engineer" in latex
+    assert "Reduced latency by 35\\%." in latex
+    assert "ACME\\_Cloud" in latex
+    assert "2024-01 – Present" in latex
+    assert "Python, PostgreSQL" in latex
+    assert "Backend \\& Platform" in latex
+    assert "\\begin{itemize}" in latex
+
+
 def test_renderer_factory_fails_at_startup_when_sandbox_capability_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

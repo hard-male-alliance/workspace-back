@@ -602,11 +602,12 @@ def test_resume_crud_revisions_operations_and_jobs_follow_the_published_contract
         assert restore.json()["kind"] == "resume.restore"
         harness.validator.validate_definition("Job", restore.json())
 
+        upload_now = datetime.now(UTC)
         harness.factory.store.add_completed_upload(
             WORKSPACE_ID,
             "upload_http_000001",
-            completed_at=NOW,
-            expires_at=NOW + timedelta(days=1),
+            completed_at=upload_now,
+            expires_at=upload_now + timedelta(days=1),
         )
         imported = harness.client.post(
             f"/api/v2/workspaces/{WORKSPACE_ID}/resume-import-jobs",
@@ -621,7 +622,7 @@ def test_resume_crud_revisions_operations_and_jobs_follow_the_published_contract
                 },
             },
         )
-        assert imported.status_code == 202
+        assert imported.status_code == 202, imported.text
         assert imported.json()["kind"] == "resume.import"
         harness.validator.validate_definition("Job", imported.json())
 

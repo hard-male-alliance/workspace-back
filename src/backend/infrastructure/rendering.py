@@ -59,7 +59,7 @@ class _BoundedCompilerOutput:
 
     max_output_bytes: int
     bytes_seen: int = 0
-    stderr_prefix: bytearray = field(default_factory=bytearray)
+    diagnostic_prefix: bytearray = field(default_factory=bytearray)
 
     def consume(self, chunk: bytes, *, is_stderr: bool) -> None:
         """@brief 计入一段 pipe 输出 / Account for one chunk of pipe output.
@@ -70,9 +70,10 @@ class _BoundedCompilerOutput:
         """
 
         self.bytes_seen += len(chunk)
-        if is_stderr and len(self.stderr_prefix) < _DIAGNOSTIC_CAPTURE_BYTES:
-            remaining = _DIAGNOSTIC_CAPTURE_BYTES - len(self.stderr_prefix)
-            self.stderr_prefix.extend(chunk[:remaining])
+        del is_stderr
+        if len(self.diagnostic_prefix) < _DIAGNOSTIC_CAPTURE_BYTES:
+            remaining = _DIAGNOSTIC_CAPTURE_BYTES - len(self.diagnostic_prefix)
+            self.diagnostic_prefix.extend(chunk[:remaining])
         if self.bytes_seen > self.max_output_bytes:
             raise _CombinedOutputLimitExceeded
 
@@ -394,18 +395,115 @@ def _safe_template(document: dict[str, Any]) -> str:
     @param document 已验证 SIR / Validated SIR.
     @return 无用户 TeX 命令的固定模板 / Fixed template containing no user TeX commands.
     """
-    title = _latex_escape(str(document.get("title", "")))
-    full_name = _latex_escape(str(document.get("profile", {}).get("full_name", "")))
-    return (
+    profile = _mapping(document.get("profile"))
+    title = _latex_escape(_text(document.get("title")))
+    full_name = _latex_escape(_text(profile.get("full_name")))
+    headline = _latex_escape(_text(profile.get("headline")))
+    summary = _latex_escape(_rich_text(profile.get("summary")))
+    contacts = [
+        _latex_escape(_text(contact.get("value")))
+        for raw_contact in _sequence(profile.get("contacts"))
+        if (contact := _mapping(raw_contact)) and _text(contact.get("value"))
+    ]
+    body: list[str] = [
         "\\documentclass[10pt]{article}\n"
         "\\usepackage{fontspec}\n"
+        "\\usepackage[margin=18mm]{geometry}\n"
         "\\setmainfont{Noto Sans CJK SC}\n"
         "\\pagestyle{empty}\n"
+        "\\setlength{\\parindent}{0pt}\n"
         "\\begin{document}\n"
-        f"\\section*{{{title}}}\n"
-        f"{full_name}\n"
-        "\\end{document}\n"
+        f"{{\\LARGE\\textbf{{{full_name}}}}}\\\\\n"
+    ]
+    if headline:
+        body.append(f"{headline}\\\\\n")
+    if contacts:
+        body.append(f"{' \\textbar{} '.join(contacts)}\\\\\n")
+    if title and title != full_name:
+        body.append(f"\\textit{{{title}}}\\\\\n")
+    if summary:
+        body.extend(("\\vspace{0.4em}\n", f"{summary}\\par\n"))
+    for raw_section in _sequence(document.get("sections")):
+        section = _mapping(raw_section)
+        if not section or section.get("visible", True) is False:
+            continue
+        section_title = _latex_escape(_text(section.get("title")))
+        if section_title:
+            body.append(f"\\section*{{{section_title}}}\n")
+        content = _latex_escape(_rich_text(section.get("content")))
+        if content:
+            body.append(f"{content}\\par\n")
+        for raw_item in _sequence(section.get("items")):
+            item = _mapping(raw_item)
+            if not item or item.get("visible", True) is False:
+                continue
+            body.extend(_latex_item(item))
+    body.append("\\end{document}\n")
+    return "".join(body)
+
+
+def _latex_item(item: dict[str, Any]) -> list[str]:
+    """Render one normalized item using only escaped text commands."""
+
+    title = _latex_escape(_text(item.get("title")))
+    organization = _latex_escape(_text(item.get("organization")))
+    subtitle = _latex_escape(_text(item.get("subtitle")))
+    location = _latex_escape(_text(item.get("location")))
+    date_range = _latex_escape(_date_range(item.get("date_range")))
+    heading_parts = [part for part in (title, organization, subtitle) if part]
+    lines: list[str] = []
+    if heading_parts:
+        lines.append(f"\\textbf{{{' --- '.join(heading_parts)}}}")
+        suffix = " \\hfill ".join(part for part in (location, date_range) if part)
+        if suffix:
+            lines.append(f" \\hfill {suffix}")
+        lines.append("\\\\\n")
+    summary = _latex_escape(_rich_text(item.get("summary")))
+    if summary:
+        lines.append(f"{summary}\\par\n")
+    highlights = [
+        _latex_escape(_rich_text(value))
+        for value in _sequence(item.get("highlights"))
+        if _rich_text(value)
+    ]
+    skills = [_latex_escape(_text(value)) for value in _sequence(item.get("skills")) if _text(value)]
+    if highlights:
+        lines.append("\\begin{itemize}\n")
+        lines.extend(f"\\item {highlight}\n" for highlight in highlights)
+        lines.append("\\end{itemize}\n")
+    if skills:
+        lines.append(f"\\textit{{Skills:}} {', '.join(skills)}\\par\n")
+    return lines
+
+
+def _date_range(value: object) -> str:
+    date_range = _mapping(value)
+    if not date_range:
+        return ""
+    start = _text(_mapping(date_range.get("start")).get("value"))
+    end = (
+        "Present"
+        if date_range.get("present") is True
+        else _text(_mapping(date_range.get("end")).get("value"))
     )
+    return " – ".join(part for part in (start, end) if part)
+
+
+def _rich_text(value: object) -> str:
+    rich_text = _mapping(value)
+    return _text(rich_text.get("text")) if rich_text else ""
+
+
+def _mapping(value: object) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _sequence(value: object) -> list[object]:
+    return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def _text(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _latex_escape(value: str) -> str:
@@ -671,7 +769,7 @@ async def _collect_bounded_process_output(
                         first_error = error
             if first_error is not None:
                 raise first_error
-        return bytes(collector.stderr_prefix)
+        return bytes(collector.diagnostic_prefix)
     finally:
         for task in tasks:
             task.cancel()

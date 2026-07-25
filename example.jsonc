@@ -159,7 +159,8 @@
     "timeout_ms": 30000,
     "max_input_bytes": 1048576,
     "max_output_bytes": 10485760,
-    "memory_limit_bytes": 536870912,
+    // XeLaTeX + Noto CJK 字体加载在受限子进程中需要约 1 GiB 虚拟地址空间。
+    "memory_limit_bytes": 1073741824,
     // 为空时 XeLaTeX 适配器只使用内置受控模板，不接受用户路径。
     "allowed_font_directories": [],
     "artifact_directory": "artifacts"
