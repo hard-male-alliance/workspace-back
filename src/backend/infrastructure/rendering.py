@@ -59,7 +59,7 @@ class _BoundedCompilerOutput:
 
     max_output_bytes: int
     bytes_seen: int = 0
-    stderr_prefix: bytearray = field(default_factory=bytearray)
+    diagnostic_prefix: bytearray = field(default_factory=bytearray)
 
     def consume(self, chunk: bytes, *, is_stderr: bool) -> None:
         """@brief 计入一段 pipe 输出 / Account for one chunk of pipe output.
@@ -70,9 +70,10 @@ class _BoundedCompilerOutput:
         """
 
         self.bytes_seen += len(chunk)
-        if is_stderr and len(self.stderr_prefix) < _DIAGNOSTIC_CAPTURE_BYTES:
-            remaining = _DIAGNOSTIC_CAPTURE_BYTES - len(self.stderr_prefix)
-            self.stderr_prefix.extend(chunk[:remaining])
+        del is_stderr
+        if len(self.diagnostic_prefix) < _DIAGNOSTIC_CAPTURE_BYTES:
+            remaining = _DIAGNOSTIC_CAPTURE_BYTES - len(self.diagnostic_prefix)
+            self.diagnostic_prefix.extend(chunk[:remaining])
         if self.bytes_seen > self.max_output_bytes:
             raise _CombinedOutputLimitExceeded
 
@@ -811,7 +812,7 @@ async def _collect_bounded_process_output(
                         first_error = error
             if first_error is not None:
                 raise first_error
-        return bytes(collector.stderr_prefix)
+        return bytes(collector.diagnostic_prefix)
     finally:
         for task in tasks:
             task.cancel()
