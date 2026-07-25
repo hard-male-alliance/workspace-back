@@ -505,6 +505,15 @@ class InterviewSettings:
     recording_directory: Path
     media_chunk_max_bytes: int
     media_session_max_bytes: int
+    stt_model: str | None
+    vision_model: str | None
+    media_analysis_timeout_ms: int
+    media_analysis_max_audio_bytes: int
+    media_analysis_max_video_bytes: int
+    video_frame_interval_seconds: int
+    video_max_frames: int
+    video_frame_max_bytes: int
+    ffmpeg_command: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1417,6 +1426,15 @@ def _interview_settings(
             "recording_directory",
             "media_chunk_max_bytes",
             "media_session_max_bytes",
+            "stt_model",
+            "vision_model",
+            "media_analysis_timeout_ms",
+            "media_analysis_max_audio_bytes",
+            "media_analysis_max_video_bytes",
+            "video_frame_interval_seconds",
+            "video_max_frames",
+            "video_frame_max_bytes",
+            "ffmpeg_command",
         },
         "interview",
     )
@@ -1436,6 +1454,12 @@ def _interview_settings(
         raise ConfigurationError(
             "interview.media_session_max_bytes must not be smaller than media_chunk_max_bytes"
         )
+    analysis_timeout_ms = _optional_bounded_positive_int(
+        mapping,
+        "media_analysis_timeout_ms",
+        default=120_000,
+        maximum=300_000,
+    )
     return InterviewSettings(
         _interview_realtime_settings(
             mapping.get("realtime"),
@@ -1445,6 +1469,40 @@ def _interview_settings(
         Path(_optional_string(mapping.get("recording_directory")) or "data/interview-media"),
         chunk_max,
         session_max,
+        _optional_string(mapping.get("stt_model")),
+        _optional_string(mapping.get("vision_model")),
+        analysis_timeout_ms,
+        _optional_bounded_positive_int(
+            mapping,
+            "media_analysis_max_audio_bytes",
+            default=26_214_400,
+            maximum=104_857_600,
+        ),
+        _optional_bounded_positive_int(
+            mapping,
+            "media_analysis_max_video_bytes",
+            default=52_428_800,
+            maximum=536_870_912,
+        ),
+        _optional_bounded_positive_int(
+            mapping,
+            "video_frame_interval_seconds",
+            default=5,
+            maximum=300,
+        ),
+        _optional_bounded_positive_int(
+            mapping,
+            "video_max_frames",
+            default=24,
+            maximum=120,
+        ),
+        _optional_bounded_positive_int(
+            mapping,
+            "video_frame_max_bytes",
+            default=1_048_576,
+            maximum=8_388_608,
+        ),
+        _optional_string(mapping.get("ffmpeg_command")) or "ffmpeg",
     )
 
 

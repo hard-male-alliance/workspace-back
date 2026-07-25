@@ -82,11 +82,7 @@ def test_safe_template_renders_full_resume_content_and_escapes_tex() -> None:
                         "visible": True,
                         "title": "Backend Engineer",
                         "organization": "ACME_Cloud",
-                        "date_range": {
-                            "start": {"value": "2024-01"},
-                            "end": None,
-                            "present": True,
-                        },
+                        "date_range": {"start": "2024-01", "end": "present"},
                         "summary": {"text": "Owned API delivery."},
                         "highlights": [{"text": "Reduced latency by 35%."}],
                         "skills": ["Python", "PostgreSQL"],
@@ -101,7 +97,7 @@ def test_safe_template_renders_full_resume_content_and_escapes_tex() -> None:
     assert "Backend Engineer" in latex
     assert "Reduced latency by 35\\%." in latex
     assert "ACME\\_Cloud" in latex
-    assert "2024-01 – Present" in latex
+    assert "2024-01 -- Present" in latex
     assert "Python, PostgreSQL" in latex
     assert "Backend \\& Platform" in latex
     assert "\\begin{itemize}" in latex
@@ -190,6 +186,93 @@ def test_fixed_template_selects_a_packaged_cjk_capable_font() -> None:
     assert r"\setmainfont{Noto Sans CJK SC}" in source
     assert "高级工程师" in source
     assert "可莉" in source
+
+
+def test_fixed_template_projects_complete_resume_content_and_escapes_tex() -> None:
+    """The fixed template renders all user-visible SIR fields without evaluating TeX."""
+
+    document = {
+        **_resume_document(),
+        "profile": {
+            "full_name": "林可莉",
+            "headline": "Senior Backend Engineer",
+            "summary": {
+                "text": "专注 Python、PostgreSQL 与可靠分布式系统。",
+                "marks": [],
+            },
+            "contacts": [
+                {
+                    "id": "contact_email",
+                    "kind": "email",
+                    "label": "Email",
+                    "value": "klee@example.com",
+                    "url": "mailto:klee@example.com",
+                }
+            ],
+        },
+        "sections": [
+            {
+                "id": "section_experience",
+                "kind": "experience",
+                "title": "工作经历",
+                "visible": True,
+                "content": None,
+                "items": [
+                    {
+                        "id": "item_experience",
+                        "kind": "experience",
+                        "title": "高级后端工程师",
+                        "subtitle": "平台团队",
+                        "organization": "Example & Co",
+                        "location": "上海",
+                        "date_range": {"start": "2022-01", "end": "present"},
+                        "summary": {"text": "负责 API 平台。", "marks": []},
+                        "highlights": [
+                            {
+                                "text": "将任务失败率从 3% 降至 0.2%。",
+                                "marks": [],
+                            },
+                            {
+                                "text": r"拒绝执行 \input{/etc/passwd}",
+                                "marks": [],
+                            },
+                        ],
+                        "skills": ["Python", "PostgreSQL"],
+                        "tags": [],
+                        "visible": True,
+                        "url": "https://example.com/project?id=1&view=full",
+                    }
+                ],
+            },
+            {
+                "id": "section_hidden",
+                "kind": "custom",
+                "title": "不得出现",
+                "visible": False,
+                "content": {"text": "secret", "marks": []},
+                "items": [],
+            },
+        ],
+    }
+
+    source = rendering._safe_template(document)
+
+    for expected in (
+        "林可莉",
+        "Senior Backend Engineer",
+        "klee@example.com",
+        "工作经历",
+        "高级后端工程师",
+        "Example \\& Co",
+        "2022-01 -- Present",
+        "将任务失败率从 3\\% 降至 0.2\\%。",
+        "Python, PostgreSQL",
+        "id=1\\&view=full",
+    ):
+        assert expected in source
+    assert "不得出现" not in source
+    assert r"\input{/etc/passwd}" not in source
+    assert r"\textbackslash{}input\{/etc/passwd\}" in source
 
 
 def _install_fake_renderer_command(
