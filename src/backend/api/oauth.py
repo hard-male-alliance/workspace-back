@@ -9,6 +9,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from backend.api.constants import PUBLIC_ORIGIN
 from backend.api.identity import IDENTITY_BROWSER_COOKIE, IDENTITY_LOGIN_COOKIE
 from backend.application.oauth import OAuthAuthorizationError, OAuthTokenError
 from backend.composition import BackendContainer
@@ -57,7 +58,11 @@ def _oauth_error_response(error: OAuthAuthorizationError) -> Response:
         query = parse_qsl(parsed.query, keep_blank_values=True)
         query.extend(
             (key, value)
-            for key, value in (("error", error.error), ("state", error.state))
+            for key, value in (
+                ("error", error.error),
+                ("state", error.state),
+                ("iss", PUBLIC_ORIGIN),
+            )
             if value is not None
         )
         return _secure_browser_headers(

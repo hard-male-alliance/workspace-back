@@ -190,6 +190,7 @@ def test_registration_login_and_oauth_resume_are_complete_and_secret_safe(
     assert resumed.status_code == 303
     query = parse_qs(urlsplit(resumed.headers["location"]).query)
     assert query["state"] == ["state-signup-012345"]
+    assert query["iss"] == ["https://api.hmalliances.org"]
     assert query["code"][0].startswith("code_")
 
     token = backend_client.post(

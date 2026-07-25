@@ -77,6 +77,7 @@ async def openid_configuration() -> JSONResponse:
             "request_parameter_supported": False,
             "request_uri_parameter_supported": False,
             "claims_parameter_supported": False,
+            "authorization_response_iss_parameter_supported": True,
         }
     )
 

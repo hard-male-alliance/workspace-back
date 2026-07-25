@@ -82,6 +82,7 @@ def test_error_after_redirect_validation_returns_only_a_safe_oauth_redirect(
     assert parse_qs(location.query) == {
         "error": ["invalid_request"],
         "state": ["state-test-0123456789"],
+        "iss": ["https://api.hmalliances.org"],
     }
     assert "error_description" not in location.query
 

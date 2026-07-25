@@ -392,6 +392,7 @@ def test_public_openid_configuration_only_advertises_the_frozen_secure_flow(
         "request_parameter_supported": False,
         "request_uri_parameter_supported": False,
         "claims_parameter_supported": False,
+        "authorization_response_iss_parameter_supported": True,
     }
     serialized = response.text
     assert "implicit" not in serialized
