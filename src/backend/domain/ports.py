@@ -168,11 +168,25 @@ class HostedIdentityRepository(Protocol):
     async def get_browser_session(self, session_id: str) -> IdentityBrowserSessionRecord | None:
         """Read a browser binding by opaque server identifier."""
 
+    async def rotate_browser_csrf(
+        self,
+        session_id: str,
+        *,
+        csrf_token_hash: str,
+        last_seen_at: datetime,
+    ) -> bool:
+        """Rotate the one-time CSRF capability for an existing browser binding."""
+
     async def create_flow(self, record: IdentityFlowRecord) -> None:
         """Persist a new identity flow."""
 
     async def get_flow(self, flow_id: str) -> IdentityFlowRecord | None:
         """Read one identity flow."""
+
+    async def get_flow_for_authorization(
+        self, authorization_request_id: str
+    ) -> IdentityFlowRecord | None:
+        """Read the single flow already attached to an OAuth authorization request."""
 
     async def transition_flow(
         self,

@@ -34,6 +34,7 @@ from backend.domain.identity import (
     IdentityFlowRecord,
     IdentitySessionRecord,
     IdentityUserRecord,
+    canonicalize_email,
 )
 from backend.domain.ports import (
     BreachedPasswordChecker,
@@ -79,6 +80,7 @@ class HostedIdentityService:
         oauth: OAuthAuthorizationService,
         email_sender: IdentityEmailSender,
         *,
+        demo_password_auth_enabled: bool = False,
         breached_password_checker: BreachedPasswordChecker | None = None,
         lifetime_seconds: int = 600,
         email_code_ttl_seconds: int = 600,
@@ -92,6 +94,7 @@ class HostedIdentityService:
         self._repository = repository
         self._oauth = oauth
         self._email_sender = email_sender
+        self._demo_password_auth_enabled = demo_password_auth_enabled
         self._breached_password_checker = breached_password_checker
         self._lifetime_seconds = lifetime_seconds
         self._email_code_ttl_seconds = email_code_ttl_seconds
@@ -103,6 +106,12 @@ class HostedIdentityService:
         self._allow_test_email_codes = allow_test_email_codes
         self._test_email_codes: dict[str, str] = {}
         self._step_lock = asyncio.Lock()
+
+    @property
+    def demo_password_auth_enabled(self) -> bool:
+        """Return whether the explicitly local-only password form is enabled."""
+
+        return self._demo_password_auth_enabled
 
     async def verify_recent(
         self,
@@ -163,6 +172,193 @@ class HostedIdentityService:
             )
         )
         return BrowserBinding(f"{session_id}.{secret}", csrf_token)
+
+    async def begin_demo_browser_session(
+        self,
+        authorization_request_id: str,
+        cookie_value: str | None,
+    ) -> BrowserBinding:
+        """Create or safely refresh a Demo form binding for one OAuth transaction."""
+
+        self._require_demo_password_auth()
+        await self._oauth.get_pending_authorization(authorization_request_id)
+        if cookie_value is None:
+            return await self.begin_browser_session(authorization_request_id)
+        try:
+            browser = await self._verified_browser(cookie_value)
+        except HostedIdentityError:
+            return await self.begin_browser_session(authorization_request_id)
+        if browser.authorization_request_id != authorization_request_id:
+            return await self.begin_browser_session(authorization_request_id)
+        csrf_token = secrets.token_urlsafe(32)
+        rotated = await self._repository.rotate_browser_csrf(
+            browser.id,
+            csrf_token_hash=_secret_hash(csrf_token),
+            last_seen_at=datetime.now(UTC),
+        )
+        if not rotated:
+            return await self.begin_browser_session(authorization_request_id)
+        return BrowserBinding(cookie_value, csrf_token)
+
+    async def submit_demo_password_flow(
+        self,
+        authorization_request_id: str,
+        *,
+        purpose: str,
+        email: str,
+        password: str,
+        locale: str,
+        cookie_value: str | None,
+        csrf_token: str | None,
+        device_name: str | None,
+        network_identifier: str,
+    ) -> IdentityStepResult:
+        """Run the local-only email/password form through the durable identity state machine."""
+
+        self._require_demo_password_auth()
+        if purpose not in {"register", "login"}:
+            raise HostedIdentityError(
+                "identity.purpose_invalid", 400, "Identity flow purpose is invalid"
+            )
+        browser = await self._verified_browser(cookie_value, csrf_token=csrf_token)
+        authorization = await self._oauth.get_pending_authorization(authorization_request_id)
+        if browser.authorization_request_id != authorization.id:
+            raise HostedIdentityError(
+                "identity.binding_invalid", 403, "Identity flow binding is invalid"
+            )
+        canonical_email = canonicalize_email(email)
+        if len(canonical_email) > 320 or _EMAIL_PATTERN.fullmatch(canonical_email) is None:
+            raise HostedIdentityError(
+                "identity.identifier_invalid", 400, "Identifier is invalid"
+            )
+        if purpose == "register":
+            _validate_demo_password(password)
+            if await self._repository.get_user_by_email(canonical_email) is not None:
+                raise HostedIdentityError(
+                    "identity.flow_cannot_complete",
+                    409,
+                    "Registration cannot complete",
+                )
+        else:
+            candidate = await self._repository.get_user_by_email(canonical_email)
+            verifier = (
+                await self._repository.password_verifier(candidate.id)
+                if candidate is not None
+                else _FAKE_PASSWORD_VERIFIER
+            )
+            if (
+                not _password_verify(password, verifier or _FAKE_PASSWORD_VERIFIER)
+                or candidate is None
+            ):
+                raise HostedIdentityError(
+                    "identity.credentials_invalid",
+                    400,
+                    "Identifier or credential is invalid",
+                )
+        async with self._step_lock:
+            flow = await self._repository.get_flow_for_authorization(authorization.id)
+            if flow is None:
+                now = datetime.now(UTC)
+                flow = IdentityFlowRecord(
+                    id=new_opaque_id("idflow"),
+                    purpose=purpose,
+                    status="pending",
+                    allowed_steps=("identify",),
+                    authorization_request_id=authorization.id,
+                    browser_session_id=browser.id,
+                    client_id=authorization.client_id,
+                    redirect_uri=authorization.redirect_uri,
+                    code_challenge=authorization.code_challenge,
+                    created_at=now,
+                    expires_at=min(authorization.expires_at, browser.expires_at),
+                    internal_state={"demo_password_auth": True},
+                )
+                await self._repository.create_flow(flow)
+            if flow.browser_session_id != browser.id:
+                raise HostedIdentityError(
+                    "identity.binding_invalid", 403, "Identity flow binding is invalid"
+                )
+            if flow.purpose != purpose:
+                raise HostedIdentityError(
+                    "identity.flow_conflict", 409, "Identity flow purpose cannot be changed"
+                )
+            if flow.status == "completed":
+                if flow.user_id is None:
+                    raise HostedIdentityError(
+                        "identity.flow_invalid", 409, "Identity flow is incomplete"
+                    )
+                login_cookie = await self._create_login_session(
+                    flow.user_id,
+                    client_id=flow.client_id,
+                    device_name=device_name,
+                )
+                await self._repository.bind_browser_user(browser.id, flow.user_id)
+                await self._consume_browser_csrf(browser.id)
+                return IdentityStepResult(flow, login_cookie)
+
+        await self.submit_step(
+            flow.id,
+            {
+                "kind": "identify",
+                "step_id": "step_demo_identify",
+                "identifier": email,
+            },
+            cookie_value=cookie_value,
+            csrf_token=csrf_token,
+            device_name=device_name,
+            network_identifier=network_identifier,
+        )
+        if purpose == "register":
+            await self.submit_step(
+                flow.id,
+                {
+                    "kind": "set_profile",
+                    "step_id": "step_demo_profile",
+                    "display_name": canonical_email,
+                    "locale": locale,
+                    "terms_version": "local-demo",
+                    "privacy_version": "local-demo",
+                },
+                cookie_value=cookie_value,
+                csrf_token=csrf_token,
+                device_name=device_name,
+                network_identifier=network_identifier,
+            )
+            await self.submit_step(
+                flow.id,
+                {
+                    "kind": "set_password",
+                    "step_id": "step_demo_password",
+                    "password": password,
+                },
+                cookie_value=cookie_value,
+                csrf_token=csrf_token,
+                device_name=device_name,
+                network_identifier=network_identifier,
+            )
+        else:
+            await self.submit_step(
+                flow.id,
+                {
+                    "kind": "verify_password",
+                    "step_id": "step_demo_password",
+                    "password": password,
+                },
+                cookie_value=cookie_value,
+                csrf_token=csrf_token,
+                device_name=device_name,
+                network_identifier=network_identifier,
+            )
+        result = await self.submit_step(
+            flow.id,
+            {"kind": "complete", "step_id": "step_demo_complete"},
+            cookie_value=cookie_value,
+            csrf_token=csrf_token,
+            device_name=device_name,
+            network_identifier=network_identifier,
+        )
+        await self._consume_browser_csrf(browser.id)
+        return result
 
     async def create_flow(
         self,
@@ -287,8 +483,31 @@ class HostedIdentityService:
                 )
             if kind == "set_password":
                 password = str(body["password"])
-                await _validate_new_password(password, self._breached_password_checker)
-                next_steps = ("complete",) if flow.purpose == "recover" else ("send_email_code",)
+                state = flow.internal_state or {}
+                if (
+                    flow.purpose == "register"
+                    and state.get("demo_password_auth") is True
+                ):
+                    _validate_demo_password(password)
+                else:
+                    await _validate_new_password(password, self._breached_password_checker)
+                next_steps = (
+                    ("complete",)
+                    if flow.purpose == "recover"
+                    or (
+                        flow.purpose == "register"
+                        and state.get("demo_password_auth") is True
+                    )
+                    else ("send_email_code",)
+                )
+                password_state_updates: dict[str, object] = {
+                    "password_verifier": _password_hash(password)
+                }
+                if (
+                    flow.purpose == "register"
+                    and state.get("demo_password_auth") is True
+                ):
+                    password_state_updates["pending_user_id"] = new_opaque_id("usr")
                 return IdentityStepResult(
                     await self._transition(
                         flow,
@@ -296,7 +515,7 @@ class HostedIdentityService:
                         step_id,
                         kind,
                         allowed_steps=next_steps,
-                        state_updates={"password_verifier": _password_hash(password)},
+                        state_updates=password_state_updates,
                     )
                 )
             if kind == "send_email_code":
@@ -507,7 +726,7 @@ class HostedIdentityService:
         step_id: str,
         identifier: str,
     ) -> IdentityFlowRecord:
-        email = identifier.strip().casefold()
+        email = canonicalize_email(identifier)
         if len(email) > 320 or _EMAIL_PATTERN.fullmatch(email) is None:
             raise HostedIdentityError("identity.identifier_invalid", 400, "Identifier is invalid")
         user = await self._repository.get_user_by_email(email)
@@ -856,7 +1075,13 @@ class HostedIdentityService:
                     "identity.flow_invalid", 409, "Identity flow is incomplete"
                 )
             now = datetime.now(UTC)
-            user_id = new_opaque_id("usr")
+            pending_user_id = state.get("pending_user_id")
+            user_id = (
+                pending_user_id
+                if state.get("demo_password_auth") is True
+                and isinstance(pending_user_id, str)
+                else new_opaque_id("usr")
+            )
             pending_passkey = state.get("pending_passkey")
             passkey = (
                 _pending_passkey_record(pending_passkey, user_id, now)
@@ -868,7 +1093,7 @@ class HostedIdentityService:
                     id=user_id,
                     subject=f"oidc-{secrets.token_urlsafe(24)}",
                     email=str(state["identifier"]),
-                    email_verified=True,
+                    email_verified=state.get("demo_password_auth") is not True,
                     display_name=str(state["display_name"]),
                     locale=str(state["locale"]),
                 ),
@@ -878,9 +1103,19 @@ class HostedIdentityService:
                 passkey=passkey,
             )
             if not created:
-                raise HostedIdentityError(
-                    "identity.flow_cannot_complete", 409, "Identity flow cannot be completed"
+                existing_user = await self._repository.get_user_by_email(
+                    str(state["identifier"])
                 )
+                if (
+                    state.get("demo_password_auth") is not True
+                    or existing_user is None
+                    or existing_user.id != user_id
+                ):
+                    raise HostedIdentityError(
+                        "identity.flow_cannot_complete",
+                        409,
+                        "Identity flow cannot be completed",
+                    )
         elif flow.purpose == "recover":
             verifier = state.get("password_verifier")
             if user_id is None or not isinstance(verifier, str):
@@ -903,20 +1138,10 @@ class HostedIdentityService:
         rotated_session_id = state.get("rotated_session_id")
         if flow.purpose == "reauthenticate" and isinstance(rotated_session_id, str):
             await self._repository.revoke_login_session(user_id, rotated_session_id, now)
-        session_id, session_secret = new_opaque_id("loginsess"), secrets.token_urlsafe(32)
-        await self._repository.create_login_session(
-            IdentitySessionRecord(
-                id=session_id,
-                user_id=user_id,
-                client_id=flow.client_id,
-                client_name=flow.client_id,
-                device_name=device_name[:200] if device_name else None,
-                session_secret_hash=_secret_hash(session_secret),
-                created_at=now,
-                last_seen_at=now,
-                idle_expires_at=now + timedelta(seconds=self._session_idle_ttl_seconds),
-                absolute_expires_at=now + timedelta(seconds=self._session_absolute_ttl_seconds),
-            )
+        login_cookie_value = await self._create_login_session(
+            user_id,
+            client_id=flow.client_id,
+            device_name=device_name,
         )
         await self._repository.bind_browser_user(browser.id, user_id)
         resume_uri = f"/oauth/authorize/resume/{flow.authorization_request_id}"
@@ -932,7 +1157,45 @@ class HostedIdentityService:
             authorization_resume_uri=resume_uri,
             completed_at=now,
         )
-        return IdentityStepResult(updated, f"{session_id}.{session_secret}")
+        return IdentityStepResult(updated, login_cookie_value)
+
+    async def _create_login_session(
+        self,
+        user_id: str,
+        *,
+        client_id: str,
+        device_name: str | None,
+    ) -> str:
+        now = datetime.now(UTC)
+        session_id, session_secret = new_opaque_id("loginsess"), secrets.token_urlsafe(32)
+        await self._repository.create_login_session(
+            IdentitySessionRecord(
+                id=session_id,
+                user_id=user_id,
+                client_id=client_id,
+                client_name=client_id,
+                device_name=device_name[:200] if device_name else None,
+                session_secret_hash=_secret_hash(session_secret),
+                created_at=now,
+                last_seen_at=now,
+                idle_expires_at=now + timedelta(seconds=self._session_idle_ttl_seconds),
+                absolute_expires_at=now + timedelta(seconds=self._session_absolute_ttl_seconds),
+            )
+        )
+        return f"{session_id}.{session_secret}"
+
+    async def _consume_browser_csrf(self, browser_session_id: str) -> None:
+        await self._repository.rotate_browser_csrf(
+            browser_session_id,
+            csrf_token_hash=_secret_hash(secrets.token_urlsafe(32)),
+            last_seen_at=datetime.now(UTC),
+        )
+
+    def _require_demo_password_auth(self) -> None:
+        if not self._demo_password_auth_enabled:
+            raise HostedIdentityError(
+                "identity.demo_disabled", 404, "Demo password authentication is disabled"
+            )
 
     async def _transition(
         self,
@@ -1004,6 +1267,17 @@ class HostedIdentityService:
 
 def _secret_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _validate_demo_password(password: str) -> None:
+    """Validate the deliberately simple local-only Demo password."""
+
+    if len(password) < 6 or len(password) > 1024:
+        raise HostedIdentityError(
+            "identity.password_policy",
+            400,
+            "Demo password does not satisfy the length policy",
+        )
 
 
 async def _validate_new_password(

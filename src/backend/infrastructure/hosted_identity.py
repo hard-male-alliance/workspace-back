@@ -17,6 +17,7 @@ from backend.domain.identity import (
     IdentityFlowRecord,
     IdentitySessionRecord,
     IdentityUserRecord,
+    canonicalize_email,
 )
 from backend.domain.principals import MembershipId, ResourceMeta, Subject, UserId, WorkspaceId
 from backend.domain.users import User
@@ -112,15 +113,52 @@ class InMemoryHostedIdentityRepository:
             record = self._browser_sessions.get(session_id)
             return replace(record) if record is not None else None
 
+    async def rotate_browser_csrf(
+        self,
+        session_id: str,
+        *,
+        csrf_token_hash: str,
+        last_seen_at: datetime,
+    ) -> bool:
+        async with self._lock:
+            record = self._browser_sessions.get(session_id)
+            if record is None or record.expires_at <= last_seen_at:
+                return False
+            self._browser_sessions[session_id] = replace(
+                record,
+                csrf_token_hash=csrf_token_hash,
+                last_seen_at=last_seen_at,
+            )
+            return True
+
     async def create_flow(self, record: IdentityFlowRecord) -> None:
         async with self._lock:
             if record.id in self._flows:
                 raise RuntimeError("identity flow id collision")
+            if any(
+                flow.authorization_request_id == record.authorization_request_id
+                for flow in self._flows.values()
+            ):
+                raise RuntimeError("authorization request already has an identity flow")
             self._flows[record.id] = replace(record)
 
     async def get_flow(self, flow_id: str) -> IdentityFlowRecord | None:
         async with self._lock:
             record = self._flows.get(flow_id)
+            return replace(record) if record is not None else None
+
+    async def get_flow_for_authorization(
+        self, authorization_request_id: str
+    ) -> IdentityFlowRecord | None:
+        async with self._lock:
+            record = next(
+                (
+                    flow
+                    for flow in self._flows.values()
+                    if flow.authorization_request_id == authorization_request_id
+                ),
+                None,
+            )
             return replace(record) if record is not None else None
 
     async def transition_flow(
@@ -170,7 +208,7 @@ class InMemoryHostedIdentityRepository:
 
     async def get_user_by_email(self, normalized_email: str) -> IdentityUserRecord | None:
         async with self._lock:
-            user_id = self._user_ids_by_email.get(_canonical_email(normalized_email))
+            user_id = self._user_ids_by_email.get(canonicalize_email(normalized_email))
             user = self._users.get(user_id or "")
             return replace(user) if user is not None else None
 
@@ -199,7 +237,7 @@ class InMemoryHostedIdentityRepository:
             false on a uniqueness conflict.
         """
         access_user, workspace, owner = _new_personal_access(user, now, self._data_region)
-        canonical_email = _canonical_email(user.email)
+        canonical_email = canonicalize_email(user.email)
         async with self._lock:
             if canonical_email in self._user_ids_by_email or user.id in self._users:
                 return False
@@ -455,8 +493,42 @@ class PostgresHostedIdentityRepository:
                 expires_at=record.expires_at,
             )
 
+    async def rotate_browser_csrf(
+        self,
+        session_id: str,
+        *,
+        csrf_token_hash: str,
+        last_seen_at: datetime,
+    ) -> bool:
+        async with self._database.unscoped_transaction() as session:
+            record = await session.scalar(
+                select(IdentityBrowserSessionOrmRecord)
+                .where(IdentityBrowserSessionOrmRecord.id == session_id)
+                .with_for_update()
+            )
+            if record is None or record.expires_at <= last_seen_at:
+                return False
+            record.csrf_token_hash = csrf_token_hash
+            record.last_seen_at = last_seen_at
+            return True
+
     async def create_flow(self, record: IdentityFlowRecord) -> None:
         async with self._database.unscoped_transaction() as session:
+            await session.execute(
+                text(
+                    "SELECT id FROM identity.oauth_authorization_requests "
+                    "WHERE id = :request_id FOR UPDATE"
+                ),
+                {"request_id": record.authorization_request_id},
+            )
+            existing = await session.scalar(
+                select(IdentityFlowOrmRecord.id).where(
+                    IdentityFlowOrmRecord.authorization_request_id
+                    == record.authorization_request_id
+                )
+            )
+            if existing is not None:
+                raise RuntimeError("authorization request already has an identity flow")
             session.add(
                 IdentityFlowOrmRecord(
                     id=record.id,
@@ -503,6 +575,21 @@ class PostgresHostedIdentityRepository:
                 expires_at=record.expires_at,
                 completed_at=record.completed_at,
             )
+
+    async def get_flow_for_authorization(
+        self, authorization_request_id: str
+    ) -> IdentityFlowRecord | None:
+        async with self._database.unscoped_transaction() as session:
+            record = await session.scalar(
+                select(IdentityFlowOrmRecord)
+                .where(
+                    IdentityFlowOrmRecord.authorization_request_id
+                    == authorization_request_id
+                )
+                .order_by(IdentityFlowOrmRecord.created_at)
+                .limit(1)
+            )
+            return _flow_from_orm(record) if record is not None else None
 
     async def transition_flow(
         self,
@@ -579,7 +666,7 @@ class PostgresHostedIdentityRepository:
         async with self._database.unscoped_transaction() as session:
             user_id = await session.scalar(
                 text("SELECT identity.resolve_login_user_id(:email)"),
-                {"email": _canonical_email(normalized_email)},
+                {"email": canonicalize_email(normalized_email)},
             )
             if not isinstance(user_id, str):
                 return None
@@ -635,7 +722,7 @@ class PostgresHostedIdentityRepository:
                     external_subject=user.subject,
                     display_name=user.display_name,
                     email=user.email,
-                    email_canonical=_canonical_email(user.email),
+                    email_canonical=canonicalize_email(user.email),
                     email_verified=user.email_verified,
                     account_status="active",
                     default_workspace_id=None,
@@ -1022,7 +1109,7 @@ def _new_personal_access(
     access_user = User(
         ResourceMeta(UserId(user.id), 1, now, now),
         Subject(user.subject),
-        _canonical_email(user.email),
+        canonicalize_email(user.email),
         user.email_verified,
         user.display_name,
         user.locale,
@@ -1037,16 +1124,6 @@ def _new_personal_access(
         MemberStatus.ACTIVE,
     )
     return access_user, workspace, owner
-
-
-def _canonical_email(email: str) -> str:
-    """@brief 生成 identity 等值比较邮箱 / Canonicalize an email for identity equality.
-
-    @param email 已完成语法验证的邮箱 / Syntax-validated email.
-    @return 与 PostgreSQL ``lower(btrim())`` 一致的邮箱 / Email matching PostgreSQL
-        ``lower(btrim())`` canonicalization.
-    """
-    return email.strip().lower()
 
 
 def _user_from_orm(record: UserOrmRecord | None) -> IdentityUserRecord | None:
