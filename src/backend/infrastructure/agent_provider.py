@@ -356,6 +356,7 @@ def _provider_request(request: AgentProviderRequest) -> dict[str, Any]:
     resume_root_id: str | None = None
     if request.resume_context is not None:
         resume_root_id = request.resume_context.resume_ref.id
+        wants_operations = AgentOutputMode.RESUME_OPERATIONS in request.spec.output_modes
         quality_report = analyze_resume_quality(request.resume_context.document)
         user_instruction = "\n".join(
             part.text
@@ -374,8 +375,16 @@ def _provider_request(request: AgentProviderRequest) -> dict[str, Any]:
                     {
                         "kind": "authoritative_resume_snapshot",
                         "instruction": (
-                            "Return reviewable operation drafts only. "
-                            "Do not claim that the Resume was changed."
+                            (
+                                "Return reviewable operation drafts only. "
+                                "Do not claim that the Resume was changed."
+                            )
+                            if wants_operations
+                            else (
+                                "Use this exact Resume snapshot as the authoritative context. "
+                                "Give analysis and advice only; return no operation drafts and "
+                                "do not claim that the Resume was changed."
+                            )
                         ),
                         "quality_report": {
                             "score": quality_report.score,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import secrets
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ _MAXIMUM_BATCH_SIZE = 100
 
 _MAXIMUM_ATTEMPTS = 100
 """@brief 可配置尝试次数硬上限 / Hard cap for configurable attempts."""
+
+logger = logging.getLogger(__name__)
 
 
 class OutboxLeaseLost(RuntimeError):
@@ -195,7 +198,21 @@ class OutboxDispatchService:
                 failed += outcome == "failed"
                 lost_leases += outcome == "lost"
                 continue
-            except Exception:
+            except Exception as error:
+                constraint_name = _safe_constraint_name(error)
+                logger.warning(
+                    "backend.outbox.handler_failed",
+                    extra={
+                        "event_name": "backend.outbox.handler_failed",
+                        "telemetry_attributes": {
+                            "operation": "outbox_dispatch",
+                            "outcome": "retry",
+                            "event_type": claim.event_type,
+                            "error_type": type(error).__name__,
+                            "constraint_name": constraint_name,
+                        },
+                    },
+                )
                 outcome = await self._retry(
                     claim,
                     "outbox.handler_failed",
@@ -346,6 +363,21 @@ def _retry_delay(
     jitter_basis_points = 8_000 + int.from_bytes(digest[:2], "big") * 4_001 // 65_536
     milliseconds = max(1_000, nominal * 1_000 * jitter_basis_points // 10_000)
     return timedelta(milliseconds=milliseconds)
+
+
+def _safe_constraint_name(error: Exception) -> str | None:
+    """@brief 从数据库异常链提取非秘密约束名 / Extract a non-secret constraint name from a database exception chain."""
+
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        name = getattr(current, "constraint_name", None)
+        if isinstance(name, str) and name:
+            return name
+        original = getattr(current, "orig", None)
+        current = original if isinstance(original, BaseException) else current.__cause__
+    return None
 
 
 def _new_lease() -> OutboxLease:

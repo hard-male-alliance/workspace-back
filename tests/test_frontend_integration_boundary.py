@@ -57,6 +57,21 @@ def test_knowledge_patch_preflight_and_new_collection_routes_are_discoverable(
     assert "patch" in preflight.headers["access-control-allow-methods"].lower()
     assert "if-match" in preflight.headers["access-control-allow-headers"].lower()
 
+    upload_preflight = backend_client.options(
+        "/__local-uploads/workspace_example/upload_example",
+        headers={
+            "Origin": "http://127.0.0.1:5173",
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "X-AIWS-Content-SHA256",
+        },
+    )
+    assert upload_preflight.status_code == 200, upload_preflight.text
+    assert "put" in upload_preflight.headers["access-control-allow-methods"].lower()
+    assert (
+        "x-aiws-content-sha256"
+        in upload_preflight.headers["access-control-allow-headers"].lower()
+    )
+
     paths = backend_client.get("/openapi.json").json()["paths"]
     expected_methods = {
         "/api/v1/me": "get",

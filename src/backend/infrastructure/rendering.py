@@ -36,7 +36,7 @@ _PIPE_READ_CHUNK_BYTES = 16 * 1024
 """@brief 单次诊断 pipe 读取上限 / Maximum bytes read from one diagnostic pipe at a time."""
 
 _DIAGNOSTIC_CAPTURE_BYTES = 4 * 1024
-"""@brief 保存在内存中的诊断前缀上限 / Maximum diagnostic prefix retained in memory."""
+"""@brief 保存在内存中的诊断尾部上限 / Maximum diagnostic tail retained in memory."""
 
 _PROCESS_TERMINATION_GRACE_SECONDS = 1.0
 """@brief 给 SIGTERM 的清理宽限期 / Cleanup grace period granted to SIGTERM."""
@@ -54,12 +54,12 @@ class _BoundedCompilerOutput:
     """@brief 有界收集编译器 pipe 输出 / Collect compiler-pipe output with strict bounds.
 
     @note ``bytes_seen`` 始终计入 stdout 与 stderr；只保留有限 stderr 前缀，避免把
-    非结构化诊断变成进程内存的无界输入。
+    非结构化诊断变成进程内存的无界输入；保留尾部以覆盖编译器最终错误。
     """
 
     max_output_bytes: int
     bytes_seen: int = 0
-    diagnostic_prefix: bytearray = field(default_factory=bytearray)
+    diagnostic_tail: bytearray = field(default_factory=bytearray)
 
     def consume(self, chunk: bytes, *, is_stderr: bool) -> None:
         """@brief 计入一段 pipe 输出 / Account for one chunk of pipe output.
@@ -71,9 +71,9 @@ class _BoundedCompilerOutput:
 
         self.bytes_seen += len(chunk)
         del is_stderr
-        if len(self.diagnostic_prefix) < _DIAGNOSTIC_CAPTURE_BYTES:
-            remaining = _DIAGNOSTIC_CAPTURE_BYTES - len(self.diagnostic_prefix)
-            self.diagnostic_prefix.extend(chunk[:remaining])
+        self.diagnostic_tail.extend(chunk)
+        if len(self.diagnostic_tail) > _DIAGNOSTIC_CAPTURE_BYTES:
+            del self.diagnostic_tail[:-_DIAGNOSTIC_CAPTURE_BYTES]
         if self.bytes_seen > self.max_output_bytes:
             raise _CombinedOutputLimitExceeded
 
@@ -83,6 +83,9 @@ class MockRenderer:
 
     @note MOCK — 只用于测试和无 TeX 的本地研发；不执行用户提供的 LaTeX。
     """
+
+    version = "mock-fixed-template-v1"
+    """@brief 写入 Artifact 审计元数据的稳定 renderer 版本 / Stable renderer version written to Artifact audit metadata."""
 
     async def render(self, document: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
         """@brief 生成最小 PDF 与 source map / Produce a minimal PDF and source map.
@@ -173,6 +176,9 @@ class SandboxedXeLaTeXRenderer:
     @note 生产必需边界是无特权 Landlock/libseccomp；Bubblewrap 仅为真实 probe 后的额外层。
     """
 
+    version = "xelatex-fixed-template-v1"
+    """@brief 写入 Artifact 审计元数据的稳定 renderer 版本 / Stable renderer version written to Artifact audit metadata."""
+
     def __init__(
         self,
         settings: RendererSettings,
@@ -208,7 +214,9 @@ class SandboxedXeLaTeXRenderer:
             )
         latex = _safe_template(document)
         if len(latex.encode("utf-8")) > self._settings.max_input_bytes:
-            raise DomainError(Problem("resume.input_too_large", 413, "Resume render input is too large"))
+            raise DomainError(
+                Problem("resume.input_too_large", 413, "Resume render input is too large")
+            )
         with tempfile.TemporaryDirectory(prefix="aiws-xelatex-") as temporary_directory:
             workdir = Path(temporary_directory)
             source_path = workdir / "resume.tex"
@@ -270,12 +278,19 @@ class SandboxedXeLaTeXRenderer:
                             "resume.render_failed",
                             422,
                             "Resume compilation failed",
-                            extensions={"exit_code": process.returncode, "diagnostic": _safe_diagnostic(stderr)},
+                            extensions={
+                                "exit_code": process.returncode,
+                                "diagnostic": _safe_diagnostic(stderr),
+                            },
                         )
                     )
                 content = _read_limited_pdf(output_path, self._settings.max_output_bytes)
                 if not content.startswith(b"%PDF-"):
-                    raise DomainError(Problem("resume.invalid_pdf", 422, "Renderer did not produce an acceptable PDF"))
+                    raise DomainError(
+                        Problem(
+                            "resume.invalid_pdf", 422, "Renderer did not produce an acceptable PDF"
+                        )
+                    )
             finally:
                 if not process_group_cleaned:
                     await _terminate_process_group(process)
@@ -369,13 +384,21 @@ def _minimal_pdf(title: object) -> bytes:
     @return 最小 PDF 字节 / Minimal PDF bytes.
     """
     safe_title = str(title).encode("ascii", "replace")[:80]
-    content = b"BT /F1 12 Tf 72 720 Td (" + safe_title.replace(b"(", b"[").replace(b")", b"]") + b") Tj ET"
+    content = (
+        b"BT /F1 12 Tf 72 720 Td ("
+        + safe_title.replace(b"(", b"[").replace(b")", b"]")
+        + b") Tj ET"
+    )
     objects = [
         b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
         b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n",
         b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n",
         b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n",
-        b"5 0 obj << /Length " + str(len(content)).encode() + b" >> stream\n" + content + b"\nendstream endobj\n",
+        b"5 0 obj << /Length "
+        + str(len(content)).encode()
+        + b" >> stream\n"
+        + content
+        + b"\nendstream endobj\n",
     ]
     output = bytearray(b"%PDF-1.4\n")
     offsets = [0]
@@ -385,7 +408,9 @@ def _minimal_pdf(title: object) -> bytes:
     xref_offset = len(output)
     output.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode())
     output.extend(b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets[1:]))
-    output.extend(f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode())
+    output.extend(
+        f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode()
+    )
     return bytes(output)
 
 
@@ -449,9 +474,7 @@ def _safe_template(document: dict[str, Any]) -> str:
         "\\setlength{\\parskip}{4pt}\n"
         "\\setcounter{secnumdepth}{0}\n"
         "\\pagestyle{plain}\n"
-        "\\begin{document}\n"
-        + "".join(body)
-        + "\\end{document}\n"
+        "\\begin{document}\n" + "".join(body) + "\\end{document}\n"
     )
 
 
@@ -483,11 +506,7 @@ def _latex_contact(value: object) -> str:
         return ""
     label = _text(contact.get("label")).strip() or _text(contact.get("kind")).strip()
     rendered_value = _latex_escape(raw_value)
-    return (
-        f"{_latex_escape(label)}: {rendered_value}"
-        if label
-        else rendered_value
-    )
+    return f"{_latex_escape(label)}: {rendered_value}" if label else rendered_value
 
 
 def _latex_item(value: object) -> str:
@@ -504,9 +523,7 @@ def _latex_item(value: object) -> str:
     lines: list[str] = []
     if primary or date_range:
         lines.append(
-            f"\\textbf{{{primary}}}"
-            + (f"\\hfill {date_range}" if date_range else "")
-            + "\\\\\n"
+            f"\\textbf{{{primary}}}" + (f"\\hfill {date_range}" if date_range else "") + "\\\\\n"
         )
     if secondary:
         lines.append(f"\\textit{{{secondary}}}\\\\\n")
@@ -555,7 +572,18 @@ def _latex_escape(value: str) -> str:
     @param value 未信任文本 / Untrusted text.
     @return 转义结果 / Escaped result.
     """
-    replacements = {"\\": "\\textbackslash{}", "{": "\\{", "}": "\\}", "#": "\\#", "$": "\\$", "%": "\\%", "&": "\\&", "_": "\\_", "^": "\\textasciicircum{}", "~": "\\textasciitilde{}"}
+    replacements = {
+        "\\": "\\textbackslash{}",
+        "{": "\\{",
+        "}": "\\}",
+        "#": "\\#",
+        "$": "\\$",
+        "%": "\\%",
+        "&": "\\&",
+        "_": "\\_",
+        "^": "\\textasciicircum{}",
+        "~": "\\textasciitilde{}",
+    }
     return "".join(replacements.get(character, character) for character in value)
 
 
@@ -733,15 +761,22 @@ def _renderer_runtime_roots(xelatex_path: str) -> tuple[Path, ...]:
     """
 
     roots: set[Path] = set()
+    resolved_xelatex = Path(xelatex_path).resolve()
     for candidate in (
         Path(sys.prefix).resolve(),
         Path(sys.base_prefix).resolve(),
-        Path(xelatex_path).resolve().parent,
+        resolved_xelatex.parent,
     ):
         try:
             candidate.relative_to("/usr")
         except ValueError:
             roots.add(candidate)
+    platform_directory = resolved_xelatex.parent
+    bin_directory = platform_directory.parent
+    if bin_directory.name == "bin":
+        texlive_root = bin_directory.parent
+        if texlive_root not in {Path("/"), Path("/usr")}:
+            roots.add(texlive_root)
     return tuple(sorted(roots, key=str))
 
 
@@ -786,7 +821,7 @@ async def _collect_bounded_process_output(
 
     @param process 已启动的隔离编译进程 / Started isolated compiler process.
     @param max_output_bytes stdout 与 stderr 合并字节上限 / Combined stdout and stderr byte limit.
-    @return 已截断保留的 stderr 前缀 / Retained bounded stderr prefix.
+    @return 已截断保留的合并诊断尾部 / Retained bounded combined-diagnostic tail.
     @raise _CombinedOutputLimitExceeded 合并输出超过硬上限时抛出 / Raised when combined output crosses the hard limit.
     @note 本函数本身不发送信号；调用方必须在 ``finally`` 中终止进程组，以便取消、超时
     与输出超限共享同一条清理路径。
@@ -812,12 +847,12 @@ async def _collect_bounded_process_output(
                         first_error = error
             if first_error is not None:
                 raise first_error
-        return bytes(collector.diagnostic_prefix)
     finally:
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+    return bytes(collector.diagnostic_tail)
 
 
 async def _drain_compiler_pipe(
@@ -877,11 +912,15 @@ def _read_limited_pdf(path: Path, max_output_bytes: int) -> bytes:
     """
 
     if path.stat().st_size > max_output_bytes:
-        raise DomainError(Problem("resume.invalid_pdf", 422, "Renderer did not produce an acceptable PDF"))
+        raise DomainError(
+            Problem("resume.invalid_pdf", 422, "Renderer did not produce an acceptable PDF")
+        )
     with path.open("rb") as pdf_file:
         content = pdf_file.read(max_output_bytes + 1)
     if len(content) > max_output_bytes:
-        raise DomainError(Problem("resume.invalid_pdf", 422, "Renderer did not produce an acceptable PDF"))
+        raise DomainError(
+            Problem("resume.invalid_pdf", 422, "Renderer did not produce an acceptable PDF")
+        )
     return content
 
 
@@ -1011,4 +1050,4 @@ def _safe_diagnostic(stderr: bytes) -> str:
     @param stderr 原始 stderr / Raw stderr.
     @return 安全诊断摘要 / Safe diagnostic summary.
     """
-    return stderr.decode("utf-8", "replace").replace("/work/", "").replace("\x00", "")[:1000]
+    return stderr.decode("utf-8", "replace").replace("/work/", "").replace("\x00", "")[-1000:]

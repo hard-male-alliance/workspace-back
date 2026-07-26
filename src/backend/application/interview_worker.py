@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Protocol
 
 from backend.application.interview_v2 import InterviewApplicationError
@@ -24,6 +25,8 @@ INTERVIEW_WORK_EVENT_TYPES = frozenset({"interview.job.queued"})
 
 _QUEUED_PAYLOAD_FIELDS = frozenset({"actor_id", "session_id", "job_id"})
 """@brief queued payload 的封闭字段集 / Closed queued-payload field set."""
+
+logger = logging.getLogger(__name__)
 
 
 class _InterviewQueuedJobWorker(Protocol):
@@ -92,6 +95,17 @@ class InterviewJobOutboxHandler:
                 maximum_attempts=self._maximum_attempts,
             )
         except InterviewApplicationError as error:
+            logger.warning(
+                "backend.interview.worker.retry_requested",
+                extra={
+                    "event_name": "backend.interview.worker.retry_requested",
+                    "telemetry_attributes": {
+                        "operation": "interview_job",
+                        "outcome": "retry",
+                        "error_code": error.code,
+                    },
+                },
+            )
             raise OutboxHandlerFailure(error.code) from error
 
     async def on_exhausted(

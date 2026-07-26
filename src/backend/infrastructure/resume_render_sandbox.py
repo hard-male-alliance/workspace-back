@@ -12,6 +12,7 @@ import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 from backend.infrastructure.process_confinement import (
     ProcessConfinementMode,
@@ -108,6 +109,7 @@ def _read_only_paths(
     @return runtime、TeX 与 font state roots / Runtime, TeX, and font-state roots.
     """
 
+    texlive_root = _texlive_distribution_root(executable)
     return (
         *python_runtime_read_paths(),
         Path("/etc/fonts"),
@@ -117,8 +119,27 @@ def _read_only_paths(
         Path("/var/cache/fontconfig"),
         Path("/var/lib/texmf"),
         executable.parent,
+        *((texlive_root,) if texlive_root is not None else ()),
         *font_directories,
     )
+
+
+def _texlive_distribution_root(executable: Path) -> Path | None:
+    """@brief 识别标准 TeX Live ``TEXDIR/bin/platform`` 布局 / Recognize the standard TeX Live ``TEXDIR/bin/platform`` layout.
+
+    @param executable 已解析的 XeLaTeX executable / Resolved XeLaTeX executable.
+    @return 需要只读开放的 TEXDIR，或系统布局的空值 / Read-only TEXDIR, or none for a system layout.
+    """
+
+    resolved = executable.resolve()
+    platform_directory = resolved.parent
+    bin_directory = platform_directory.parent
+    if bin_directory.name != "bin":
+        return None
+    texlive_root = bin_directory.parent
+    if texlive_root == Path("/") or texlive_root == Path("/usr"):
+        return None
+    return texlive_root
 
 
 def _xelatex_environment(workdir: Path) -> dict[str, str]:
@@ -134,10 +155,33 @@ def _xelatex_environment(workdir: Path) -> dict[str, str]:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PATH": "/usr/bin:/bin",
+        "FONTCONFIG_FILE": str(workdir / "fonts.conf"),
         "TEXMFCONFIG": str(workdir / "texmf-config"),
         "TEXMFVAR": str(workdir / "texmf-var"),
         "TMPDIR": str(workdir / "tmp"),
     }
+
+
+def _write_fontconfig(workdir: Path, font_directories: Sequence[Path]) -> None:
+    """@brief 为白名单字体生成私有固定 Fontconfig / Generate private fixed Fontconfig for allowlisted fonts.
+
+    @param workdir renderer 唯一可写目录 / Renderer's sole writable directory.
+    @param font_directories 仅来自运维配置的字体根 / Font roots originating only from operator configuration.
+    """
+
+    configured_directories = "".join(
+        f"  <dir>{xml_escape(str(directory))}</dir>\n" for directory in font_directories
+    )
+    content = (
+        '<?xml version="1.0"?>\n'
+        '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">\n'
+        "<fontconfig>\n"
+        '  <include ignore_missing="yes">/etc/fonts/fonts.conf</include>\n'
+        f"{configured_directories}"
+        f"  <cachedir>{xml_escape(str(workdir / 'cache/fontconfig'))}</cachedir>\n"
+        "</fontconfig>\n"
+    )
+    (workdir / "fonts.conf").write_text(content, encoding="utf-8")
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -153,8 +197,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         mode = ProcessConfinementMode(argv[0])
         workdir = Path(argv[1]).resolve(strict=True)
-        invocation_name = Path(argv[2]).name
-        executable = Path(argv[2]).resolve(strict=True)
+        invocation = Path(argv[2])
+        if not invocation.is_absolute():
+            raise ValueError("renderer executable must be absolute")
+        executable = invocation.resolve(strict=True)
         memory_bytes = _positive_integer(argv[3])
         output_bytes = _positive_integer(argv[4])
         timeout_ms = _positive_integer(argv[5])
@@ -164,6 +210,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         for name in ("cache", "cache/fontconfig", "texmf-config", "texmf-var", "tmp"):
             target = workdir / name
             target.mkdir(mode=0o700, exist_ok=True)
+        _write_fontconfig(workdir, font_directories)
         os.chdir(workdir)
         _apply_resource_limits(
             memory_bytes=memory_bytes,
@@ -184,7 +231,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     ):
         return _SANDBOX_ERROR_EXIT
     command = [
-        invocation_name,
+        str(invocation),
         "-no-shell-escape",
         "-halt-on-error",
         "-file-line-error",

@@ -161,13 +161,7 @@ _DEFAULT_ARTIFACT_API_ORIGIN = "https://api.hmalliances.org"
 """@brief 未显式注入时使用的契约公开 Origin / Contract public Origin used when not explicitly injected."""
 
 type _MutablePlatformJson = (
-    None
-    | bool
-    | int
-    | float
-    | str
-    | list[_MutablePlatformJson]
-    | dict[str, _MutablePlatformJson]
+    None | bool | int | float | str | list[_MutablePlatformJson] | dict[str, _MutablePlatformJson]
 )
 """@brief PostgreSQL JSONB driver 接受的普通 JSON 树 / Plain JSON tree accepted by the PostgreSQL JSONB driver."""
 
@@ -1770,7 +1764,7 @@ class _PostgresResumeJobSink:
             return PersistedResumeJob(job, None, "resume.job_spec_invalid")
         try:
             spec: ResumeJobSpec = _load_object(_JOB_SPEC_ADAPTER, payload["spec"])
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return PersistedResumeJob(job, None, "resume.job_spec_invalid")
         return PersistedResumeJob(job, spec)
 
@@ -1778,10 +1772,7 @@ class _PostgresResumeJobSink:
         """@brief affected-row CAS 保存 Resume Job / Save a Resume Job with affected-row CAS."""
         self._authorizer.require_workspace(job.workspace_id)
         actor_id = self._authorizer.require_actor()
-        if (
-            not job.kind.startswith("resume.")
-            or job.meta.revision != expected_revision + 1
-        ):
+        if not job.kind.startswith("resume.") or job.meta.revision != expected_revision + 1:
             raise ResumeCasMismatch
         progress = job.progress
         result = await self._session.execute(
@@ -1801,16 +1792,10 @@ class _PostgresResumeJobSink:
                 completed_units=0 if progress is None else progress.completed,
                 total_units=None if progress is None else progress.total,
                 progress_unit=(
-                    JobProgressUnit.UNKNOWN.value
-                    if progress is None
-                    else progress.unit.value
+                    JobProgressUnit.UNKNOWN.value if progress is None else progress.unit.value
                 ),
                 result_refs=_dump_array(_RESOURCE_REFS_ADAPTER, job.result_refs),
-                problem=(
-                    None
-                    if job.problem is None
-                    else _dump_problem(job.problem)
-                ),
+                problem=(None if job.problem is None else _dump_problem(job.problem)),
                 started_at=job.started_at,
                 finished_at=job.finished_at,
                 updated_at=job.meta.updated_at,
@@ -1961,7 +1946,17 @@ class _PostgresResumeWorkerResults:
                 created_at=artifact.meta.created_at,
                 updated_at=artifact.meta.updated_at,
                 revision=artifact.meta.revision,
-                extensions={},
+                extensions={
+                    "resume_render": {
+                        "workspace_id": str(job.workspace_id),
+                        "resume_id": str(revision.resume_id),
+                        "resume_revision": revision.revision,
+                        "template_id": revision.document.template.template_id,
+                        "template_version": revision.document.template.version,
+                        "renderer_version": rendered.renderer_version,
+                        "sha256": artifact.sha256,
+                    }
+                },
             )
             self._session.add(artifact_record)
             # 统一 content/source-map 表保留 non-deferrable composite FK；先 flush metadata，
@@ -2036,9 +2031,7 @@ _RENDERER_SOURCE_MAP_FIELDS = frozenset(
 )
 """@brief renderer 内部 source-map envelope 的封闭字段 / Closed renderer source-map envelope fields."""
 
-_RENDERER_SOURCE_NODE_FIELDS = frozenset(
-    {"entity_id", "field_path", "page", "rects"}
-)
+_RENDERER_SOURCE_NODE_FIELDS = frozenset({"entity_id", "field_path", "page", "rects"})
 """@brief renderer source node 的封闭字段 / Closed renderer source-node fields."""
 
 _RENDERER_PDF_RECT_FIELDS = frozenset({"x", "y", "width", "height", "unit"})
@@ -2159,9 +2152,7 @@ def _source_node_from_renderer(value: object) -> PdfSourceNode:
     raw_rects = value["rects"]
     if not isinstance(entity_id, str):
         raise TypeError("renderer source-node entity ID must be a string")
-    if not isinstance(field_path, list) or not all(
-        isinstance(part, str) for part in field_path
-    ):
+    if not isinstance(field_path, list) or not all(isinstance(part, str) for part in field_path):
         raise TypeError("renderer source-node field path must be a string array")
     if not isinstance(raw_rects, list):
         raise TypeError("renderer source-node rectangles must be an array")
@@ -2303,11 +2294,7 @@ def _resume_job_from_record(record: JobRecord) -> Job:
             JobProgressUnit(record.progress_unit),
         )
     )
-    problem = (
-        None
-        if record.problem is None
-        else _load_object(_PROBLEM_ADAPTER, record.problem)
-    )
+    problem = None if record.problem is None else _load_object(_PROBLEM_ADAPTER, record.problem)
     return Job(
         _resource_meta(record, JobId(record.id)),
         WorkspaceId(record.workspace_id),
@@ -2486,9 +2473,7 @@ class PostgresResumeUnitOfWork:
         self._session = self._database.new_session()
         self._transaction = await self._session.begin()
         access_repository = (
-            None
-            if self._worker_scope is not None
-            else PostgresAccessRepository(self._session)
+            None if self._worker_scope is not None else PostgresAccessRepository(self._session)
         )
         self._authorizer = _TrackingResumeAuthorizer(
             None if access_repository is None else AccessAuthorizer(access_repository),

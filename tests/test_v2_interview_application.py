@@ -54,6 +54,7 @@ from backend.domain.interview_v2 import (
     InterviewAvatarPreferences,
     InterviewCommunicationMetrics,
     InterviewDifficulty,
+    InterviewerUtteranceInput,
     InterviewEvidence,
     InterviewExecutionGrant,
     InterviewMediaPreferences,
@@ -1068,7 +1069,21 @@ async def test_all_twelve_routes_and_workers_form_one_strict_lifecycle() -> None
     replay_receipt = await service.ingest_realtime_input(audience, envelope)
     assert first_receipt == RealtimeInputReceipt(2, False)
     assert replay_receipt == RealtimeInputReceipt(2, True)
-    assert len(state.transcript[session_id]) == 1
+    question = InterviewerUtteranceInput("你如何验证线性一致性？", 2_000, 2_000)
+    question_envelope = RealtimeInputEnvelope(
+        RealtimeInputId("input_interviewer_0001"),
+        WORKSPACE,
+        session_id,
+        connection.id,
+        NOW,
+        question,
+        realtime_input_fingerprint(question),
+    )
+    question_receipt = await service.ingest_realtime_input(audience, question_envelope)
+    assert question_receipt == RealtimeInputReceipt(3, False)
+    assert len(state.transcript[session_id]) == 2
+    assert state.transcript[session_id][-1].speaker.value == "interviewer"
+    assert state.transcript[session_id][-1].text == question.text
     assert utterance.text not in repr(state.realtime_inputs)
     transcript = await service.get_transcript(PRINCIPAL, WORKSPACE, session_id, page)
     assert transcript.items == tuple(state.transcript[session_id])
@@ -1096,7 +1111,8 @@ async def test_all_twelve_routes_and_workers_form_one_strict_lifecycle() -> None
     )
     assert coaching.scenario_name == "Distributed systems"
     assert coaching.focus_areas == ("consistency",)
-    assert coaching.transcript[-1].text == utterance.text
+    assert coaching.transcript[-2].text == utterance.text
+    assert coaching.transcript[-1].text == question.text
     assert coaching.data_region == "cn"
 
     active_session = state.sessions[session_id]

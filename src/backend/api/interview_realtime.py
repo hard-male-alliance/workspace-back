@@ -30,6 +30,7 @@ from backend.application.ports.interview_v2 import (
 from backend.config import BackendSettings
 from backend.domain.interview_v2 import (
     CandidateUtteranceInput,
+    InterviewerUtteranceInput,
     InterviewSessionId,
     RealtimeConnectionId,
     RealtimeControl,
@@ -257,12 +258,18 @@ async def interview_realtime(websocket: WebSocket) -> None:
                         )
                         await _stream_followup(
                             websocket,
+                            container.interview_v2,
                             container.interview_realtime_coach,
                             context,
+                            audience,
+                            workspace_id,
+                            session_id,
+                            connection_id,
                             audio_header.input_id,
                             transcript,
                             latest_visual_observation,
                             live_history,
+                            start_ms=audio_header.end_ms,
                         )
                 except (InterviewApplicationError, OSError, RuntimeError) as error:
                     await _turn_error(websocket, audio_header.input_id, error)
@@ -320,7 +327,11 @@ async def interview_realtime(websocket: WebSocket) -> None:
                     "replayed": receipt.replayed,
                 }
             )
-            if isinstance(payload, CandidateUtteranceInput) and not receipt.replayed:
+            if (
+                isinstance(payload, RealtimeControlInput)
+                and payload.control is RealtimeControl.MEDIA_STARTED
+                and not receipt.replayed
+            ):
                 try:
                     context = await container.interview_v2.prepare_realtime_coaching(
                         audience,
@@ -328,15 +339,68 @@ async def interview_realtime(websocket: WebSocket) -> None:
                         session_id,
                         connection_id,
                     )
-                    await _stream_followup(
-                        websocket,
-                        container.interview_realtime_coach,
-                        context,
-                        input_id,
-                        payload.text,
-                        latest_visual_observation,
-                        live_history,
+                    if not context.transcript:
+                        await _stream_followup(
+                            websocket,
+                            container.interview_v2,
+                            container.interview_realtime_coach,
+                            context,
+                            audience,
+                            workspace_id,
+                            session_id,
+                            connection_id,
+                            input_id,
+                            "",
+                            latest_visual_observation,
+                            live_history,
+                            start_ms=0,
+                        )
+                except (InterviewApplicationError, OSError, RuntimeError) as error:
+                    await _turn_error(websocket, input_id, error)
+            if isinstance(payload, CandidateUtteranceInput):
+                try:
+                    context = await container.interview_v2.prepare_realtime_coaching(
+                        audience,
+                        workspace_id,
+                        session_id,
+                        connection_id,
                     )
+                    output_id = _interviewer_output_id(input_id)
+                    existing = next(
+                        (
+                            segment
+                            for segment in context.transcript
+                            if segment.source_ref.resource_type == "realtime_input"
+                            and segment.source_ref.id == output_id
+                        ),
+                        None,
+                    )
+                    if existing is not None:
+                        await websocket.send_json(
+                            {
+                                "type": "interviewer_followup",
+                                "in_reply_to": str(input_id),
+                                "text": existing.text,
+                                "sequence": existing.sequence,
+                                "replayed": True,
+                            }
+                        )
+                    else:
+                        await _stream_followup(
+                            websocket,
+                            container.interview_v2,
+                            container.interview_realtime_coach,
+                            context,
+                            audience,
+                            workspace_id,
+                            session_id,
+                            connection_id,
+                            input_id,
+                            payload.text,
+                            latest_visual_observation,
+                            live_history,
+                            start_ms=payload.end_ms,
+                        )
                 except (InterviewApplicationError, OSError, RuntimeError) as error:
                     await _turn_error(websocket, input_id, error)
     except WebSocketDisconnect:
@@ -567,12 +631,19 @@ def _verify_binary(content: bytes, expected_sha256: str) -> None:
 
 async def _stream_followup(
     websocket: WebSocket,
+    service: InterviewApplicationService,
     coach: RealtimeInterviewCoach,
     context: object,
+    audience: ResourceRef,
+    workspace_id: WorkspaceId,
+    session_id: InterviewSessionId,
+    connection_id: RealtimeConnectionId,
     input_id: RealtimeInputId,
     candidate_text: str,
     visual_observation: str | None,
     live_history: list[tuple[str, str]],
+    *,
+    start_ms: int,
 ) -> None:
     from backend.application.interview_v2 import RealtimeCoachingContext
 
@@ -596,21 +667,37 @@ async def _stream_followup(
             }
         )
     followup = "".join(chunks)
+    output_id = RealtimeInputId(_interviewer_output_id(input_id))
+    output = InterviewerUtteranceInput(followup, start_ms, start_ms)
+    output_receipt = await service.ingest_realtime_input(
+        audience,
+        _envelope(
+            workspace_id,
+            session_id,
+            connection_id,
+            output_id,
+            output,
+        ),
+    )
     await websocket.send_json(
         {
             "type": "interviewer_followup",
             "in_reply_to": str(input_id),
             "text": followup,
+            "sequence": output_receipt.sequence,
+            "replayed": output_receipt.replayed,
         }
     )
-    live_history.extend(
-        (
-            ("candidate", candidate_text),
-            ("interviewer", followup),
-        )
-    )
+    if candidate_text:
+        live_history.append(("candidate", candidate_text))
+    live_history.append(("interviewer", followup))
     if len(live_history) > 40:
         del live_history[:-40]
+
+
+def _interviewer_output_id(input_id: RealtimeInputId) -> str:
+    """Derive one stable server-output identity from the client message identity."""
+    return f"input_interviewer_{hashlib.sha256(str(input_id).encode()).hexdigest()[:32]}"
 
 
 async def _turn_error(
@@ -637,7 +724,7 @@ def _envelope(
     session_id: InterviewSessionId,
     connection_id: RealtimeConnectionId,
     input_id: RealtimeInputId,
-    payload: CandidateUtteranceInput | RealtimeControlInput,
+    payload: CandidateUtteranceInput | InterviewerUtteranceInput | RealtimeControlInput,
 ) -> RealtimeInputEnvelope:
     """@brief 使用服务端接收时间和规范指纹构造应用输入 / Build an application input with server receive time and canonical fingerprint."""
     return RealtimeInputEnvelope(

@@ -537,9 +537,7 @@ def _principal() -> TokenPrincipal:
         USER_ID,
         Subject("subject_00000001"),
         ClientId("client_00000001"),
-        frozenset(
-            {Scope("resume.read"), Scope("resume.write"), Scope("resume.render")}
-        ),
+        frozenset({Scope("resume.read"), Scope("resume.write"), Scope("resume.render")}),
     )
 
 
@@ -1135,9 +1133,7 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
         UserId("user_legacy0001"),
         Subject("legacy-subject"),
         ClientId("client_legacy0001"),
-        frozenset(
-            {Scope("resume.read"), Scope("resume.write"), Scope("resume.render")}
-        ),
+        frozenset({Scope("resume.read"), Scope("resume.write"), Scope("resume.render")}),
     )
     upload_reader = _BytesUploadReader({})
     worker = ResumeJobWorkerService(
@@ -1182,6 +1178,14 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
                 (RenderFormat.PDF, RenderFormat.JSON, RenderFormat.DOCX),
             ),
         )
+        updated = await service.update_resume_metadata(
+            principal,
+            WorkspaceId("workspace_legacy0001"),
+            document.meta.id,
+            UpdateResumeMetadataCommand(title="Changed after snapshot"),
+            expected_revision=1,
+        )
+        assert updated.meta.revision == 2
         with psycopg.connect(resume_postgres.super_dsn) as connection:
             connection.execute(
                 "UPDATE agent.outbox_events SET payload = "
@@ -1211,7 +1215,7 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
         assert state["problem"] is None
         assert len(state["result_refs"]) == 3
         artifacts = resume_postgres.rows(
-            "SELECT kind, media_type, size_bytes, sha256, subject_id, subject_revision "
+            "SELECT kind, media_type, size_bytes, sha256, subject_id, subject_revision, extensions "
             "FROM agent.artifacts "
             f"WHERE subject_id = '{document.meta.id}' ORDER BY kind"
         )
@@ -1221,6 +1225,34 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
             "resume_pdf",
         ]
         assert all(item["size_bytes"] > 0 and len(item["sha256"]) == 64 for item in artifacts)
+        assert {item["extensions"]["resume_render"]["renderer_version"] for item in artifacts} == {
+            "mock-fixed-template-v1",
+            "native-json-v1",
+            "python-docx-v1",
+        }
+        assert all(
+            item["extensions"]["resume_render"]
+            == {
+                "workspace_id": "workspace_legacy0001",
+                "resume_id": str(document.meta.id),
+                "resume_revision": 1,
+                "template_id": TEMPLATE_REF.template_id,
+                "template_version": TEMPLATE_REF.version,
+                "renderer_version": item["extensions"]["resume_render"]["renderer_version"],
+                "sha256": item["sha256"],
+            }
+            for item in artifacts
+        )
+        rendered_json = resume_postgres.rows(
+            "SELECT content.content FROM agent.artifact_contents content "
+            "JOIN agent.artifacts artifact ON artifact.id = content.artifact_id "
+            f"WHERE artifact.subject_id = '{document.meta.id}' "
+            "AND artifact.kind = 'resume_json'"
+        )[0]["content"]
+        assert json.loads(bytes(rendered_json))["title"] == "Worker Resume"
+        assert resume_postgres.rows(
+            f"SELECT title, current_revision_no FROM resume.documents WHERE id = '{document.meta.id}'"
+        ) == [{"title": "Changed after snapshot", "current_revision_no": 2}]
         assert resume_postgres.rows(
             "SELECT count(*) AS count FROM agent.artifact_contents content "
             "JOIN agent.artifacts artifact ON artifact.id = content.artifact_id "
@@ -1232,8 +1264,7 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
             f"WHERE artifact.subject_id = '{document.meta.id}'"
         ) == [{"count": 1}]
         assert resume_postgres.rows(
-            "SELECT count(*) AS count FROM resume.render_jobs "
-            f"WHERE job_id = '{job.meta.id}'"
+            f"SELECT count(*) AS count FROM resume.render_jobs WHERE job_id = '{job.meta.id}'"
         ) == [{"count": 1}]
 
         event_id = resume_postgres.rows(
@@ -1252,20 +1283,18 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
         replay = await dispatcher.run_once()
         assert (replay.claimed, replay.completed, replay.retried, replay.failed) == (1, 1, 0, 0)
         assert resume_postgres.rows(
-            "SELECT count(*) AS count FROM agent.artifacts "
-            f"WHERE subject_id = '{document.meta.id}'"
+            f"SELECT count(*) AS count FROM agent.artifacts WHERE subject_id = '{document.meta.id}'"
         ) == [{"count": 3}]
         assert resume_postgres.rows(
-            "SELECT status, revision FROM agent.jobs "
-            f"WHERE id = '{job.meta.id}'"
+            f"SELECT status, revision FROM agent.jobs WHERE id = '{job.meta.id}'"
         ) == [{"status": "succeeded", "revision": 3}]
 
         upload_id = "upload_worker0001"
         imported_bytes = b"Klee Example\nDistributed systems engineer"
         imported_sha256 = hashlib.sha256(imported_bytes).hexdigest()
-        upload_reader.values[
-            (WorkspaceId("workspace_legacy0001"), UploadSessionId(upload_id))
-        ] = imported_bytes
+        upload_reader.values[(WorkspaceId("workspace_legacy0001"), UploadSessionId(upload_id))] = (
+            imported_bytes
+        )
         with psycopg.connect(resume_postgres.super_dsn) as connection:
             connection.execute(
                 """
@@ -1322,14 +1351,6 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
         assert imported_document["profile"]["full_name"] == "Klee Example"
         assert imported_document["profile"]["summary"]["text"] == imported_bytes.decode()
 
-        updated = await service.update_resume_metadata(
-            principal,
-            WorkspaceId("workspace_legacy0001"),
-            document.meta.id,
-            UpdateResumeMetadataCommand(title="Changed after snapshot"),
-            expected_revision=1,
-        )
-        assert updated.meta.revision == 2
         restore_job = await service.create_restore_job(
             principal,
             WorkspaceId("workspace_legacy0001"),
@@ -1354,8 +1375,7 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
             "revision": 3,
         }
         assert resume_postgres.rows(
-            "SELECT status, revision FROM agent.jobs "
-            f"WHERE id = '{restore_job.meta.id}'"
+            f"SELECT status, revision FROM agent.jobs WHERE id = '{restore_job.meta.id}'"
         ) == [{"status": "succeeded", "revision": 3}]
 
         flaky_renderer = _FlakyResumeRenderer(MultiFormatResumeRenderer(MockRenderer()))
@@ -1392,8 +1412,7 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
             interrupted.failed,
         ) == (1, 0, 1, 0)
         assert resume_postgres.rows(
-            "SELECT status, revision FROM agent.jobs "
-            f"WHERE id = '{crash_job.meta.id}'"
+            f"SELECT status, revision FROM agent.jobs WHERE id = '{crash_job.meta.id}'"
         ) == [{"status": "running", "revision": 2}]
         with psycopg.connect(resume_postgres.super_dsn) as connection:
             connection.execute(
@@ -1412,8 +1431,7 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
         expected_operation_id = f"resume.render:{crash_job.meta.id}"
         assert flaky_renderer.operation_ids == [expected_operation_id, expected_operation_id]
         assert resume_postgres.rows(
-            "SELECT status, revision FROM agent.jobs "
-            f"WHERE id = '{crash_job.meta.id}'"
+            f"SELECT status, revision FROM agent.jobs WHERE id = '{crash_job.meta.id}'"
         ) == [{"status": "succeeded", "revision": 3}]
 
         unsupported_worker = ResumeJobWorkerService(
@@ -1510,10 +1528,7 @@ async def test_postgres_resume_outbox_dispatch_renders_and_replays_terminal_job_
                     database,
                     event_types=RESUME_WORK_EVENT_TYPES,
                 ),
-                {
-                    event_type: malformed_handler
-                    for event_type in RESUME_WORK_EVENT_TYPES
-                },
+                {event_type: malformed_handler for event_type in RESUME_WORK_EVENT_TYPES},
                 required_event_types=RESUME_WORK_EVENT_TYPES,
                 settings=settings,
             )

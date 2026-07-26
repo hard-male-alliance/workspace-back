@@ -18,10 +18,14 @@ from backend.api.interview_realtime import router_interview_realtime
 from backend.application.interview_v2 import RealtimeCoachingContext
 from backend.domain.interview_v2 import (
     CandidateUtteranceInput,
+    InterviewerUtteranceInput,
     RealtimeControl,
     RealtimeControlInput,
     RealtimeInputEnvelope,
     RealtimeInputReceipt,
+    TranscriptSegment,
+    TranscriptSegmentId,
+    TranscriptSpeaker,
 )
 from backend.domain.resources import ResourceRef
 
@@ -70,6 +74,7 @@ class _Service:
         default_factory=list
     )
     coaching_media_kinds: list[str | None] = field(default_factory=list)
+    transcript: list[TranscriptSegment] = field(default_factory=list)
 
     async def ingest_realtime_input(
         self, audience: ResourceRef, envelope: RealtimeInputEnvelope
@@ -83,6 +88,20 @@ class _Service:
             return RealtimeInputReceipt(prior[1], True)
         sequence = len(self.receipts) + 1
         self.receipts[key] = (envelope.fingerprint_sha256, sequence)
+        if isinstance(envelope.payload, InterviewerUtteranceInput):
+            self.transcript.append(
+                TranscriptSegment(
+                    TranscriptSegmentId(f"segment_fake_{sequence:04d}"),
+                    envelope.workspace_id,
+                    envelope.session_id,
+                    len(self.transcript) + 1,
+                    ResourceRef("realtime_input", str(envelope.input_id)),
+                    TranscriptSpeaker.INTERVIEWER,
+                    envelope.payload.start_ms,
+                    envelope.payload.end_ms,
+                    envelope.payload.text,
+                )
+            )
         return RealtimeInputReceipt(sequence, False)
 
     async def authorize_media_capture(
@@ -125,7 +144,7 @@ class _Service:
             ("Python", "databases"),
             "zh-CN",
             True,
-            (),
+            tuple(self.transcript),
             "global",
         )
 
@@ -257,6 +276,16 @@ def test_websocket_auth_control_text_and_replay_flow() -> None:
             "sequence": 2,
             "replayed": False,
         }
+        assert socket.receive_json() == {
+            "type": "interviewer_start",
+            "in_reply_to": "input_media_started01",
+        }
+        assert socket.receive_json()["delta"] == "你如何确认"
+        assert socket.receive_json()["delta"] == "连接池是根因？"
+        opening = socket.receive_json()
+        assert opening["type"] == "interviewer_followup"
+        assert opening["sequence"] == 3
+        assert opening["replayed"] is False
         utterance = {
             "type": "candidate_utterance",
             "input_id": "input_candidate00001",
@@ -276,12 +305,14 @@ def test_websocket_auth_control_text_and_replay_flow() -> None:
             "type": "interviewer_followup",
             "in_reply_to": "input_candidate00001",
             "text": "你如何确认连接池是根因？",
+            "sequence": 5,
+            "replayed": False,
         }
         socket.send_json(utterance)
         assert socket.receive_json() == {
             "type": "ack",
             "input_id": "input_candidate00001",
-            "sequence": 3,
+            "sequence": 4,
             "replayed": True,
         }
 
@@ -292,14 +323,17 @@ def test_websocket_auth_control_text_and_replay_flow() -> None:
     assert container.interview_v2.calls[0].payload.control is RealtimeControl.CONNECTED
     assert isinstance(container.interview_v2.calls[1].payload, RealtimeControlInput)
     assert container.interview_v2.calls[1].payload.control is RealtimeControl.MEDIA_STARTED
-    assert isinstance(container.interview_v2.calls[2].payload, CandidateUtteranceInput)
-    assert container.interview_v2.calls[2].payload.text == "请介绍一次后端故障排查经历。"
+    assert isinstance(container.interview_v2.calls[2].payload, InterviewerUtteranceInput)
+    assert isinstance(container.interview_v2.calls[3].payload, CandidateUtteranceInput)
+    assert container.interview_v2.calls[3].payload.text == "请介绍一次后端故障排查经历。"
+    assert isinstance(container.interview_v2.calls[4].payload, InterviewerUtteranceInput)
     assert isinstance(container.interview_v2.calls[-1].payload, RealtimeControlInput)
     assert (
         container.interview_v2.calls[-1].payload.control
         is RealtimeControl.DISCONNECTED
     )
     assert container.interview_realtime_coach.followups == [
+        ("", None),
         ("请介绍一次后端故障排查经历。", None)
     ]
 

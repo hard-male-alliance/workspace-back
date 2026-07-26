@@ -402,7 +402,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
             CORSMiddleware,
             allow_origins=list(resolved_settings.network.cors_allowed_origins),
             allow_credentials=False,
-            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=[
                 "Accept",
                 "Accept-Language",
@@ -414,6 +414,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
                 "Last-Event-ID",
                 "Range",
                 "X-Request-Id",
+                "X-AIWS-Content-SHA256",
                 "traceparent",
             ],
             expose_headers=[

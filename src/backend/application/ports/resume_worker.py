@@ -61,7 +61,9 @@ class ResumeImportSource:
         """@brief 校验 import 证明完整性 / Validate import-evidence integrity."""
         if not self.upload_session_id or not self.media_type or self.size_bytes < 1:
             raise ValueError("Resume import source evidence is incomplete")
-        if len(self.sha256) != 64 or any(character not in "0123456789abcdef" for character in self.sha256):
+        if len(self.sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.sha256
+        ):
             raise ValueError("Resume import source SHA-256 is invalid")
 
 
@@ -94,6 +96,7 @@ class RenderedResumeArtifact:
     @param content 受限大小的不可变内容 / Size-bounded immutable content.
     @param page_count 可选页数 / Optional page count.
     @param source_map PDF 的规范 source map / Canonical source map for PDF.
+    @param renderer_version 生成当前字节的稳定 renderer 版本 / Stable renderer version that produced these bytes.
     """
 
     artifact_id: ArtifactId
@@ -102,6 +105,7 @@ class RenderedResumeArtifact:
     content: bytes = field(repr=False)
     page_count: int | None = None
     source_map: dict[str, JsonValue] | None = None
+    renderer_version: str = "unknown-renderer-v1"
 
     def __post_init__(self) -> None:
         """@brief 校验 format/content 关联 / Validate format/content associations."""
@@ -111,6 +115,12 @@ class RenderedResumeArtifact:
             raise ValueError("rendered Resume artifact metadata is invalid")
         if (self.source_map is not None) is (self.format is not RenderFormat.PDF):
             raise ValueError("only a PDF Resume artifact may carry a source map")
+        if (
+            not self.renderer_version
+            or self.renderer_version.strip() != self.renderer_version
+            or len(self.renderer_version) > 128
+        ):
+            raise ValueError("rendered Resume artifact renderer version is invalid")
 
 
 def resume_worker_artifact_id(

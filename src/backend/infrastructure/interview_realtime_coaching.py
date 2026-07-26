@@ -108,14 +108,24 @@ class ProviderRealtimeInterviewCoach:
             for item in context.transcript
             if item.text.strip()
         ]
+        initial_question = candidate_text.strip() == ""
+        task = (
+            (
+                "Act as the interviewer. Begin the interview by asking exactly one concise, "
+                "relevant opening question. "
+            )
+            if initial_question
+            else (
+                "Act as the interviewer. Understand the candidate's latest answer and ask "
+                "exactly one concise, relevant follow-up question. "
+            )
+        ) + (
+            "Do not score, explain, praise, or reveal reasoning. Do not infer sensitive or "
+            "biometric traits from visual context. Return only the question."
+        )
         prompt = json.dumps(
             {
-                "task": (
-                    "Act as the interviewer. Understand the candidate's latest answer and ask "
-                    "exactly one concise, relevant follow-up question. Do not score, explain, "
-                    "praise, or reveal reasoning. Do not infer sensitive or biometric traits "
-                    "from visual context. Return only the question."
-                ),
+                "task": task,
                 "scenario": {
                     "name": context.scenario_name,
                     "description": context.scenario_description,
@@ -128,7 +138,7 @@ class ProviderRealtimeInterviewCoach:
                     {"speaker": speaker, "text": text}
                     for speaker, text in live_history[-40:]
                 ],
-                "latest_candidate_answer": candidate_text,
+                "latest_candidate_answer": None if initial_question else candidate_text,
                 "latest_visual_observation": visual_observation,
             },
             ensure_ascii=False,
