@@ -44,7 +44,6 @@ from backend.domain.agent_v2 import (
     AgentExecutionGrant,
     AgentKnowledgeEvidence,
     AgentOutboxId,
-    AgentOutputMode,
     AgentProviderApprovalRequired,
     AgentProviderCompleted,
     AgentProviderOutcome,
@@ -2230,7 +2229,7 @@ async def _load_resume_context(
     @param run 已验证 Run / Validated Run.
     @return 非 Resume 模式返回空，否则返回精确 SIR / None outside Resume mode, otherwise the exact SIR.
     """
-    if AgentOutputMode.RESUME_OPERATIONS not in run.spec.output_modes:
+    if run.spec.capability is not ConversationCapability.RESUME_EDIT:
         return None
     return await uow.resume_proposals.load_base(
         workspace_id,

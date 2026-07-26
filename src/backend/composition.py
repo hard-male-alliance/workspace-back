@@ -1377,11 +1377,11 @@ def _interview_report_provider(
         fallback consent, so this boundary disables provider fallback rather than treating global
         configuration as user authorization.
     """
+    if settings.environment in {"development", "test"}:
+        return DeterministicInterviewReportProvider(
+            environment=settings.environment,
+        )
     if settings.ai.provider == "mock":
-        if settings.environment in {"development", "test"}:
-            return DeterministicInterviewReportProvider(
-                environment=settings.environment,
-            )
         return FailClosedInterviewReportProvider()
     return StreamingJsonInterviewReportProvider(
         provider,

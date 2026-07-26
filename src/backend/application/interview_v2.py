@@ -39,6 +39,7 @@ from backend.domain.interview_v2 import (
     CreateRealtimeConnectionSpec,
     EndInterviewReason,
     EndSessionJobSpec,
+    InterviewerUtteranceInput,
     InterviewJobQueuedRecord,
     InterviewMediaPreferences,
     InterviewOutboxId,
@@ -938,13 +939,13 @@ class InterviewApplicationService:
                         "interview_session.realtime_input_forbidden",
                         "the Session cannot accept realtime input in its current state",
                     )
-                if (
-                    isinstance(envelope.payload, CandidateUtteranceInput)
-                    and session.view.status is not InterviewSessionStatus.ACTIVE
-                ):
+                if isinstance(
+                    envelope.payload,
+                    (CandidateUtteranceInput, InterviewerUtteranceInput),
+                ) and session.view.status is not InterviewSessionStatus.ACTIVE:
                     raise InterviewConflict(
                         "interview_session.not_active",
-                        "candidate utterances require an active Session",
+                        "interview utterances require an active Session",
                     )
                 if (
                     isinstance(envelope.payload, RealtimeControlInput)
@@ -957,10 +958,10 @@ class InterviewApplicationService:
                         expected_revision=session.meta.revision,
                     )
                     session = active
-                if (
-                    isinstance(envelope.payload, CandidateUtteranceInput)
-                    and session.spec.recording.store_transcript
-                ):
+                if isinstance(
+                    envelope.payload,
+                    (CandidateUtteranceInput, InterviewerUtteranceInput),
+                ) and session.spec.recording.store_transcript:
                     reservation = await uow.repository.allocate_transcript_sequence(
                         envelope.workspace_id,
                         envelope.session_id,
@@ -972,7 +973,14 @@ class InterviewApplicationService:
                             session_id=envelope.session_id,
                             sequence=reservation.sequence,
                             source_ref=ResourceRef("realtime_input", envelope.input_id),
-                            speaker=TranscriptSpeaker.CANDIDATE,
+                            speaker=(
+                                TranscriptSpeaker.CANDIDATE
+                                if isinstance(
+                                    envelope.payload,
+                                    CandidateUtteranceInput,
+                                )
+                                else TranscriptSpeaker.INTERVIEWER
+                            ),
                             start_ms=envelope.payload.start_ms,
                             end_ms=envelope.payload.end_ms,
                             text=envelope.payload.text,

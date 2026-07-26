@@ -891,6 +891,21 @@ class CandidateUtteranceInput:
 
 
 @dataclass(frozen=True, slots=True)
+class InterviewerUtteranceInput:
+    """@brief 服务端模型确认的面试官文字输出 / Server-model-confirmed interviewer text output."""
+
+    text: str
+    start_ms: int
+    end_ms: int
+    type: Literal["interviewer_utterance"] = "interviewer_utterance"
+
+    def __post_init__(self) -> None:
+        """@brief 校验文本和时间范围 / Validate text and time range."""
+        _require_text(self.text, "interviewer utterance", 1, 20_000)
+        _require_time_range(self.start_ms, self.end_ms, "interviewer utterance")
+
+
+@dataclass(frozen=True, slots=True)
 class RealtimeControlInput:
     """@brief 实时生命周期控制输入 / Realtime lifecycle-control input."""
 
@@ -898,7 +913,9 @@ class RealtimeControlInput:
     type: Literal["control"] = "control"
 
 
-type RealtimeInputPayload = CandidateUtteranceInput | RealtimeControlInput
+type RealtimeInputPayload = (
+    CandidateUtteranceInput | InterviewerUtteranceInput | RealtimeControlInput
+)
 """@brief 实时输入封闭判别联合 / Closed discriminated union for realtime input."""
 
 
@@ -1464,6 +1481,7 @@ __all__ = [
     "InterviewSessionStatus",
     "InterviewSessionView",
     "InterviewTransitionError",
+    "InterviewerUtteranceInput",
     "JobTarget",
     "RealtimeConnection",
     "RealtimeConnectionId",

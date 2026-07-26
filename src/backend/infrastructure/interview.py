@@ -2369,6 +2369,7 @@ class PostgresInterviewRepository:
                 extensions={},
             )
         )
+        await self._session.flush()
         for score in report.draft.rubric_scores:
             for evidence in score.evidence:
                 self._session.add(

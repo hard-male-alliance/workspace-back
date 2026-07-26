@@ -174,6 +174,52 @@ def test_renderer_landlock_allows_only_the_required_system_paper_definitions() -
     assert Path("/etc") not in paths
 
 
+def test_user_installed_texlive_root_is_mounted_read_only() -> None:
+    """A normal-user TeX Live tree remains readable inside both confinement layers."""
+
+    executable = Path("/home/example/texlive/2026/bin/x86_64-linux/xetex")
+
+    assert Path("/home/example/texlive/2026") in render_sandbox._read_only_paths(executable, ())
+    assert Path("/home/example/texlive/2026") in rendering._renderer_runtime_roots(str(executable))
+
+
+def test_renderer_child_preserves_the_absolute_xelatex_invocation_path(
+    tmp_path: Path,
+) -> None:
+    """The launcher does not lose XeLaTeX format discovery for a user install."""
+
+    plan = ProcessConfinementPlan(ProcessConfinementMode.STRONG, None)
+    executable = "/home/example/texlive/2026/bin/x86_64-linux/xelatex"
+
+    argv = rendering._renderer_child_argv(
+        executable,
+        _renderer_settings(tmp_path),
+        tmp_path,
+        plan,
+    )
+
+    assert argv[7] == executable
+
+
+def test_private_fontconfig_contains_only_operator_allowlisted_directories(
+    tmp_path: Path,
+) -> None:
+    """The sandbox discovers local fonts without scanning the user's home directory."""
+
+    allowed = tmp_path / "operator-fonts"
+    allowed.mkdir()
+
+    render_sandbox._write_fontconfig(tmp_path, (allowed,))
+
+    content = (tmp_path / "fonts.conf").read_text(encoding="utf-8")
+    assert f"<dir>{allowed}</dir>" in content
+    assert str(Path.home()) not in content
+    assert str(tmp_path / "cache/fontconfig") in content
+    assert render_sandbox._xelatex_environment(tmp_path)["FONTCONFIG_FILE"] == str(
+        tmp_path / "fonts.conf"
+    )
+
+
 def test_fixed_template_selects_a_packaged_cjk_capable_font() -> None:
     """@brief 固定模板不会把中文姓名渲染成空白字形 / Fixed template does not render Chinese names as missing glyphs."""
 

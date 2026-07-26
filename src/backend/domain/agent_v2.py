@@ -985,7 +985,7 @@ class AgentProviderRequest:
             for item in self.knowledge_evidence
         ):
             raise AgentDomainError("provider evidence exceeds the execution grant")
-        wants_resume = AgentOutputMode.RESUME_OPERATIONS in self.spec.output_modes
+        wants_resume = self.spec.capability is ConversationCapability.RESUME_EDIT
         if wants_resume != (self.resume_context is not None):
             raise AgentDomainError("provider Resume context does not match output modes")
         if self.resume_context is not None and self.resume_context.resume_ref not in self.grant.context_refs:

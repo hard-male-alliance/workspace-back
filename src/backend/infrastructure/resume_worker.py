@@ -118,10 +118,7 @@ class ResumeImportProcessLimits:
             or not 0.01 <= self.wall_timeout_seconds <= 120.0
         ):
             raise ValueError("Resume import wall timeout must be between 0.01 and 120 seconds")
-        if (
-            isinstance(self.cpu_time_seconds, bool)
-            or not 1 <= self.cpu_time_seconds <= 60
-        ):
+        if isinstance(self.cpu_time_seconds, bool) or not 1 <= self.cpu_time_seconds <= 60:
             raise ValueError("Resume import CPU limit must be between one and 60 seconds")
         if (
             isinstance(self.memory_bytes, bool)
@@ -159,9 +156,7 @@ class SafeResumeImporter:
         self._reader = reader
         self._maximum_bytes = maximum_bytes
         self._process_limits = process_limits or ResumeImportProcessLimits()
-        self._confinement_plan = confinement_plan or confinement_plan_for(
-            deployment_environment
-        )
+        self._confinement_plan = confinement_plan or confinement_plan_for(deployment_environment)
 
     async def import_resume(
         self,
@@ -218,7 +213,9 @@ class SafeResumeImporter:
             raise ResumeCapabilityFailure("resume.import_empty_document", retryable=False)
         if len(normalized) > _MAXIMUM_IMPORT_TEXT_CHARACTERS:
             raise ResumeCapabilityFailure("resume.import_text_too_large", retryable=False)
-        first_line = next((line.strip("#*_- \t") for line in normalized.splitlines() if line.strip()), "")
+        first_line = next(
+            (line.strip("#*_- \t") for line in normalized.splitlines() if line.strip()), ""
+        )
         full_name = first_line if 1 <= len(first_line) <= 200 else "Imported candidate"
         return ResumeImportedContent(full_name, normalized)
 
@@ -229,6 +226,12 @@ class MultiFormatResumeRenderer:
     def __init__(self, pdf_renderer: Renderer) -> None:
         """@brief 绑定部署选择的 PDF renderer / Bind the deployment-selected PDF renderer."""
         self._pdf_renderer = pdf_renderer
+        renderer_version = getattr(pdf_renderer, "version", "unknown-renderer-v1")
+        self._pdf_renderer_version = (
+            renderer_version
+            if isinstance(renderer_version, str) and renderer_version
+            else "unknown-renderer-v1"
+        )
 
     async def render_resume(
         self,
@@ -269,6 +272,7 @@ class MultiFormatResumeRenderer:
                         content,
                         page_count,
                         source_map,
+                        self._pdf_renderer_version,
                     )
                 )
             elif output_format is RenderFormat.JSON:
@@ -284,6 +288,7 @@ class MultiFormatResumeRenderer:
                         RenderFormat.JSON,
                         "application/json",
                         content,
+                        renderer_version="native-json-v1",
                     )
                 )
             elif output_format is RenderFormat.DOCX:
@@ -294,6 +299,7 @@ class MultiFormatResumeRenderer:
                         RenderFormat.DOCX,
                         _DOCX_MEDIA_TYPE,
                         content,
+                        renderer_version="python-docx-v1",
                     )
                 )
             else:
@@ -354,7 +360,7 @@ async def _extract_import_text_in_subprocess(
         except asyncio.CancelledError:
             try:
                 spawned = await creation
-            except (OSError, RuntimeError):
+            except OSError, RuntimeError:
                 raise
             cleanup = asyncio.create_task(_terminate_import_process_group(spawned))
             await asyncio.shield(cleanup)
@@ -719,7 +725,7 @@ def _signal_import_process_group(process_group_id: int, signal_number: int) -> N
         return
     try:
         _killpg(process_group_id, signal_number)
-    except (PermissionError, ProcessLookupError):
+    except PermissionError, ProcessLookupError:
         return
 
 
@@ -751,9 +757,7 @@ def _normalize_import_text(value: str) -> str:
     """@brief 规范换行并移除不可持久控制字符 / Normalize newlines and remove non-persistable controls."""
     normalized = value.replace("\r\n", "\n").replace("\r", "\n")
     normalized = "".join(
-        character
-        for character in normalized
-        if character in "\n\t" or ord(character) >= 32
+        character for character in normalized if character in "\n\t" or ord(character) >= 32
     )
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in normalized.split("\n")]
     return "\n".join(lines).strip()
@@ -834,9 +838,7 @@ def _render_docx(document: ResumeDocument) -> bytes:
             heading = item.title or item.organization or item.subtitle or item.kind.value
             output.add_heading(heading, level=2)
             metadata = " · ".join(
-                value
-                for value in (item.organization, item.location, item.subtitle)
-                if value
+                value for value in (item.organization, item.location, item.subtitle) if value
             )
             if metadata:
                 output.add_paragraph(metadata)
@@ -853,12 +855,15 @@ def _canonicalize_docx(payload: bytes) -> bytes:
     """@brief 固定 ZIP entry 顺序与 timestamp 以支持 crash 重放 / Fix ZIP entry order and timestamps for crash replay."""
     source = zipfile.ZipFile(io.BytesIO(payload), "r")
     target_buffer = io.BytesIO()
-    with source, zipfile.ZipFile(
-        target_buffer,
-        "w",
-        compression=zipfile.ZIP_DEFLATED,
-        compresslevel=9,
-    ) as target:
+    with (
+        source,
+        zipfile.ZipFile(
+            target_buffer,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as target,
+    ):
         for name in sorted(source.namelist()):
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
