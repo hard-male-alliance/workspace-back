@@ -1,23 +1,32 @@
-"""API V2 Agent 文本 provider 适配器测试。"""
+"""OpenAI Agents SDK integration tests for the API V2 Agent provider."""
 
 from __future__ import annotations
 
-import json
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
+from agents.items import ModelResponse, TResponseStreamEvent
+from agents.models.interface import Model, ModelTracing
+from agents.usage import Usage
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseOutputMessage,
+    ResponseOutputText,
+)
 
-from backend.application.ports.agent_v2 import AgentProviderFailure
 from backend.domain.agent_v2 import (
     AgentExecutionGrant,
-    AgentKnowledgeEvidence,
     AgentOutputMode,
+    AgentProposalDecisionContext,
     AgentProviderCompleted,
+    AgentProviderProposalDecisionRequired,
     AgentProviderRequest,
+    AgentResumeContext,
     AgentRunId,
     AgentRunSpec,
-    AuthorizedKnowledgeContext,
     ConversationCapability,
     ConversationId,
     Message,
@@ -29,108 +38,117 @@ from backend.domain.knowledge_retrieval import (
     InferenceCostTier,
     InferenceIntent,
     InferenceQualityTier,
-    KnowledgeCitation,
     KnowledgeSelection,
     KnowledgeSelectionMode,
 )
-from backend.domain.knowledge_sources import (
-    KnowledgeSourceId,
-    KnowledgeSourceVersionId,
-    ModelRegion,
-)
+from backend.domain.knowledge_sources import ModelRegion
 from backend.domain.principals import ResourceMeta, WorkspaceId
 from backend.domain.resources import ResourceRef
-from backend.infrastructure.agent_provider import StreamingTextAgentProvider
-from backend.infrastructure.providers import CapabilityDescriptor
+from backend.domain.resumes import (
+    PageSize,
+    ResumeId,
+    ResumeSectionKind,
+    TemplatePolicy,
+    TemplateRef,
+    TemplateZonePolicy,
+    create_resume_document,
+)
+from backend.infrastructure.agents_sdk_provider import OpenAIAgentsSDKProvider
 
 NOW = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
-"""固定测试时刻。"""
-
 WORKSPACE_ID = WorkspaceId("workspace_provider_0001")
-"""测试 Workspace。"""
 
 
-class RecordingStreamProvider:
-    """记录 provider-safe 请求并返回严格 JSON 分片。"""
-
-    def __init__(self, response: dict[str, object] | None = None) -> None:
-        """初始化空调用记录。"""
-        self.calls: list[tuple[str, dict[str, object]]] = []
-        self.response = response or {
-            "protocol_version": "agent.output.strict_json.v1",
-            "text": "world",
-            "citation_indices": [],
-            "resume_proposal": None,
-        }
-
-    def capabilities(self) -> tuple[CapabilityDescriptor, ...]:
-        """声明测试 transport 支持 general 的原生结构化输出。"""
-        return (CapabilityDescriptor("general", True, False, True),)
-
-    async def stream_text(self, prompt: str, request: dict[str, object]):  # type: ignore[no-untyped-def]
-        """记录调用并流式返回一个 JSON 文档。"""
-        self.calls.append((prompt, request))
-        encoded = json.dumps(self.response)
-        midpoint = len(encoded) // 2
-        yield encoded[:midpoint]
-        yield encoded[midpoint:]
+def _text_response(text: str, response_id: str) -> ModelResponse:
+    return ModelResponse(
+        output=[
+            ResponseOutputMessage(
+                id=f"message_{response_id}",
+                content=[
+                    ResponseOutputText(
+                        annotations=[],
+                        text=text,
+                        type="output_text",
+                    )
+                ],
+                role="assistant",
+                status="completed",
+                type="message",
+            )
+        ],
+        usage=Usage(input_tokens=11, output_tokens=7, total_tokens=18),
+        response_id=response_id,
+    )
 
 
-class RawStreamProvider:
-    """返回指定原始字符串，用于验证本地封闭解析。"""
-
-    def __init__(self, response: str) -> None:
-        self.response = response
-        self.calls = 0
-
-    def capabilities(self) -> tuple[CapabilityDescriptor, ...]:
-        return (CapabilityDescriptor("general", True, False, True),)
-
-    async def stream_text(self, prompt: str, request: dict[str, object]):  # type: ignore[no-untyped-def]
-        del prompt, request
-        self.calls += 1
-        yield self.response
-
-
-class CapabilityBlindProvider:
-    """缺少能力发现的 transport；网络方法不应被调用。"""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def stream_text(self, prompt: str, request: dict[str, object]):  # type: ignore[no-untyped-def]
-        del prompt, request
-        self.calls += 1
-        yield "{}"
+def _tool_response(name: str, arguments: str, call_id: str) -> ModelResponse:
+    return ModelResponse(
+        output=[
+            ResponseFunctionToolCall(
+                arguments=arguments,
+                call_id=call_id,
+                name=name,
+                type="function_call",
+                status="completed",
+            )
+        ],
+        usage=Usage(input_tokens=13, output_tokens=5, total_tokens=18),
+        response_id=f"response_{call_id}",
+    )
 
 
-def _request(
-    *,
-    modes: tuple[AgentOutputMode, ...],
-    with_evidence: bool = True,
-) -> AgentProviderRequest:
-    """构造已授权 provider request。"""
+class SequenceModel(Model):
+    """Return SDK-native model items and capture the real tool catalog."""
+
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[Any, list[Any], Any]] = []
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: Any,
+        model_settings: Any,
+        tools: list[Any],
+        output_schema: Any,
+        handoffs: list[Any],
+        tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
+        conversation_id: str | None,
+        prompt: Any,
+    ) -> ModelResponse:
+        del (
+            system_instructions,
+            model_settings,
+            handoffs,
+            tracing,
+            previous_response_id,
+            conversation_id,
+            prompt,
+        )
+        self.calls.append((input, tools, output_schema))
+        return self.responses.pop(0)
+
+    async def stream_response(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        del args, kwargs
+        if False:
+            yield
+
+
+def _request() -> AgentProviderRequest:
     conversation_id = ConversationId("conversation_provider_0001")
     message_id = MessageId("message_provider_0001")
-    wants_citations = AgentOutputMode.CITATIONS in modes
-    source_id = KnowledgeSourceId("knowledge_source_provider_0001")
-    version_id = KnowledgeSourceVersionId("knowledge_version_provider_0001")
     spec = AgentRunSpec(
         conversation_id,
         message_id,
         ConversationCapability.GENERAL,
         (),
-        KnowledgeSelection(
-            (
-                KnowledgeSelectionMode.EXPLICIT
-                if wants_citations
-                else KnowledgeSelectionMode.NONE
-            ),
-            (source_id,) if wants_citations else (),
-            (),
-            (),
-            "general_agent",
-        ),
+        KnowledgeSelection(KnowledgeSelectionMode.NONE, (), (), (), "general_agent"),
         InferenceIntent(
             InferenceQualityTier.BALANCED,
             10_000,
@@ -139,7 +157,7 @@ def _request(
             False,
             False,
         ),
-        modes,
+        (AgentOutputMode.TEXT,),
         "zh-CN",
     )
     grant = AgentExecutionGrant(
@@ -149,11 +167,7 @@ def _request(
         ModelRegion.CN,
         False,
         (),
-        (
-            AuthorizedKnowledgeContext(source_id, version_id, 1),
-        )
-        if wants_citations
-        else (),
+        (),
         1,
     )
     message = Message(
@@ -165,202 +179,138 @@ def _request(
         None,
         (TextContentPart("hello"),),
     )
-    evidence = (
-        AgentKnowledgeEvidence(
-            0,
-            "knowledge_chunk_provider_0001",
-            KnowledgeCitation(source_id, version_id, "page/1", "evidence", 0.9),
-        ),
-    )
     return AgentProviderRequest(
         AgentRunId("agent_run_provider_0001"),
         spec,
         grant,
         message,
-        evidence if wants_citations and with_evidence else (),
+    )
+
+
+def _resume_request() -> AgentProviderRequest:
+    request = _request()
+    kinds = frozenset(ResumeSectionKind)
+    document = create_resume_document(
+        resume_id=ResumeId("resume_provider_0001"),
+        workspace_id=WORKSPACE_ID,
+        title="Original title",
+        locale="zh-CN",
+        template_policy=TemplatePolicy(
+            TemplateRef("template_provider_0001", "1"),
+            frozenset({"zh-CN"}),
+            frozenset({PageSize.A4}),
+            frozenset({"pdf"}),
+            kinds,
+            (TemplateZonePolicy("main", kinds, 100),),
+            frozenset({"sans"}),
+            frozenset({"yyyy-mm"}),
+            frozenset({"disc"}),
+        ),
+        created_at=NOW,
+    )
+    resume_ref = ResourceRef("resume", str(document.meta.id), document.meta.revision)
+    return replace(
+        request,
+        spec=replace(
+            request.spec,
+            capability=ConversationCapability.RESUME_EDIT,
+            context_refs=(resume_ref,),
+            output_modes=(AgentOutputMode.TEXT, AgentOutputMode.RESUME_OPERATIONS),
+            knowledge=KnowledgeSelection(
+                KnowledgeSelectionMode.NONE,
+                (),
+                (),
+                (),
+                "resume_assistant",
+            ),
+        ),
+        grant=replace(
+            request.grant,
+            agent_scope="resume_assistant",
+            context_refs=(resume_ref,),
+        ),
+        resume_context=AgentResumeContext(resume_ref, document),
     )
 
 
 @pytest.mark.asyncio
-async def test_streaming_provider_returns_public_text_and_integer_metering() -> None:
-    """适配器只返回公开文本并用整数可复算计量。"""
-    delegate = RecordingStreamProvider()
-    provider = StreamingTextAgentProvider(
-        delegate,
+async def test_runner_returns_plain_assistant_output_without_structured_output() -> None:
+    model = SequenceModel([_text_response("直接回答", "response_direct")])
+    provider = OpenAIAgentsSDKProvider(
+        model,
         input_cost_microusd_per_million_tokens=1_000_000,
         output_cost_microusd_per_million_tokens=1_000_000,
     )
 
-    outcome = await provider.execute(_request(modes=(AgentOutputMode.TEXT,)))
+    outcome = await provider.execute(_request())
 
     assert isinstance(outcome, AgentProviderCompleted)
-    assert outcome.content == (TextContentPart("world"),)
-    assert outcome.usage.input_tokens == 2
-    assert outcome.usage.output_tokens > 2
-    assert int(outcome.usage.cost_micro_usd) > 4
-    assert delegate.calls[0][0] == "hello"
-    assert delegate.calls[0][1]["capability"] == "general"
-    assert delegate.calls[0][1]["response_format"] == "agent.output.strict_json.v1"
-    response_schema = delegate.calls[0][1]["response_schema"]
-    assert isinstance(response_schema, dict)
-    assert response_schema["additionalProperties"] is False
+    assert outcome.content == (TextContentPart("直接回答"),)
+    assert outcome.usage.input_tokens == 11
+    assert outcome.usage.output_tokens == 7
+    assert model.calls[0][1] == []
+    assert model.calls[0][2] is None
 
 
 @pytest.mark.asyncio
-async def test_provider_receives_bounded_prior_user_and_assistant_messages() -> None:
-    """同一会话历史进入独立可信边界，且不会与当前用户指令混写。"""
-    delegate = RecordingStreamProvider()
-    provider = StreamingTextAgentProvider(
-        delegate,
+async def test_native_tool_call_interrupts_and_resumes_same_sdk_state() -> None:
+    model = SequenceModel(
+        [
+            _tool_response(
+                "resume_draft_set_field",
+                '{"entity_id":"resume_provider_0001","field_path":["title"],'
+                '"value":"Focused title"}',
+                "call_draft_0001",
+            ),
+            _tool_response(
+                "resume_request_proposal_decision",
+                '{"title":"Improve title"}',
+                "call_proposal_0001",
+            ),
+            _text_response("已按你的决定继续处理。", "response_resumed"),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
         input_cost_microusd_per_million_tokens=0,
         output_cost_microusd_per_million_tokens=0,
     )
-    request = _request(modes=(AgentOutputMode.TEXT,))
-    current = replace(request.input_message, sequence=3)
-    prior_user = Message(
-        ResourceMeta(MessageId("message_provider_history_user"), 1, NOW, NOW),
-        WORKSPACE_ID,
-        current.conversation_id,
-        1,
-        MessageRole.USER,
-        None,
-        (TextContentPart("我有三年前端开发经验"),),
-    )
-    prior_assistant = Message(
-        ResourceMeta(MessageId("message_provider_history_assistant"), 1, NOW, NOW),
-        WORKSPACE_ID,
-        current.conversation_id,
-        2,
-        MessageRole.ASSISTANT,
-        prior_user.meta.id,
-        (TextContentPart("可以先整理项目经历"),),
-        AgentRunId("agent_run_provider_history"),
-    )
+    request = _resume_request()
 
-    await provider.execute(
+    interrupted = await provider.execute(request)
+
+    assert isinstance(interrupted, AgentProviderProposalDecisionRequired)
+    assert interrupted.tool_call_id == "call_proposal_0001"
+    assert interrupted.proposal_title == "Improve title"
+    assert interrupted.resume_operations[0].payload["op"] == "set_field"
+    assert "$schemaVersion" in interrupted.provider_state
+    native_tools = model.calls[0][1]
+    assert {tool.name for tool in native_tools} >= {
+        "resume_read_section",
+        "resume_draft_set_field",
+        "resume_request_proposal_decision",
+    }
+    proposal_tool = next(
+        tool for tool in native_tools if tool.name == "resume_request_proposal_decision"
+    )
+    assert proposal_tool.needs_approval is True
+    assert model.calls[0][2] is None
+
+    resumed = await provider.execute(
         replace(
             request,
-            input_message=current,
-            conversation_history=(prior_user, prior_assistant),
+            proposal_decision=AgentProposalDecisionContext(
+                ResourceRef("resume_proposal", "proposal_provider_0001", 2),
+                "accept",
+                ResourceRef("resume", "resume_provider_0001", 2),
+            ),
+            provider_state=interrupted.provider_state,
         )
     )
 
-    assert delegate.calls[0][0] == "hello"
-    messages = delegate.calls[0][1]["messages"]
-    assert isinstance(messages, list)
-    history = json.loads(messages[0]["content"])
-    assert history["kind"] == "authorized_conversation_history"
-    assert history["items"] == [
-        {"role": "user", "text": "我有三年前端开发经验"},
-        {"role": "assistant", "text": "可以先整理项目经历"},
-    ]
-    assert "suggestions, not independent facts" in history["instruction"]
-
-
-@pytest.mark.asyncio
-async def test_text_adapter_fails_explicitly_when_text_was_not_requested() -> None:
-    """不能以文本假冒 citation-only 请求。"""
-    provider = StreamingTextAgentProvider(
-        RecordingStreamProvider(
-            {
-                "protocol_version": "agent.output.strict_json.v1",
-                "text": "unrequested",
-                "citation_indices": [0],
-                "resume_proposal": None,
-            }
-        ),
-        input_cost_microusd_per_million_tokens=0,
-        output_cost_microusd_per_million_tokens=0,
-    )
-
-    with pytest.raises(AgentProviderFailure) as captured:
-        await provider.execute(_request(modes=(AgentOutputMode.CITATIONS,)))
-
-    assert captured.value.problem.code == "agent.provider_protocol_error"
-    assert captured.value.problem.retryable is False
-
-
-@pytest.mark.asyncio
-async def test_requested_citations_allow_empty_result_when_retrieval_found_no_evidence() -> None:
-    """已授权来源检索无命中时允许空引用，不把正常无结果伪装成 Provider 失败。"""
-
-    provider = StreamingTextAgentProvider(
-        RecordingStreamProvider(
-            {
-                "protocol_version": "agent.output.strict_json.v1",
-                "text": None,
-                "citation_indices": [],
-                "resume_proposal": None,
-            }
-        ),
-        input_cost_microusd_per_million_tokens=0,
-        output_cost_microusd_per_million_tokens=0,
-    )
-    request = _request(modes=(AgentOutputMode.CITATIONS,), with_evidence=False)
-
-    outcome = await provider.execute(request)
-    assert isinstance(outcome, AgentProviderCompleted)
-    outcome.validate_for(request)
-    assert outcome.content == ()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "raw",
-    (
-        "{}",
-        '```json\n{"protocol_version":"agent.output.strict_json.v1"}\n```',
-        (
-            '{"protocol_version":"agent.output.strict_json.v1","text":"ok",'
-            '"citation_indices":[],"resume_proposal":null,"extra":true}'
-        ),
-        (
-            '{"protocol_version":"agent.output.strict_json.v1","text":"ok",'
-            '"citation_indices":[],"resume_proposal":null}{}'
-        ),
-    ),
-)
-async def test_malformed_structured_outputs_fail_closed(raw: str) -> None:
-    """Markdown、字段漂移和多个 JSON 文档都不能进入领域层。"""
-    provider = StreamingTextAgentProvider(
-        RawStreamProvider(raw),
-        input_cost_microusd_per_million_tokens=0,
-        output_cost_microusd_per_million_tokens=0,
-    )
-
-    with pytest.raises(AgentProviderFailure) as captured:
-        await provider.execute(_request(modes=(AgentOutputMode.TEXT,)))
-
-    assert captured.value.problem.code == "agent.provider_protocol_error"
-    assert captured.value.problem.retryable is False
-
-
-@pytest.mark.asyncio
-async def test_capability_and_prompt_limits_fail_before_network_io() -> None:
-    """缺失原生 structured-output 能力或超大 prompt 都在发网前拒绝。"""
-    blind = CapabilityBlindProvider()
-    provider = StreamingTextAgentProvider(
-        blind,
-        input_cost_microusd_per_million_tokens=0,
-        output_cost_microusd_per_million_tokens=0,
-    )
-    with pytest.raises(AgentProviderFailure) as capability_error:
-        await provider.execute(_request(modes=(AgentOutputMode.TEXT,)))
-    assert capability_error.value.problem.code == "agent.provider_capability_unavailable"
-    assert blind.calls == 0
-
-    transport = RecordingStreamProvider()
-    bounded = StreamingTextAgentProvider(
-        transport,
-        input_cost_microusd_per_million_tokens=0,
-        output_cost_microusd_per_million_tokens=0,
-    )
-    request = _request(modes=(AgentOutputMode.TEXT,))
-    oversized_message = replace(
-        request.input_message,
-        content=tuple(TextContentPart("x" * 200_000) for _ in range(6)),
-    )
-    with pytest.raises(AgentProviderFailure) as size_error:
-        await bounded.execute(replace(request, input_message=oversized_message))
-    assert size_error.value.problem.code == "agent.provider_input_too_large"
-    assert transport.calls == []
+    assert isinstance(resumed, AgentProviderCompleted)
+    assert resumed.content == (TextContentPart("已按你的决定继续处理。"),)
+    assert resumed.tool_invocations[0].ordinal == 3
+    assert resumed.tool_invocations[0].tool_name == "resume_request_proposal_decision"
+    resumed_input = model.calls[-1][0]
+    assert "call_proposal_0001" in repr(resumed_input)

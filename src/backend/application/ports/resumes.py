@@ -18,7 +18,7 @@ from backend.domain.principals import (
 from backend.domain.resume_jobs import ResumeJobSpec, ResumeOutboxEvent
 from backend.domain.resume_proposals import ResumeProposal
 from backend.domain.resumes import (
-    ResumeAggregate,
+    Resume,
     ResumeBatchId,
     ResumeId,
     ResumeOperationOutcome,
@@ -133,7 +133,7 @@ class ResumeRepository(Protocol):
         resume_id: ResumeId,
         *,
         for_update: bool = False,
-    ) -> ResumeAggregate | None:
+    ) -> Resume | None:
         """@brief 在 Workspace 内读取 Resume 聚合 / Read a Resume aggregate within a Workspace.
 
         @param workspace_id 路径 Workspace / Path Workspace.
@@ -144,7 +144,7 @@ class ResumeRepository(Protocol):
 
     async def add_resume(
         self,
-        aggregate: ResumeAggregate,
+        aggregate: Resume,
         revision: ResumeRevision,
     ) -> None:
         """@brief 原子添加 Resume 与首个 revision / Atomically add a Resume and its first revision.
@@ -155,7 +155,7 @@ class ResumeRepository(Protocol):
 
     async def save_resume(
         self,
-        aggregate: ResumeAggregate,
+        aggregate: Resume,
         revision: ResumeRevision,
         *,
         expected_revision: int,

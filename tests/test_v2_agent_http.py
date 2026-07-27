@@ -27,6 +27,7 @@ from backend.domain.agent_v2 import (
     AgentRunSpec,
     AgentRunStatus,
     AgentRunView,
+    AgentUsage,
     CitationContentPart,
     Conversation,
     ConversationCapability,
@@ -899,3 +900,30 @@ def test_public_projections_never_leak_internal_agent_state() -> None:
         assert approval.status_code == 200
         assert "invocation" not in approval.text
         assert "tool_call_id" not in approval.text
+
+
+def test_proposal_wait_remains_internal_to_the_public_agent_run_contract() -> None:
+    """The public contract exposes a produced Proposal while the worker remains paused."""
+
+    with _harness() as harness:
+        harness.service.runs[SEED_RUN_ID] = AgentRunView(
+            ResourceMeta(SEED_RUN_ID, 2, NOW, NOW),
+            WORKSPACE_ID,
+            SEED_CONVERSATION_ID,
+            SEED_MESSAGE_ID,
+            ConversationCapability.RESUME_EDIT,
+            AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
+            MessageId("message_agent_waiting_0001"),
+            (ResourceRef("resume_proposal", "proposal_agent_waiting_0001", 1),),
+            None,
+            AgentUsage(10, 5, "0"),
+        )
+
+        response = harness.client.get(
+            f"/api/v2/workspaces/{WORKSPACE_ID}/agent-runs/{SEED_RUN_ID}"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "succeeded"
+        assert response.json()["proposal_refs"][0]["id"] == "proposal_agent_waiting_0001"
+        harness.validator.validate_definition("AgentRun", response.json())

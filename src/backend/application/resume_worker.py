@@ -46,7 +46,7 @@ from backend.domain.resume_jobs import (
 )
 from backend.domain.resumes import (
     ChangeTarget,
-    ResumeAggregate,
+    Resume,
     ResumeDomainError,
     ResumeId,
     ResumeProfile,
@@ -133,7 +133,7 @@ class _RestorePreparation:
 
     job: Job
     spec: ResumeRestoreSpec
-    current: ResumeAggregate
+    current: Resume
     source: ResumeRevision
     policy: TemplatePolicy
 
@@ -702,7 +702,7 @@ def _import_document(
     preparation: _ImportPreparation,
     content: ResumeImportedContent,
     actor_id: UserId,
-) -> tuple[ResumeAggregate, ResumeRevision]:
+) -> tuple[Resume, ResumeRevision]:
     """@brief 将 converter 输出构造成有效 revision=1 SIR / Build a valid revision-one SIR from converter output."""
     created_at = preparation.job.started_at
     if created_at is None:
@@ -725,13 +725,13 @@ def _import_document(
     )
     document = replace(document, profile=profile)
     preparation.policy.validate(document)
-    return ResumeAggregate.create(document, actor_id)
+    return Resume.create(document, actor_id)
 
 
 def _restored_aggregate(
     preparation: _RestorePreparation,
     actor_id: UserId,
-) -> tuple[ResumeAggregate, ResumeRevision]:
+) -> tuple[Resume, ResumeRevision]:
     """@brief 从 immutable snapshot 构造下一 revision / Build the next revision from an immutable snapshot."""
     at = preparation.job.started_at
     if at is None:
@@ -747,7 +747,7 @@ def _restored_aggregate(
         restored.meta.revision,
         frozenset({ChangeTarget(str(restored.meta.id))}),
     )
-    aggregate = ResumeAggregate(
+    aggregate = Resume(
         restored,
         current.operation_ledger,
         (*current.revision_changes, change),
@@ -782,19 +782,19 @@ def _worker_problem(job_id: JobId, code: str, *, retryable: bool) -> ProblemDeta
     )
 
 
-def _expect_import_output(value: object) -> tuple[ResumeAggregate, ResumeRevision]:
+def _expect_import_output(value: object) -> tuple[Resume, ResumeRevision]:
     """@brief 防御性验证 import 内部输出 / Defensively validate an internal import output."""
     if (
         not isinstance(value, tuple)
         or len(value) != 2
-        or not isinstance(value[0], ResumeAggregate)
+        or not isinstance(value[0], Resume)
         or not isinstance(value[1], ResumeRevision)
     ):
         raise TypeError("Resume importer produced an invalid internal output")
     return value
 
 
-def _expect_restore_output(value: object) -> tuple[ResumeAggregate, ResumeRevision]:
+def _expect_restore_output(value: object) -> tuple[Resume, ResumeRevision]:
     """@brief 防御性验证 restore 内部输出 / Defensively validate an internal restore output."""
     return _expect_import_output(value)
 

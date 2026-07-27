@@ -59,7 +59,7 @@ from backend.domain.resumes import (
     PartialDate,
     RemoveResumeEntity,
     RenderHint,
-    ResumeAggregate,
+    Resume,
     ResumeBatchId,
     ResumeBatchKeyReused,
     ResumeDomainError,
@@ -170,7 +170,7 @@ def _document(
     *,
     resume_id: ResumeId = RESUME_ID,
     title: str = "Distributed Systems Engineer",
-) -> ResumeAggregate:
+) -> Resume:
     """@brief 构造 revision=1 的 Resume 聚合 / Build a Resume aggregate at revision one."""
     document = create_resume_document(
         resume_id=resume_id,
@@ -181,7 +181,7 @@ def _document(
         created_at=NOW,
         full_name="Klee",
     )
-    return ResumeAggregate.create(document, USER_ID)[0]
+    return Resume.create(document, USER_ID)[0]
 
 
 def _section() -> ResumeSection:
@@ -475,7 +475,7 @@ def test_safe_rebase_accepts_disjoint_targets_and_rejects_overlap() -> None:
 class MemoryStore:
     """@brief Resume 应用用例的事务内存状态 / In-memory transactional state for Resume use cases."""
 
-    resumes: dict[tuple[WorkspaceId, ResumeId], ResumeAggregate] = field(default_factory=dict)
+    resumes: dict[tuple[WorkspaceId, ResumeId], Resume] = field(default_factory=dict)
     revisions: dict[tuple[WorkspaceId, ResumeId, int], ResumeRevision] = field(default_factory=dict)
     receipts: dict[tuple[WorkspaceId, ResumeId, ResumeBatchId], OperationBatchReceipt] = field(default_factory=dict)
     proposals: dict[tuple[WorkspaceId, ResumeProposalId], ResumeProposal] = field(default_factory=dict)
@@ -507,12 +507,12 @@ class MemoryRepository:
         has_more = start + page.limit < len(items)
         return CollectionPage(selected, str(selected[-1].meta.id) if selected and has_more else None)
 
-    async def get_resume(self, workspace_id: WorkspaceId, resume_id: ResumeId, *, for_update: bool = False) -> ResumeAggregate | None:
+    async def get_resume(self, workspace_id: WorkspaceId, resume_id: ResumeId, *, for_update: bool = False) -> Resume | None:
         """@brief 读取 Workspace Resume / Read a Workspace Resume."""
         del for_update
         return self.store.resumes.get((workspace_id, resume_id))
 
-    async def add_resume(self, aggregate: ResumeAggregate, revision: ResumeRevision) -> None:
+    async def add_resume(self, aggregate: Resume, revision: ResumeRevision) -> None:
         """@brief 添加 Resume 与首个 revision / Add a Resume and first revision."""
         key = (aggregate.document.workspace_id, aggregate.document.meta.id)
         if key in self.store.resumes:
@@ -520,7 +520,7 @@ class MemoryRepository:
         self.store.resumes[key] = aggregate
         self.store.revisions[(*key, revision.revision)] = revision
 
-    async def save_resume(self, aggregate: ResumeAggregate, revision: ResumeRevision, *, expected_revision: int) -> None:
+    async def save_resume(self, aggregate: Resume, revision: ResumeRevision, *, expected_revision: int) -> None:
         """@brief 通过 CAS 保存 Resume / Save a Resume via CAS."""
         key = (aggregate.document.workspace_id, aggregate.document.meta.id)
         current = self.store.resumes.get(key)

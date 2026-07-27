@@ -1138,17 +1138,17 @@ class RevisionChange:
 
 
 @dataclass(frozen=True, slots=True)
-class ResumeAggregateChange:
+class ResumeChange:
     """@brief 一次原子聚合变更的完整产物 / Complete product of one atomic aggregate change."""
 
-    aggregate: ResumeAggregate
+    aggregate: Resume
     revision: ResumeRevision | None
     applied_operation_ids: tuple[ResumeOperationId, ...]
     deduplicated_operation_ids: tuple[ResumeOperationId, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class ResumeAggregate:
+class Resume:
     """@brief 带 operation ledger 与 rebase 因果记录的 Resume 聚合 / Resume aggregate with dedup and rebase history."""
 
     document: ResumeDocument
@@ -1156,7 +1156,7 @@ class ResumeAggregate:
     revision_changes: tuple[RevisionChange, ...] = ()
 
     @classmethod
-    def create(cls, document: ResumeDocument, actor_id: UserId) -> tuple[ResumeAggregate, ResumeRevision]:
+    def create(cls, document: ResumeDocument, actor_id: UserId) -> tuple[Resume, ResumeRevision]:
         """@brief 创建首个不可变 revision / Create the first immutable revision.
 
         @param document revision=1 的新 Resume / New Resume at revision one.
@@ -1169,7 +1169,7 @@ class ResumeAggregate:
         aggregate = cls(document)
         return aggregate, ResumeRevision(document.meta.id, 1, document.meta.created_at, actor_id, document)
 
-    def update_metadata(self, *, title: str | None, locale: str | None, at: datetime, actor_id: UserId) -> ResumeAggregateChange:
+    def update_metadata(self, *, title: str | None, locale: str | None, at: datetime, actor_id: UserId) -> ResumeChange:
         """@brief 修改 Resume metadata 并产生 revision / Update Resume metadata and produce a revision.
 
         @param title 可选目标标题 / Optional target title.
@@ -1193,9 +1193,9 @@ class ResumeAggregate:
         )
         aggregate = replace(self, document=updated, revision_changes=(*self.revision_changes, RevisionChange(updated.meta.revision, targets)))
         revision = ResumeRevision(updated.meta.id, updated.meta.revision, at, actor_id, updated)
-        return ResumeAggregateChange(aggregate, revision, (), ())
+        return ResumeChange(aggregate, revision, (), ())
 
-    def apply_batch(self, batch: ResumeOperationBatch, *, at: datetime, actor_id: UserId, template_policies: Mapping[TemplateRef, TemplatePolicy]) -> ResumeAggregateChange:
+    def apply_batch(self, batch: ResumeOperationBatch, *, at: datetime, actor_id: UserId, template_policies: Mapping[TemplateRef, TemplatePolicy]) -> ResumeChange:
         """@brief 校验、去重并原子应用 operation batch / Validate, deduplicate, and atomically apply a batch.
 
         @param batch 已类型化批次 / Typed operation batch.
@@ -1223,7 +1223,7 @@ class ResumeAggregate:
         if batch.base_revision != self.document.meta.revision:
             self._ensure_rebase_is_safe(batch, targets_by_operation)
         if not fresh:
-            return ResumeAggregateChange(self, None, tuple(operation.operation_id for operation in batch.operations), tuple(deduplicated))
+            return ResumeChange(self, None, tuple(operation.operation_id for operation in batch.operations), tuple(deduplicated))
         candidate = self.document
         for operation in fresh:
             candidate = _apply_operation(candidate, operation)
@@ -1242,7 +1242,7 @@ class ResumeAggregate:
             revision_changes=(*self.revision_changes, RevisionChange(revision_number, changed_targets)),
         )
         revision = ResumeRevision(candidate.meta.id, revision_number, at, actor_id, candidate)
-        return ResumeAggregateChange(
+        return ResumeChange(
             aggregate,
             revision,
             tuple(operation.operation_id for operation in batch.operations),
@@ -2064,10 +2064,10 @@ __all__ = [
     "PartialDate",
     "RenderHint",
     "ResourceRef",
-    "ResumeAggregate",
-    "ResumeAggregateChange",
+    "Resume",
     "ResumeBatchId",
     "ResumeBatchKeyReused",
+    "ResumeChange",
     "ResumeConflict",
     "ResumeDocument",
     "ResumeDomainError",

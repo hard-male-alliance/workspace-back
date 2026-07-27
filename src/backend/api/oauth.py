@@ -24,6 +24,12 @@ JWKS_PATH = "/oauth/jwks"
 DEMO_STYLES_PATH = "/oauth/demo.css"
 _DEMO_FORM_MAX_BYTES = 8_192
 _DEMO_LOCALES = ("zh-CN", "en-US")
+_LOCAL_DEMO_ORIGINS = frozenset(
+    {
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+    }
+)
 _DEMO_STYLES = """
 :root {
   color-scheme: light;
@@ -320,7 +326,7 @@ async def _read_demo_form(request: Request) -> dict[str, str]:
 
 
 def _validate_demo_form_origin(request: Request) -> None:
-    if request.headers.get("Origin") != PUBLIC_ORIGIN:
+    if request.headers.get("Origin") not in {PUBLIC_ORIGIN, *_LOCAL_DEMO_ORIGINS}:
         raise HostedIdentityError("identity.origin_invalid", 403, "Origin validation failed")
     if request.headers.get("Sec-Fetch-Site") != "same-origin":
         raise HostedIdentityError(

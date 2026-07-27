@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Protocol, TypeIs
 
 from backend.application.ports.agent_v2 import (
+    AgentProposalDecisionClaim,
     AgentRunExecutionClaim,
     AgentRunExhaustionClaim,
     AgentToolDecisionClaim,
@@ -24,6 +25,7 @@ from backend.application.ports.outbox_dispatch import (
 )
 from backend.domain.agent_v2 import (
     AgentOutboxId,
+    AgentRunId,
     AgentRunView,
     ToolCallId,
     ToolDecision,
@@ -37,6 +39,9 @@ _RUN_QUEUED_EVENT_TYPE = "agent.run.queued"
 
 _TOOL_DECISION_EVENT_TYPE = "agent.tool_decision.recorded"
 """@brief 已提交工具决定的唯一恢复事件 / Sole resume event for a committed tool decision."""
+
+_PROPOSAL_DECISION_EVENT_TYPE = "agent.proposal_decision.recorded"
+"""@brief Resume Proposal 决定后的 Agent 恢复事件。"""
 
 _QUEUED_PAYLOAD_FIELDS = frozenset({"actor_id", "run_id", "job_id"})
 """@brief queued payload 的封闭字段集 / Closed field set for a queued payload."""
@@ -55,6 +60,10 @@ _TOOL_DECISION_PAYLOAD_FIELDS = frozenset(
     }
 )
 """@brief 工具决定 payload 的封闭字段集 / Closed field set for a tool-decision payload."""
+
+_PROPOSAL_DECISION_PAYLOAD_FIELDS = frozenset(
+    {"actor_id", "run_id", "decision", "resume_id", "resume_revision"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +129,19 @@ class _AgentRunExhaustionClaim:
     """@brief outbox header 中的 Run subject / Run subject from the outbox header."""
 
 
+@dataclass(frozen=True, slots=True)
+class _AgentProposalDecisionClaim:
+    """Validated Resume-to-Agent continuation."""
+
+    id: AgentOutboxId
+    workspace_id: WorkspaceId
+    actor_id: UserId
+    run_id: AgentRunId
+    proposal_ref: ResourceRef
+    decision: str
+    resume_ref: ResourceRef
+
+
 class _AgentWorker(Protocol):
     """@brief handler 所需的窄 worker 形状 / Narrow worker shape required by the handler."""
 
@@ -128,6 +150,12 @@ class _AgentWorker(Protocol):
 
     async def execute_approved_tool(self, dispatch: AgentToolDecisionClaim) -> AgentRunView:
         """@brief 幂等执行或终结工具决定 / Idempotently execute or terminate a tool decision."""
+
+    async def resume_after_proposal_decision(
+        self,
+        dispatch: AgentProposalDecisionClaim,
+    ) -> AgentRunView:
+        """Resume a Run after its exact Proposal decision."""
 
     async def fail_exhausted(self, dispatch: AgentRunExhaustionClaim) -> AgentRunView:
         """@brief 幂等闭合耗尽事件拥有的 Run/Job / Idempotently close the Run/Job owned by an exhausted event."""
@@ -156,6 +184,11 @@ class AgentRunOutboxHandler:
             return
         if claim.event_type == _TOOL_DECISION_EVENT_TYPE:
             await self._worker.execute_approved_tool(_tool_decision_claim(claim))
+            return
+        if claim.event_type == _PROPOSAL_DECISION_EVENT_TYPE:
+            await self._worker.resume_after_proposal_decision(
+                _proposal_decision_claim(claim)
+            )
             return
         raise OutboxHandlerFailure("agent.event_type_unsupported")
 
@@ -293,6 +326,48 @@ def _tool_decision_claim(claim: OutboxDispatchClaim) -> _AgentToolDecisionClaim:
         tool_call_id=parsed_call_id,
         decision=parsed_decision,
     )
+
+
+def _proposal_decision_claim(
+    claim: OutboxDispatchClaim,
+) -> _AgentProposalDecisionClaim:
+    """Strictly validate the Resume-to-Agent continuation envelope."""
+
+    payload = claim.payload
+    if (
+        claim.event_type != _PROPOSAL_DECISION_EVENT_TYPE
+        or claim.subject.resource_type != "resume_proposal"
+        or claim.subject.revision is None
+        or frozenset(payload) != _PROPOSAL_DECISION_PAYLOAD_FIELDS
+    ):
+        raise OutboxHandlerFailure("agent.proposal_decision_event_invalid")
+    actor_id = payload.get("actor_id")
+    run_id = payload.get("run_id")
+    decision = payload.get("decision")
+    resume_id = payload.get("resume_id")
+    resume_revision = payload.get("resume_revision")
+    if (
+        not isinstance(actor_id, str)
+        or actor_id != claim.actor_id
+        or not isinstance(run_id, str)
+        or not isinstance(decision, str)
+        or decision not in {"accept", "accept_selected", "reject"}
+        or not isinstance(resume_id, str)
+        or not _is_positive_int(resume_revision)
+    ):
+        raise OutboxHandlerFailure("agent.proposal_decision_event_invalid")
+    try:
+        return _AgentProposalDecisionClaim(
+            id=AgentOutboxId(str(claim.event_id)),
+            workspace_id=claim.workspace_id,
+            actor_id=UserId(actor_id),
+            run_id=AgentRunId(run_id),
+            proposal_ref=claim.subject,
+            decision=decision,
+            resume_ref=ResourceRef("resume", resume_id, resume_revision),
+        )
+    except ValueError as error:
+        raise OutboxHandlerFailure("agent.proposal_decision_event_invalid") from error
 
 
 def _is_positive_int(value: object) -> TypeIs[int]:

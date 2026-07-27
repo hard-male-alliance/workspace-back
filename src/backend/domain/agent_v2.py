@@ -132,6 +132,7 @@ class AgentRunStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
     WAITING_FOR_APPROVAL = "waiting_for_approval"
+    WAITING_FOR_PROPOSAL_DECISION = "waiting_for_proposal_decision"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -569,6 +570,50 @@ class AgentResumeOperationDraft:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentProposalDecisionContext:
+    """Committed human decision supplied when a paused Agent resumes."""
+
+    proposal_ref: ResourceRef
+    decision: str
+    resume_ref: ResourceRef
+
+    def __post_init__(self) -> None:
+        if (
+            self.proposal_ref.resource_type != "resume_proposal"
+            or self.proposal_ref.revision is None
+            or self.resume_ref.resource_type != "resume"
+            or self.resume_ref.revision is None
+            or self.decision not in {"accept", "accept_selected", "reject"}
+        ):
+            raise AgentDomainError("Agent Proposal decision context is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentToolInvocationTrace:
+    """Content-free diagnostic record for one narrow Agent tool invocation."""
+
+    ordinal: int
+    tool_name: str
+    argument_keys: tuple[str, ...]
+    status: str
+    duration_ms: float
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.ordinal, bool)
+            or self.ordinal < 1
+            or not self.tool_name
+            or len(self.tool_name) > 101
+            or self.argument_keys != tuple(sorted(set(self.argument_keys)))
+            or any(not key or len(key) > 100 for key in self.argument_keys)
+            or self.status not in {"completed", "decision_required"}
+            or isinstance(self.duration_ms, bool)
+            or not 0 <= self.duration_ms <= 3_600_000
+        ):
+            raise AgentDomainError("Agent tool invocation diagnostic is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class AgentRunView:
     """@brief 严格对应公开 AgentRun Schema 的投影 / Projection matching the public AgentRun schema."""
 
@@ -602,6 +647,15 @@ class AgentRunView:
             _require_opaque_id(self.pending_approval_id, "pending approval id")
         elif self.pending_approval_id is not None:
             raise AgentDomainError("only a waiting run may expose a pending approval")
+        if self.status is AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION:
+            if (
+                self.output_message_id is None
+                or len(self.proposal_refs) != 1
+                or self.usage is None
+            ):
+                raise AgentDomainError(
+                    "proposal-waiting run requires an output, usage, and one Proposal"
+                )
         if self.status is AgentRunStatus.FAILED:
             if self.problem is None:
                 raise AgentDomainError("failed run requires ProblemDetails")
@@ -609,8 +663,14 @@ class AgentRunView:
             raise AgentDomainError("only a failed run may expose ProblemDetails")
         if self.status is AgentRunStatus.SUCCEEDED and self.output_message_id is None:
             raise AgentDomainError("succeeded run requires an output message")
-        if not self.status.is_terminal and (
-            self.output_message_id is not None or self.proposal_refs or self.usage is not None
+        if (
+            not self.status.is_terminal
+            and self.status is not AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION
+            and (
+                self.output_message_id is not None
+                or self.proposal_refs
+                or self.usage is not None
+            )
         ):
             raise AgentDomainError("non-terminal run cannot expose terminal results")
 
@@ -625,6 +685,7 @@ class AgentRun:
     spec: AgentRunSpec = field(repr=False)
     grant: AgentExecutionGrant = field(repr=False)
     active_tool_call_id: ToolCallId | None = field(default=None, repr=False)
+    provider_state: Mapping[str, JsonValue] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """@brief 校验公开投影、执行请求与 Job 绑定 / Validate public projection, execution request, and Job binding."""
@@ -642,6 +703,12 @@ class AgentRun:
             _require_opaque_id(self.active_tool_call_id, "active tool call id")
         elif self.active_tool_call_id is not None:
             raise AgentDomainError("only a waiting run may retain an active tool call")
+        if (
+            self.view.status is AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION
+        ) != (self.provider_state is not None):
+            raise AgentDomainError(
+                "only a Proposal-waiting run may retain native provider state"
+            )
 
     @property
     def meta(self) -> ResourceMeta[AgentRunId]:
@@ -698,6 +765,37 @@ class AgentRun:
             active_tool_call_id=tool_call_id,
         )
 
+    def wait_for_proposal_decision(
+        self,
+        output_message_id: MessageId,
+        proposal_ref: ResourceRef,
+        usage: AgentUsage,
+        provider_state: Mapping[str, JsonValue],
+        *,
+        at: datetime,
+    ) -> AgentRun:
+        """Pause after a draft tool call until the human decides the Proposal."""
+
+        self._require_state(
+            AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
+            {AgentRunStatus.RUNNING},
+        )
+        _require_opaque_id(output_message_id, "proposal-waiting output message id")
+        if not _is_proposal_ref(proposal_ref):
+            raise AgentDomainError("proposal wait requires an exact Resume Proposal")
+        return replace(
+            self,
+            view=replace(
+                self.view,
+                meta=self.meta.advance(at),
+                status=AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
+                output_message_id=output_message_id,
+                proposal_refs=(proposal_ref,),
+                usage=usage,
+            ),
+            provider_state=provider_state,
+        )
+
     def resume_after_decision(
         self,
         approval_id: ToolApprovalId,
@@ -718,6 +816,21 @@ class AgentRun:
                 pending_approval_id=None,
             ),
             active_tool_call_id=None,
+            provider_state=None,
+        )
+
+    def matches_proposal_decision(self, proposal_ref: ResourceRef) -> bool:
+        """Return whether a committed Proposal revision resumes this exact wait."""
+
+        if self.view.status is not AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION:
+            return False
+        waiting_ref = self.view.proposal_refs[0]
+        return (
+            proposal_ref.resource_type == "resume_proposal"
+            and proposal_ref.id == waiting_ref.id
+            and proposal_ref.revision is not None
+            and waiting_ref.revision is not None
+            and proposal_ref.revision == waiting_ref.revision + 1
         )
 
     def succeed(
@@ -729,7 +842,13 @@ class AgentRun:
         at: datetime,
     ) -> AgentRun:
         """@brief running → succeeded，仅保存 Message/Proposal 引用 / Succeed with only Message and Proposal references."""
-        self._require_state(AgentRunStatus.SUCCEEDED, {AgentRunStatus.RUNNING})
+        self._require_state(
+            AgentRunStatus.SUCCEEDED,
+            {
+                AgentRunStatus.RUNNING,
+                AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
+            },
+        )
         _require_opaque_id(output_message_id, "output message id")
         return replace(
             self,
@@ -741,6 +860,7 @@ class AgentRun:
                 proposal_refs=tuple(proposal_refs),
                 usage=usage,
             ),
+            provider_state=None,
         )
 
     def fail(self, problem: ProblemDetails, *, at: datetime) -> AgentRun:
@@ -751,6 +871,7 @@ class AgentRun:
                 AgentRunStatus.QUEUED,
                 AgentRunStatus.RUNNING,
                 AgentRunStatus.WAITING_FOR_APPROVAL,
+                AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
             },
         )
         return replace(
@@ -763,6 +884,7 @@ class AgentRun:
                 problem=problem,
             ),
             active_tool_call_id=None,
+            provider_state=None,
         )
 
     def cancel(self, *, at: datetime) -> AgentRun:
@@ -773,6 +895,7 @@ class AgentRun:
                 AgentRunStatus.QUEUED,
                 AgentRunStatus.RUNNING,
                 AgentRunStatus.WAITING_FOR_APPROVAL,
+                AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
             },
         )
         return replace(
@@ -784,6 +907,7 @@ class AgentRun:
                 pending_approval_id=None,
             ),
             active_tool_call_id=None,
+            provider_state=None,
         )
 
     def _require_state(
@@ -966,6 +1090,9 @@ class AgentProviderRequest:
     knowledge_evidence: tuple[AgentKnowledgeEvidence, ...] = ()
     resume_context: AgentResumeContext | None = None
     conversation_history: tuple[Message, ...] = ()
+    proposal_decision: AgentProposalDecisionContext | None = None
+    provider_state: Mapping[str, JsonValue] | None = field(default=None, repr=False)
+    actor_id: UserId | None = None
 
     def __post_init__(self) -> None:
         """@brief 校验输入消息与 Run 请求一致 / Validate input Message against the Run request."""
@@ -975,6 +1102,8 @@ class AgentProviderRequest:
             or self.input_message.role is not MessageRole.USER
         ):
             raise AgentDomainError("provider request requires the exact user input message")
+        if self.actor_id is not None:
+            _require_opaque_id(self.actor_id, "provider request actor id")
         if len(self.conversation_history) > 40:
             raise AgentDomainError("provider conversation history cannot exceed 40 messages")
         history_order = tuple(item.sequence for item in self.conversation_history)
@@ -1006,7 +1135,15 @@ class AgentProviderRequest:
         wants_resume = self.spec.capability is ConversationCapability.RESUME_EDIT
         if wants_resume != (self.resume_context is not None):
             raise AgentDomainError("provider Resume context does not match output modes")
-        if self.resume_context is not None and self.resume_context.resume_ref not in self.grant.context_refs:
+        if (self.proposal_decision is None) != (self.provider_state is None):
+            raise AgentDomainError(
+                "provider state is required exactly when a Proposal decision resumes"
+            )
+        if (
+            self.resume_context is not None
+            and self.proposal_decision is None
+            and self.resume_context.resume_ref not in self.grant.context_refs
+        ):
             raise AgentDomainError("provider Resume context exceeds the execution grant")
 
 
@@ -1023,6 +1160,7 @@ class AgentProviderCompleted:
     usage: AgentUsage
     resume_operations: tuple[AgentResumeOperationDraft, ...] = ()
     proposal_title: str | None = None
+    tool_invocations: tuple[AgentToolInvocationTrace, ...] = ()
 
     def __post_init__(self) -> None:
         """@brief 校验最终内容和 Proposal-only 写入 / Validate final content and Proposal-only writes."""
@@ -1057,7 +1195,13 @@ class AgentProviderCompleted:
             raise AgentDomainError(
                 "provider Resume drafts and proposal title must appear together"
             )
-
+        ordinals = tuple(item.ordinal for item in self.tool_invocations)
+        if ordinals and ordinals != tuple(
+            range(ordinals[0], ordinals[0] + len(ordinals))
+        ):
+            raise AgentDomainError(
+                "provider tool invocation ordinals must be contiguous within an attempt"
+            )
     def validate_for(self, request: AgentProviderRequest) -> None:
         """@brief 对精确请求验证完整模式与证据 provenance / Validate complete modes and evidence provenance.
 
@@ -1067,6 +1211,8 @@ class AgentProviderCompleted:
             omitted, extra, or fabricated output.
         """
         allowed = set(request.spec.output_modes)
+        if request.proposal_decision is not None and self.resume_operations:
+            raise AgentDomainError("a resumed Proposal decision cannot draft another Proposal")
         if self.proposal_refs or any(
             isinstance(part, ResumeProposalContentPart) for part in self.content
         ):
@@ -1094,18 +1240,16 @@ class AgentProviderCompleted:
         if (AgentOutputMode.TEXT in allowed) != (text_count == 1):
             raise AgentDomainError("provider must return exactly one requested text output")
         wants_citations = AgentOutputMode.CITATIONS in allowed
-        if (not wants_citations and citations) or (
-            wants_citations and request.knowledge_evidence and not citations
-        ):
-            raise AgentDomainError("provider must return every requested citation output")
+        if not wants_citations and citations:
+            raise AgentDomainError("provider returned unrequested citations")
         if len(set(citations)) != len(citations):
             raise AgentDomainError("provider citation selections must be unique")
         evidence = {item.citation for item in request.knowledge_evidence}
         if not set(citations) <= evidence:
             raise AgentDomainError("provider returned a citation outside server evidence")
         has_resume = bool(self.resume_operations)
-        if (AgentOutputMode.RESUME_OPERATIONS in allowed) != has_resume:
-            raise AgentDomainError("provider must return every requested Resume output")
+        if has_resume and AgentOutputMode.RESUME_OPERATIONS not in allowed:
+            raise AgentDomainError("provider returned unrequested Resume output")
         if has_resume and len(self.content) >= 100:
             raise AgentDomainError(
                 "provider content leaves no room for the server Proposal reference"
@@ -1136,7 +1280,34 @@ class AgentProviderApprovalRequired:
     binding: ToolCallBinding
 
 
-type AgentProviderOutcome = AgentProviderCompleted | AgentProviderApprovalRequired
+@dataclass(frozen=True, slots=True)
+class AgentProviderProposalDecisionRequired:
+    """A native Agent tool call paused before the reviewable Resume write."""
+
+    content: tuple[MessageContentPart, ...]
+    usage: AgentUsage
+    resume_operations: tuple[AgentResumeOperationDraft, ...]
+    proposal_title: str
+    provider_state: Mapping[str, JsonValue] = field(repr=False)
+    tool_call_id: ToolCallId
+    tool_invocations: tuple[AgentToolInvocationTrace, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.resume_operations:
+            raise AgentDomainError("Proposal interruption requires Resume operations")
+        _require_text(self.proposal_title, "provider proposal title", minimum=1, maximum=300)
+        _require_opaque_id(self.tool_call_id, "provider Proposal tool call id")
+        frozen = _freeze_provider_json(self.provider_state, depth=0)
+        if not isinstance(frozen, Mapping):
+            raise AgentDomainError("provider state must be a JSON object")
+        object.__setattr__(self, "provider_state", frozen)
+
+
+type AgentProviderOutcome = (
+    AgentProviderCompleted
+    | AgentProviderApprovalRequired
+    | AgentProviderProposalDecisionRequired
+)
 """@brief 模型 provider 的封闭结果联合 / Closed model-provider outcome union."""
 
 
@@ -1373,6 +1544,7 @@ def validate_run_job_alignment(run: AgentRun, job: Job) -> None:
         AgentRunStatus.QUEUED: JobStatus.QUEUED,
         AgentRunStatus.RUNNING: JobStatus.RUNNING,
         AgentRunStatus.WAITING_FOR_APPROVAL: JobStatus.RUNNING,
+        AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION: JobStatus.RUNNING,
         AgentRunStatus.SUCCEEDED: JobStatus.SUCCEEDED,
         AgentRunStatus.FAILED: JobStatus.FAILED,
         AgentRunStatus.CANCELLED: JobStatus.CANCELLED,
@@ -1490,9 +1662,11 @@ __all__ = [
     "AgentOutboxId",
     "AgentOutboxRecord",
     "AgentOutputMode",
+    "AgentProposalDecisionContext",
     "AgentProviderApprovalRequired",
     "AgentProviderCompleted",
     "AgentProviderOutcome",
+    "AgentProviderProposalDecisionRequired",
     "AgentProviderRequest",
     "AgentResumeContext",
     "AgentResumeOperationDraft",
@@ -1505,6 +1679,7 @@ __all__ = [
     "AgentRunStatus",
     "AgentRunTransitionError",
     "AgentRunView",
+    "AgentToolInvocationTrace",
     "AgentUsage",
     "AuthorizedKnowledgeContext",
     "CitationContentPart",

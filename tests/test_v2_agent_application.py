@@ -32,6 +32,7 @@ from backend.application.ports.agent_v2 import (
     AgentRunPolicyRequest,
     AgentToolDecisionClaim,
     AgentToolExecutor,
+    AgentToolInvocationCommand,
     MessageSequenceReservation,
     ToolExecutionReceipt,
 )
@@ -407,6 +408,10 @@ class FakeResumeProposals:
     async def create(self, command: AgentResumeProposalCommand) -> ResourceRef:
         del command
         raise AssertionError("unexpected Resume Proposal creation")
+
+    async def record_invocations(self, command: AgentToolInvocationCommand) -> None:
+        del command
+        raise AssertionError("unexpected Agent tool invocation persistence")
 
 
 class FakeUow:

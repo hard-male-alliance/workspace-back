@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Protocol, cast
 
 import httpx
+from agents.models.interface import Model
+from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
+from openai import AsyncOpenAI
 
 from backend.api.constants import PUBLIC_ORIGIN
 from backend.api.v2_http import CursorCodec
@@ -161,7 +164,6 @@ from backend.infrastructure.access import (
 from backend.infrastructure.account_deletion import PostgresAccountDeletionExecutionPort
 from backend.infrastructure.agent_provider import (
     EmptyAgentToolRegistry,
-    StreamingTextAgentProvider,
     UnavailableAgentToolExecutor,
 )
 from backend.infrastructure.agent_retrieval import GrantedAgentKnowledgeRetriever
@@ -174,6 +176,10 @@ from backend.infrastructure.agent_v2 import (
     InMemoryAgentWorkerUnitOfWorkFactory,
     PostgresAgentUnitOfWorkFactory,
     PostgresAgentWorkerUnitOfWorkFactory,
+)
+from backend.infrastructure.agents_sdk_provider import (
+    DeterministicAgentModel,
+    OpenAIAgentsSDKProvider,
 )
 from backend.infrastructure.contracts import ContractValidator
 from backend.infrastructure.embeddings import (
@@ -378,6 +384,9 @@ class _AgentRuntimeComponents:
 
     dispatcher: _OutboxDispatchService
     """@brief 仅消费 Agent-owned queued 事件的 dispatcher / Dispatcher consuming only Agent-owned queued events."""
+
+    provider: OpenAIAgentsSDKProvider
+    """SDK model runtime owned by the application lifespan."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -739,6 +748,7 @@ async def build_container(
         },
     )
     provider: AgentModelProvider | None = None
+    agent_runtime: _AgentRuntimeComponents | None = None
     try:
         provider = await _provider_for(settings)
         dependencies = ServiceDependencies(
@@ -842,6 +852,7 @@ async def build_container(
                 memory_access_store=memory_access_store,
                 provider=provider,
                 embedder=embedding_provider,
+                telemetry=telemetry,
             )
             knowledge_runtime = _knowledge_runtime_for(
                 settings,
@@ -1080,6 +1091,9 @@ async def build_container(
                 database,
                 telemetry_database,
                 interview_media_analyzer,
+                agent_provider=(
+                    None if agent_runtime is None else agent_runtime.provider
+                ),
             )
         except BaseException as error:
             shutdown_failures.append(error)
@@ -1103,6 +1117,7 @@ def _agent_runtime_for(
     memory_access_store: InMemoryAccessStore | None,
     provider: AgentModelProvider,
     embedder: EmbeddingProvider,
+    telemetry: ObservabilityPipeline,
 ) -> _AgentRuntimeComponents:
     """@brief 构造 memory/PostgreSQL Agent V2 应用与 worker 图 / Build the memory/PostgreSQL Agent V2 application and worker graph.
 
@@ -1117,14 +1132,39 @@ def _agent_runtime_for(
         and dependencies disagree.
     """
     model_routes = _agent_model_routes(settings)
-    model_adapter = StreamingTextAgentProvider(
-        provider,
+    del provider
+    sdk_model: Model
+    if settings.ai.provider == "mock":
+        sdk_client = None
+        sdk_model = DeterministicAgentModel()
+    else:
+        sdk_http_client = httpx.AsyncClient(
+            proxy=settings.network.outbound_proxy_url,
+            timeout=httpx.Timeout(
+                settings.network.read_timeout_ms / 1_000,
+                connect=settings.network.connect_timeout_ms / 1_000,
+            ),
+        )
+        sdk_client = AsyncOpenAI(
+            api_key=settings.ai.api_key,
+            base_url=_required_provider_base_url(settings.ai.base_url),
+            http_client=sdk_http_client,
+        )
+        sdk_model = OpenAIChatCompletionsModel(
+            model=settings.ai.model,
+            openai_client=sdk_client,
+            buffer_streamed_tool_calls=True,
+        )
+    model_adapter = OpenAIAgentsSDKProvider(
+        sdk_model,
         input_cost_microusd_per_million_tokens=(
             settings.ai.metering.input_cost_microusd_per_million_tokens
         ),
         output_cost_microusd_per_million_tokens=(
             settings.ai.metering.output_cost_microusd_per_million_tokens
         ),
+        telemetry=telemetry,
+        client=sdk_client,
     )
     tool_executor = UnavailableAgentToolExecutor()
     tool_registry = EmptyAgentToolRegistry()
@@ -1175,7 +1215,7 @@ def _agent_runtime_for(
             required_event_types=AGENT_WORK_EVENT_TYPES,
             settings=OutboxDispatchSettings(),
         )
-        return _AgentRuntimeComponents(application, worker, dispatcher)
+        return _AgentRuntimeComponents(application, worker, dispatcher, model_adapter)
 
     if memory_access_store is None:
         raise RuntimeError("memory Agent runtime requires the shared Access store")
@@ -1202,7 +1242,7 @@ def _agent_runtime_for(
         tool_registry=tool_registry,
     )
     dispatcher = InMemoryAgentDispatchService(store, worker)
-    return _AgentRuntimeComponents(application, worker, dispatcher)
+    return _AgentRuntimeComponents(application, worker, dispatcher, model_adapter)
 
 
 def _resume_runtime_for(
@@ -2390,6 +2430,8 @@ async def _close_runtime_resources(
     database: AsyncDatabase | None,
     telemetry_database: AsyncDatabase | None,
     interview_media_analyzer: OpenRouterInterviewMediaAnalyzer | None = None,
+    *,
+    agent_provider: OpenAIAgentsSDKProvider | None = None,
 ) -> None:
     """@brief 尽力关闭全部资源并在最后保留首个失败 / Close every resource and preserve the first failure.
 
@@ -2408,6 +2450,11 @@ async def _close_runtime_resources(
 
     failures: list[BaseException] = []
 
+    if agent_provider is not None:
+        try:
+            await agent_provider.aclose()
+        except BaseException as error:
+            failures.append(error)
     if provider is not None:
         try:
             await _close_provider(provider)

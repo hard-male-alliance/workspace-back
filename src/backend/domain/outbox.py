@@ -26,6 +26,7 @@ class OutboxEventPurpose(StrEnum):
 AGENT_WORK_EVENT_TYPES = frozenset(
     {
         "agent.run.queued",
+        "agent.proposal_decision.recorded",
         "agent.tool_decision.recorded",
     }
 )

@@ -45,7 +45,7 @@ from backend.domain.resumes import (
     JsonValue,
     RenderHint,
     ResourceRef,
-    ResumeAggregate,
+    Resume,
     ResumeBatchId,
     ResumeBatchKeyReused,
     ResumeDocument,
@@ -310,7 +310,7 @@ class ResumeApplicationService:
                     template_policy=policy,
                     created_at=now,
                 )
-            aggregate, revision = ResumeAggregate.create(
+            aggregate, revision = Resume.create(
                 document,
                 context.actor.user_id,
             )
@@ -932,6 +932,25 @@ class ResumeApplicationService:
                 },
                 now,
             )
+            if decided.source_agent_run_id is not None:
+                await self._emit(
+                    uow,
+                    context,
+                    "agent.proposal_decision.recorded",
+                    ResourceRef(
+                        "resume_proposal",
+                        str(proposal_id),
+                        decided.meta.revision,
+                    ),
+                    {
+                        "actor_id": str(context.actor.user_id),
+                        "run_id": decided.source_agent_run_id,
+                        "decision": command.decision.value,
+                        "resume_id": str(aggregate.document.meta.id),
+                        "resume_revision": aggregate.document.meta.revision,
+                    },
+                    now,
+                )
             await uow.commit()
             return outcome
 
@@ -960,7 +979,7 @@ class ResumeApplicationService:
         resume_id: ResumeId,
         *,
         for_update: bool = False,
-    ) -> ResumeAggregate:
+    ) -> Resume:
         """@brief 读取 Resume 并统一隐藏跨租户结果 / Read a Resume and uniformly hide cross-tenant results."""
         aggregate = await repository.get_resume(
             workspace_id,
@@ -1009,7 +1028,7 @@ class ResumeApplicationService:
     async def _load_operation_policies(
         self,
         uow: ResumeUnitOfWork,
-        aggregate: ResumeAggregate,
+        aggregate: Resume,
         operations: Sequence[ResumeOperation],
     ) -> Mapping[TemplateRef, TemplatePolicy]:
         """@brief 一次加载批次可能提交的全部模板策略 / Load every template policy a batch may commit."""
@@ -1027,7 +1046,7 @@ class ResumeApplicationService:
     async def _save_resume(
         self,
         uow: ResumeUnitOfWork,
-        aggregate: ResumeAggregate,
+        aggregate: Resume,
         revision: ResumeRevision,
         *,
         expected_revision: int,

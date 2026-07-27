@@ -114,10 +114,12 @@ def test_0027_is_single_linear_head_and_taxonomy_matches_runtime() -> None:
     script = scripts.get_revision("20260723_0027")
     migration = _load_migration()
 
-    assert scripts.get_heads() == ["20260723_0028"]
+    assert scripts.get_heads() == ["20260727_0030"]
     assert script is not None
     assert script.down_revision == "20260723_0026"
-    assert set(migration._WORK_EVENT_TYPES) == WORK_EVENT_TYPES
+    assert set(migration._WORK_EVENT_TYPES) | {
+        "agent.proposal_decision.recorded"
+    } == WORK_EVENT_TYPES
     assert set(migration._NOTIFICATION_EVENT_TYPES) == NOTIFICATION_EVENT_TYPES
 
 
