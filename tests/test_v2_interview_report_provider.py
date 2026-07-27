@@ -17,6 +17,7 @@ from backend.application.ports.interview_v2 import (
     ReportGenerationRequest,
 )
 from backend.domain.interview_v2 import (
+    InterviewDomainError,
     InterviewRubric,
     JobTarget,
     RubricDimension,
@@ -195,6 +196,93 @@ def _valid_output() -> dict[str, Any]:
     }
 
 
+def _six_dimension_rubric() -> InterviewRubric:
+    """@brief 构造阶段一冻结的六维 Rubric / Build the frozen Stage-1 six-dimension Rubric."""
+
+    dimensions = (
+        (
+            "rubric_dimension_role_competency",
+            "Role competency",
+            "Demonstrates role knowledge and fit.",
+            0.25,
+        ),
+        (
+            "rubric_dimension_problem_solving",
+            "Problem solving",
+            "Clarifies constraints and compares solutions.",
+            0.20,
+        ),
+        (
+            "rubric_dimension_project_evidence",
+            "Project evidence",
+            "Supports experience with concrete evidence.",
+            0.15,
+        ),
+        (
+            "rubric_dimension_communication",
+            "Communication",
+            "Answers directly with a clear structure.",
+            0.15,
+        ),
+        (
+            "rubric_dimension_collaboration",
+            "Collaboration",
+            "Explains coordination and shared outcomes.",
+            0.15,
+        ),
+        (
+            "rubric_dimension_growth",
+            "Growth",
+            "Reflects, learns, and adapts.",
+            0.10,
+        ),
+    )
+    return InterviewRubric(
+        "rubric_demo_general_six_dimension",
+        "1.0",
+        "Local Demo Six Dimension Interview",
+        tuple(
+            RubricDimension(
+                dimension_id,
+                name,
+                description,
+                weight,
+                ("Uses observable candidate evidence",),
+                ScoreScale(0.0, 100.0),
+            )
+            for dimension_id, name, description, weight in dimensions
+        ),
+        ScoreScale(0.0, 100.0),
+    )
+
+
+def _valid_six_dimension_output() -> dict[str, Any]:
+    """@brief 构造与冻结六维权重一致的真实报告输出 / Build a valid weighted six-dimension report output."""
+
+    scores = (84.0, 78.0, 72.0, 80.0, 76.0, 70.0)
+    output = _valid_output()
+    output["overall_score"] = 77.8
+    output["rubric_scores"] = [
+        {
+            "dimension_id": dimension.dimension_id,
+            "score": score,
+            "confidence": 0.75,
+            "summary": {"plain_text": f"Observable evidence supports a score of {score:.0f}."},
+            "evidence": [
+                {
+                    "segment_id": SEGMENT_ID,
+                    "start_ms": 1_000,
+                    "end_ms": 3_000,
+                    "quote": "Candidate answer grounded in evidence.",
+                }
+            ],
+            "improvement_actions": ["Add another concrete example."],
+        }
+        for dimension, score in zip(_six_dimension_rubric().dimensions, scores, strict=True)
+    ]
+    return output
+
+
 def _adapter(
     provider: RecordingModelProvider,
     **budgets: int,
@@ -287,6 +375,71 @@ async def test_streaming_report_provider_builds_grounded_draft_and_stable_reques
     assert "workspace_report0001" not in prompt
     assert "input_report000001" not in prompt
     assert str(OPERATION_ID) not in prompt
+
+
+@pytest.mark.asyncio
+async def test_streaming_report_provider_builds_complete_six_dimension_report() -> None:
+    """@brief 真实 Provider 输出恰好覆盖冻结六维并引用当前 Transcript / Real provider output covers exactly the frozen six dimensions and current Transcript."""
+
+    rubric = _six_dimension_rubric()
+    request = _request(rubric=rubric)
+    provider = RecordingModelProvider(
+        (json.dumps(_valid_six_dimension_output(), ensure_ascii=False),)
+    )
+
+    draft = await _adapter(provider).generate(request, operation_id=OPERATION_ID)
+    draft.validate_against(rubric, request.transcript, request.session_id)
+
+    assert tuple(score.dimension_id for score in draft.rubric_scores) == tuple(
+        dimension.dimension_id for dimension in rubric.dimensions
+    )
+    assert len(draft.rubric_scores) == 6
+    assert draft.overall_score == pytest.approx(
+        sum(
+            score.score * dimension.weight
+            for score, dimension in zip(
+                draft.rubric_scores,
+                rubric.dimensions,
+                strict=True,
+            )
+        )
+    )
+    assert all(score.evidence for score in draft.rubric_scores)
+    assert {
+        evidence.segment_id
+        for score in draft.rubric_scores
+        for evidence in score.evidence
+    } == {TranscriptSegmentId(SEGMENT_ID)}
+    prompt = provider.prompts[0]
+    assert all(dimension.dimension_id in prompt for dimension in rubric.dimensions)
+    assert "protected or demographic" in prompt
+    assert "score conservatively" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("missing", "duplicate", "extra"))
+async def test_six_dimension_report_rejects_non_exact_dimension_set(mutation: str) -> None:
+    """@brief 缺项、重复项和第七项均不能越过冻结 Rubric / Missing, duplicate, and seventh dimensions cannot cross the frozen Rubric boundary."""
+
+    rubric = _six_dimension_rubric()
+    request = _request(rubric=rubric)
+    output = _valid_six_dimension_output()
+    scores = cast(list[dict[str, Any]], output["rubric_scores"])
+    if mutation == "missing":
+        scores.pop()
+    elif mutation == "duplicate":
+        scores[-1] = dict(scores[0])
+    else:
+        scores.append({**scores[-1], "dimension_id": "rubric_dimension_untrusted_extra"})
+    provider = RecordingModelProvider((json.dumps(output, ensure_ascii=False),))
+
+    draft = await _adapter(provider).generate(request, operation_id=OPERATION_ID)
+
+    with pytest.raises(
+        InterviewDomainError,
+        match="score every frozen rubric dimension exactly once",
+    ):
+        draft.validate_against(rubric, request.transcript, request.session_id)
 
 
 @pytest.mark.asyncio

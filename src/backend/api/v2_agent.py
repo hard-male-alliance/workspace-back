@@ -1179,7 +1179,11 @@ def _agent_run(value: AgentRunView) -> dict[str, JsonValue]:
             "conversation_id": str(value.conversation_id),
             "input_message_id": str(value.input_message_id),
             "capability": value.capability.value,
-            "status": value.status.value,
+            "status": (
+                "succeeded"
+                if value.status.value == "waiting_for_proposal_decision"
+                else value.status.value
+            ),
             "output_message_id": (
                 str(value.output_message_id) if value.output_message_id is not None else None
             ),

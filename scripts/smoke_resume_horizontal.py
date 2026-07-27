@@ -35,7 +35,7 @@ from backend.domain.resumes import (
     DateRange,
     PartialDate,
     RenderHint,
-    ResumeAggregate,
+    Resume,
     ResumeBatchId,
     ResumeDocument,
     ResumeId,
@@ -144,7 +144,7 @@ async def _main() -> int:
         template_policy=ats_policy,
         created_at=_NOW,
     )
-    aggregate, _ = ResumeAggregate.create(variant, _ACTOR_ID)
+    aggregate, _ = Resume.create(variant, _ACTOR_ID)
     optimized_experience = replace(
         variant.sections[0],
         items=(

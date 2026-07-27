@@ -149,6 +149,8 @@ _USAGE_ADAPTER: TypeAdapter[AgentUsage] = TypeAdapter(AgentUsage)
 _PROBLEM_ADAPTER: TypeAdapter[ProblemDetails] = TypeAdapter(ProblemDetails)
 """@brief ProblemDetails JSONB codec / ProblemDetails JSONB codec."""
 
+_PROVIDER_STATE_EXTENSION = "openai_agents_run_state"
+
 _EVENT_RETENTION = timedelta(days=30)
 """@brief Agent outbox 可重放保留期 / Agent-outbox replay retention."""
 
@@ -234,6 +236,15 @@ def _thaw_json(value: JsonValue) -> object:
     if isinstance(value, tuple):
         return [_thaw_json(item) for item in value]
     return value
+
+
+def _run_extensions(run: AgentRun) -> JsonObject:
+    if run.provider_state is None:
+        return {}
+    return cast(
+        JsonObject,
+        {_PROVIDER_STATE_EXTENSION: _thaw_json(run.provider_state)},
+    )
 
 
 def _load[ValueT](adapter: TypeAdapter[ValueT], payload: object, label: str) -> ValueT:
@@ -2046,7 +2057,7 @@ def _run_record(run: AgentRun) -> AgentRunRecord:
         created_at=run.meta.created_at,
         updated_at=run.meta.updated_at,
         revision=run.meta.revision,
-        extensions={},
+        extensions=_run_extensions(run),
     )
 
 
@@ -2097,6 +2108,10 @@ def _run_from_record(record: AgentRunRecord) -> AgentRun:
         grant=grant,
         active_tool_call_id=(
             None if record.active_tool_call_id is None else ToolCallId(record.active_tool_call_id)
+        ),
+        provider_state=cast(
+            Mapping[str, JsonValue] | None,
+            record.extensions.get(_PROVIDER_STATE_EXTENSION),
         ),
     )
 
@@ -2292,6 +2307,7 @@ class PostgresAgentRepository(_PostgresAgentRepositoryCore):
                             AgentRunStatus.QUEUED.value,
                             AgentRunStatus.RUNNING.value,
                             AgentRunStatus.WAITING_FOR_APPROVAL.value,
+                            AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION.value,
                         )
                     ),
                 )
@@ -2472,34 +2488,35 @@ class PostgresAgentRepository(_PostgresAgentRepositoryCore):
         ]
         if self._auth.is_worker:
             predicates.append(AgentRunRecord.resource_owner_id == str(self._auth.require_actor()))
+        values: dict[str, object] = {
+            "status": run.view.status.value,
+            "output_message_id": (
+                None if run.view.output_message_id is None else str(run.view.output_message_id)
+            ),
+            "proposal_refs": _dump_array(_RESOURCE_REFS_ADAPTER, run.view.proposal_refs),
+            "pending_approval_id": (
+                None
+                if run.view.pending_approval_id is None
+                else str(run.view.pending_approval_id)
+            ),
+            "usage": (
+                None if run.view.usage is None else _dump_object(_USAGE_ADAPTER, run.view.usage)
+            ),
+            "problem": (
+                None if run.view.problem is None else _dump_problem(run.view.problem)
+            ),
+            "active_tool_call_id": (
+                None if run.active_tool_call_id is None else str(run.active_tool_call_id)
+            ),
+            "revision": run.meta.revision,
+            "updated_at": run.meta.updated_at,
+        }
+        if run.provider_state is not None or run.view.proposal_refs:
+            values["extensions"] = _run_extensions(run)
         result = await self._session.execute(
             update(AgentRunRecord)
             .where(*predicates)
-            .values(
-                status=run.view.status.value,
-                output_message_id=(
-                    None if run.view.output_message_id is None else str(run.view.output_message_id)
-                ),
-                proposal_refs=_dump_array(_RESOURCE_REFS_ADAPTER, run.view.proposal_refs),
-                pending_approval_id=(
-                    None
-                    if run.view.pending_approval_id is None
-                    else str(run.view.pending_approval_id)
-                ),
-                usage=(
-                    None if run.view.usage is None else _dump_object(_USAGE_ADAPTER, run.view.usage)
-                ),
-                problem=(
-                    None
-                    if run.view.problem is None
-                    else _dump_problem(run.view.problem)
-                ),
-                active_tool_call_id=(
-                    None if run.active_tool_call_id is None else str(run.active_tool_call_id)
-                ),
-                revision=run.meta.revision,
-                updated_at=run.meta.updated_at,
-            )
+            .values(**values)
         )
         if _affected_rows(result) != 1:
             raise AgentCasMismatch

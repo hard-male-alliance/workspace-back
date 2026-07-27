@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,60 @@ def test_safe_template_renders_full_resume_content_and_escapes_tex() -> None:
     assert "Python, PostgreSQL" in latex
     assert "Backend \\& Platform" in latex
     assert "\\begin{itemize}" in latex
+
+
+def test_configured_main_font_uses_fixed_operator_font_file(tmp_path: Path) -> None:
+    """A configured CJK font does not depend on a pre-warmed Fontconfig cache."""
+
+    (tmp_path / "NotoSansCJK-Regular.ttc").write_bytes(b"font")
+
+    preamble = rendering._configured_main_font_preamble((str(tmp_path),))
+
+    assert f"Path={tmp_path.as_posix()}/" in preamble
+    assert "UprightFont=NotoSansCJK-Regular.ttc" in preamble
+    assert "BoldFeatures={FakeBold=2}" in preamble
+
+
+def test_professional_template_ids_select_distinct_safe_tex_layouts() -> None:
+    document = {
+        **_resume_document(),
+        "profile": {"full_name": "张明", "headline": "后端工程师"},
+        "sections": [
+            {
+                "title": "项目经历",
+                "visible": True,
+                "content": {"text": "稳定交付 & 安全转义。"},
+                "items": [],
+            }
+        ],
+    }
+
+    ats = rendering._safe_template(
+        {
+            **document,
+            "template": {
+                "template_id": "tpl_ats_professional_v1",
+                "version": "1.0",
+            },
+        }
+    )
+    modern = rendering._safe_template(
+        {
+            **document,
+            "template": {
+                "template_id": "tpl_modern_professional_v1",
+                "version": "1.0",
+            },
+        }
+    )
+
+    assert "\\usepackage[margin=15mm]{geometry}" in ats
+    assert "\\usepackage{xcolor}" not in ats
+    assert "\\usepackage[margin=17mm]{geometry}" in modern
+    assert "\\definecolor{AIWSAccent}" in modern
+    assert "稳定交付 \\& 安全转义" in ats
+    assert "稳定交付 \\& 安全转义" in modern
+    assert ats != modern
 
 
 def test_renderer_factory_fails_at_startup_when_sandbox_capability_is_missing(
@@ -513,13 +568,88 @@ def test_minimal_xelatex_document_compiles_through_real_strong_boundary(
         pytest.skip("Landlock ABI >= 3 and libseccomp are unavailable")
     plan = ProcessConfinementPlan(ProcessConfinementMode.STRONG, None)
     assert probed_plan.mode is ProcessConfinementMode.STRONG
-    settings = _renderer_settings(tmp_path, max_output_bytes=4 * 1024 * 1024)
+    font_directory = Path.home() / ".local/share/fonts/workspace-demo"
+    if not font_directory.is_dir():
+        pytest.skip("The local CJK font directory is unavailable")
+    settings = replace(
+        _renderer_settings(tmp_path, max_output_bytes=4 * 1024 * 1024),
+        allowed_font_directories=(str(font_directory),),
+    )
     (tmp_path / "resume.tex").write_text(
         "\\documentclass{article}\n"
         "\\pagestyle{empty}\n"
         "\\begin{document}\n"
         "Confinement boundary smoke test.\n"
         "\\end{document}\n",
+        encoding="utf-8",
+    )
+    argv = rendering._renderer_process_argv(xelatex, settings, tmp_path, plan)
+
+    completed = subprocess.run(
+        argv,
+        cwd=tmp_path,
+        env=rendering._renderer_process_environment(tmp_path),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+        timeout=15,
+        start_new_session=True,
+    )
+
+    diagnostic = (completed.stdout + completed.stderr).decode("utf-8", "replace")
+    assert completed.returncode == 0, diagnostic[-4_000:]
+    assert (tmp_path / "resume.pdf").read_bytes().startswith(b"%PDF-")
+
+
+@pytest.mark.parametrize(
+    "template_id",
+    ("tpl_ats_professional_v1", "tpl_modern_professional_v1"),
+)
+def test_professional_layouts_compile_through_real_strong_boundary(
+    tmp_path: Path,
+    template_id: str,
+) -> None:
+    """Compile both immutable professional layouts through the hardened XeLaTeX launcher."""
+
+    xelatex = shutil.which("xelatex")
+    if xelatex is None:
+        pytest.skip("XeLaTeX is unavailable")
+    clear_confinement_probe_cache()
+    try:
+        plan = confinement_plan_for("production")
+    except ProcessConfinementUnavailable:
+        pytest.skip("Landlock ABI >= 3 and libseccomp are unavailable")
+    document = {
+        **_resume_document(),
+        "template": {"template_id": template_id, "version": "1.0"},
+        "profile": {
+            "full_name": "张明",
+            "headline": "Backend Engineer",
+            "contacts": [{"value": "zhang@example.com"}],
+        },
+        "sections": [
+            {
+                "title": "项目经历",
+                "visible": True,
+                "content": {"text": "Delivered safe APIs with measurable results."},
+                "items": [],
+            }
+        ],
+    }
+    font_directory = Path.home() / ".local/share/fonts/workspace-demo"
+    if not font_directory.is_dir():
+        pytest.skip("The local CJK font directory is unavailable")
+    settings = replace(
+        _renderer_settings(tmp_path, max_output_bytes=4 * 1024 * 1024),
+        allowed_font_directories=(str(font_directory),),
+    )
+    (tmp_path / "resume.tex").write_text(
+        rendering._safe_template(
+            document,
+            main_font_preamble=rendering._configured_main_font_preamble(
+                settings.allowed_font_directories
+            ),
+        ),
         encoding="utf-8",
     )
     argv = rendering._renderer_process_argv(xelatex, settings, tmp_path, plan)

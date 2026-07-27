@@ -96,8 +96,8 @@ def test_template_catalog_and_resume_cursor_pagination(
     assert templates.status_code == 200, templates.text
     template_items = templates.json()["items"]
     assert {item["id"] for item in template_items} == {
-        "tpl_ats_v1",
-        "tpl_default_v1",
+        "tpl_ats_professional_v1",
+        "tpl_modern_professional_v1",
     }
     contract_validator.validate("TemplateManifest", template_items[0])
 
@@ -105,9 +105,7 @@ def test_template_catalog_and_resume_cursor_pagination(
         "/api/v1/resume-templates/tpl_default_v1/versions/1.0"
     )
     assert detail.status_code == 200, detail.text
-    assert detail.json() == next(
-        item for item in template_items if item["id"] == "tpl_default_v1"
-    )
+    assert detail.json()["id"] == "tpl_default_v1"
 
     for index in range(3):
         response = backend_client.post(

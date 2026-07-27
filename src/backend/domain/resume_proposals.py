@@ -97,6 +97,7 @@ class ResumeProposal:
     expires_at: datetime | None = None
     decided_by: UserId | None = None
     accepted_operation_ids: tuple[ResumeOperationId, ...] = ()
+    source_agent_run_id: str | None = None
 
     def __post_init__(self) -> None:
         """@brief 校验 proposal 不变量 / Validate proposal invariants.
@@ -136,6 +137,11 @@ class ResumeProposal:
             raise ResumeDomainError(
                 "resume.invalid_proposal",
                 "accepted operation IDs are not a proposal subset",
+            )
+        if self.source_agent_run_id is not None and not self.source_agent_run_id.strip():
+            raise ResumeDomainError(
+                "resume.invalid_proposal",
+                "proposal source Agent Run ID cannot be empty",
             )
 
     def expire(self, at: datetime) -> ResumeProposal:

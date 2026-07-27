@@ -32,6 +32,7 @@ from backend.application.ports.agent_v2 import (
     AgentRunPolicyRequest,
     AgentToolDecisionClaim,
     AgentToolExecutor,
+    AgentToolInvocationCommand,
     MessageSequenceReservation,
     ToolExecutionReceipt,
 )
@@ -408,6 +409,10 @@ class FakeResumeProposals:
         del command
         raise AssertionError("unexpected Resume Proposal creation")
 
+    async def record_invocations(self, command: AgentToolInvocationCommand) -> None:
+        del command
+        raise AssertionError("unexpected Agent tool invocation persistence")
+
 
 class FakeUow:
     def __init__(self, state: State) -> None:
@@ -460,11 +465,12 @@ class FakeProvider:
         self.state = state
         self.outcome = outcome
         self.calls = 0
+        self.requests: list[AgentProviderRequest] = []
 
-    async def execute(self, request: object) -> object:
-        del request
+    async def execute(self, request: AgentProviderRequest) -> object:
         assert self.state.active_transactions == 0
         self.calls += 1
+        self.requests.append(request)
         return self.outcome
 
 
@@ -1210,6 +1216,62 @@ async def test_provider_network_io_occurs_outside_transactions_and_completion_ap
 
 
 @pytest.mark.asyncio
+async def test_worker_supplies_prior_same_conversation_messages_to_provider() -> None:
+    """当前输入前的历史消息会随 Run 进入 provider，当前消息本身不会重复。"""
+    state = State()
+    ids = DeterministicIds()
+    service = _service(state, ids)
+    conversation = await service.create_conversation(
+        PRINCIPAL,
+        WORKSPACE,
+        CreateConversationCommand(ConversationCapability.GENERAL, "history"),
+        CONTEXT,
+    )
+    first = await service.create_message(
+        PRINCIPAL,
+        WORKSPACE,
+        conversation.meta.id,
+        CreateMessageCommand(None, (TextContentPart("我有三年前端开发经验"),)),
+        expected_conversation_revision=1,
+        context=CONTEXT,
+    )
+    second = await service.create_message(
+        PRINCIPAL,
+        WORKSPACE,
+        conversation.meta.id,
+        CreateMessageCommand(first.meta.id, (TextContentPart("请根据以上资料继续"),)),
+        expected_conversation_revision=2,
+        context=CONTEXT,
+    )
+    run = await service.create_agent_run(
+        PRINCIPAL,
+        WORKSPACE,
+        _spec(conversation.meta.id, second.meta.id),
+        CONTEXT,
+    )
+    provider = FakeProvider(
+        state,
+        AgentProviderCompleted(
+            (TextContentPart("好的"),),
+            (),
+            AgentUsage(3, 2, "5"),
+        ),
+    )
+    worker = AgentWorkerService(
+        FakeWorkerUowFactory(state),
+        provider,  # type: ignore[arg-type]
+        FakeToolExecutor(state),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+
+    await worker.execute_run(_queued_dispatch(state, run.meta.id))
+
+    assert provider.requests[0].input_message == second
+    assert provider.requests[0].conversation_history == (first,)
+
+
+@pytest.mark.asyncio
 async def test_provider_failure_is_persisted_and_never_leaks_exception_text() -> None:
     """Provider 未知异常应原子终结 Run/Job，且公开问题不含异常文本。"""
     state = State()
@@ -1259,6 +1321,87 @@ async def test_provider_failure_is_persisted_and_never_leaks_exception_text() ->
     assert failed.problem.code == "agent.provider_failed"
     assert "secret" not in str(failed.problem)
     assert state.jobs[state.runs[run.meta.id].job_id].status.value == "failed"
+
+
+@pytest.mark.asyncio
+async def test_failed_run_input_is_excluded_from_later_provider_history() -> None:
+    """失败编辑输入不能在后续普通对话中被当成仍待执行的指令。"""
+
+    state = State()
+    ids = DeterministicIds()
+    service = _service(state, ids)
+    conversation = await service.create_conversation(
+        PRINCIPAL,
+        WORKSPACE,
+        CreateConversationCommand(ConversationCapability.GENERAL, "failed history"),
+        CONTEXT,
+    )
+    failed_input = await service.create_message(
+        PRINCIPAL,
+        WORKSPACE,
+        conversation.meta.id,
+        CreateMessageCommand(None, (TextContentPart("把姓名改成王小明"),)),
+        expected_conversation_revision=1,
+        context=CONTEXT,
+    )
+    failed_run = await service.create_agent_run(
+        PRINCIPAL,
+        WORKSPACE,
+        _spec(conversation.meta.id, failed_input.meta.id),
+        CONTEXT,
+    )
+
+    class FailingProvider:
+        async def execute(self, request: object) -> object:
+            del request
+            raise RuntimeError("provider failure")
+
+    failing_worker = AgentWorkerService(
+        FakeWorkerUowFactory(state),
+        FailingProvider(),  # type: ignore[arg-type]
+        FakeToolExecutor(state),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+    failed = await failing_worker.execute_run(
+        _queued_dispatch(state, failed_run.meta.id)
+    )
+    assert failed.status is AgentRunStatus.FAILED
+
+    current_input = await service.create_message(
+        PRINCIPAL,
+        WORKSPACE,
+        conversation.meta.id,
+        CreateMessageCommand(failed_input.meta.id, (TextContentPart("你是谁？"),)),
+        expected_conversation_revision=2,
+        context=CONTEXT,
+    )
+    current_run = await service.create_agent_run(
+        PRINCIPAL,
+        WORKSPACE,
+        _spec(conversation.meta.id, current_input.meta.id),
+        CONTEXT,
+    )
+    provider = FakeProvider(
+        state,
+        AgentProviderCompleted(
+            (TextContentPart("我是简历助手"),),
+            (),
+            AgentUsage(3, 2, "5"),
+        ),
+    )
+    worker = AgentWorkerService(
+        FakeWorkerUowFactory(state),
+        provider,  # type: ignore[arg-type]
+        FakeToolExecutor(state),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+
+    await worker.execute_run(_queued_dispatch(state, current_run.meta.id))
+
+    assert provider.requests[0].input_message == current_input
+    assert provider.requests[0].conversation_history == ()
 
 
 @pytest.mark.asyncio

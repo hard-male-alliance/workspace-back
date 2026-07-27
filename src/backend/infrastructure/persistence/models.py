@@ -1375,7 +1375,8 @@ class AgentRunRecord(Base, TenantScopedMixin):
             name="agent_runs_v2_capability",
         ),
         CheckConstraint(
-            "status IN ('queued', 'running', 'waiting_for_approval', 'succeeded', 'failed', 'cancelled')",
+            "status IN ('queued', 'running', 'waiting_for_approval', "
+            "'waiting_for_proposal_decision', 'succeeded', 'failed', 'cancelled')",
             name="agent_runs_v2_status",
         ),
         CheckConstraint(
@@ -1397,12 +1398,15 @@ class AgentRunRecord(Base, TenantScopedMixin):
             name="agent_runs_v2_problem",
         ),
         CheckConstraint(
-            "(status = 'succeeded' AND output_message_id IS NOT NULL) OR "
-            "(status <> 'succeeded' AND output_message_id IS NULL)",
+            "(status IN ('succeeded', 'waiting_for_proposal_decision') "
+            "AND output_message_id IS NOT NULL) OR "
+            "(status NOT IN ('succeeded', 'waiting_for_proposal_decision') "
+            "AND output_message_id IS NULL)",
             name="agent_runs_v2_output",
         ),
         CheckConstraint(
-            "status IN ('succeeded', 'failed', 'cancelled') OR "
+            "status IN ('succeeded', 'failed', 'cancelled', "
+            "'waiting_for_proposal_decision') OR "
             "(jsonb_array_length(proposal_refs) = 0 AND usage IS NULL)",
             name="agent_runs_v2_terminal_results",
         ),
@@ -1471,6 +1475,59 @@ class AgentRunRecord(Base, TenantScopedMixin):
     usage: Mapped[JsonObject | None] = mapped_column(JSONB(none_as_null=True))
     problem: Mapped[JsonObject | None] = mapped_column(JSONB(none_as_null=True))
     active_tool_call_id: Mapped[str | None] = mapped_column(String(160))
+
+
+class AgentToolInvocationRecord(Base, TenantScopedMixin):
+    """@brief Agent Run 中持久化的细粒度工具指令 / Durable narrow tool instruction."""
+
+    __tablename__ = "tool_invocations"
+    __table_args__ = (
+        CheckConstraint(
+            "tool_name ~ '^[a-z][a-z0-9_]{2,100}$' "
+            "AND status IN ('completed', 'decision_required', 'failed')",
+            name="agent_tool_invocations_v1_state",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(arguments) = 'object' AND jsonb_typeof(result) = 'object'",
+            name="agent_tool_invocations_v1_payload",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "run_id",
+            "ordinal",
+            name="agent_tool_invocations_v1_run_ordinal",
+        ),
+        ForeignKeyConstraint(
+            ["run_id", "workspace_id"],
+            ["agent.runs.id", "agent.runs.workspace_id"],
+            name="fk_agent_tool_invocations_run_workspace",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["proposal_id", "workspace_id"],
+            ["resume.proposals.id", "resume.proposals.workspace_id"],
+            name="fk_agent_tool_invocations_proposal_workspace",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        Index(
+            "ix_agent_tool_invocations_workspace_run_ordinal",
+            "workspace_id",
+            "run_id",
+            "ordinal",
+        ),
+        {"schema": "agent"},
+    )
+
+    id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(101), nullable=False)
+    arguments: Mapped[JsonObject] = mapped_column(JSONB, nullable=False)
+    result: Mapped[JsonObject] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    proposal_id: Mapped[str | None] = mapped_column(String(160))
 
 
 class ToolApprovalRecord(Base, TenantScopedMixin):
@@ -1730,6 +1787,11 @@ class ResumeProposalRecord(Base, TenantScopedMixin):
             ["agent.runs.id", "agent.runs.workspace_id"],
             name="fk_resume_proposals_agent_run_workspace",
             ondelete="SET NULL (agent_run_id)",
+        ),
+        UniqueConstraint(
+            "id",
+            "workspace_id",
+            name="resume_proposals_v2_id_workspace",
         ),
         Index("ix_resume_proposals_resume_status", "resume_id", "status"),
         {"schema": "resume"},

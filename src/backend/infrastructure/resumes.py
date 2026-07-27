@@ -81,7 +81,7 @@ from backend.domain.resumes import (
     OperationLedgerEntry,
     PageSize,
     ResourceRef,
-    ResumeAggregate,
+    Resume,
     ResumeBatchId,
     ResumeDocument,
     ResumeId,
@@ -109,6 +109,7 @@ from backend.infrastructure.access import (
 )
 from backend.infrastructure.persistence.database import AsyncDatabase
 from backend.infrastructure.persistence.models import (
+    AgentToolInvocationRecord,
     ArtifactContentRecord,
     ArtifactPdfSourceMapRecord,
     ArtifactRecord,
@@ -602,7 +603,7 @@ class InMemoryResumeStore:
     """@brief Resume V2 的共享进程内状态 / Shared in-process Resume V2 state."""
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    resumes: dict[tuple[WorkspaceId, ResumeId], ResumeAggregate] = field(default_factory=dict)
+    resumes: dict[tuple[WorkspaceId, ResumeId], Resume] = field(default_factory=dict)
     revisions: dict[tuple[WorkspaceId, ResumeId, int], ResumeRevision] = field(default_factory=dict)
     receipts: dict[tuple[WorkspaceId, ResumeId, ResumeBatchId], OperationBatchReceipt] = field(
         default_factory=dict
@@ -644,7 +645,7 @@ class InMemoryResumeRepository:
 
     def __init__(
         self,
-        resumes: dict[tuple[WorkspaceId, ResumeId], ResumeAggregate],
+        resumes: dict[tuple[WorkspaceId, ResumeId], Resume],
         revisions: dict[tuple[WorkspaceId, ResumeId, int], ResumeRevision],
         receipts: dict[tuple[WorkspaceId, ResumeId, ResumeBatchId], OperationBatchReceipt],
         proposals: dict[tuple[WorkspaceId, ResumeProposalId], ResumeProposal],
@@ -679,12 +680,12 @@ class InMemoryResumeRepository:
         resume_id: ResumeId,
         *,
         for_update: bool = False,
-    ) -> ResumeAggregate | None:
+    ) -> Resume | None:
         """@brief 读取 Workspace Resume / Read a Workspace Resume."""
         del for_update
         return self.resumes.get((workspace_id, resume_id))
 
-    async def add_resume(self, aggregate: ResumeAggregate, revision: ResumeRevision) -> None:
+    async def add_resume(self, aggregate: Resume, revision: ResumeRevision) -> None:
         """@brief 添加聚合与首版快照 / Add an aggregate and first snapshot."""
         key = (aggregate.document.workspace_id, aggregate.document.meta.id)
         if key in self.resumes or revision.revision != 1:
@@ -694,7 +695,7 @@ class InMemoryResumeRepository:
 
     async def save_resume(
         self,
-        aggregate: ResumeAggregate,
+        aggregate: Resume,
         revision: ResumeRevision,
         *,
         expected_revision: int,
@@ -925,7 +926,7 @@ class InMemoryResumeUnitOfWork:
         self._outbox: _MemoryResumeOutbox | None = None
         self._resume_snapshot: (
             tuple[
-                dict[tuple[WorkspaceId, ResumeId], ResumeAggregate],
+                dict[tuple[WorkspaceId, ResumeId], Resume],
                 dict[tuple[WorkspaceId, ResumeId, int], ResumeRevision],
                 dict[tuple[WorkspaceId, ResumeId, ResumeBatchId], OperationBatchReceipt],
                 dict[tuple[WorkspaceId, ResumeProposalId], ResumeProposal],
@@ -1113,8 +1114,8 @@ class PostgresResumeRepository:
         """@brief 绑定 Session 与已跟踪的授权上下文 / Bind the Session and tracked authorization context."""
         self._session = session
         self._authorizer = authorizer
-        self._pending_aggregate: ResumeAggregate | None = None
-        self._current_aggregate: ResumeAggregate | None = None
+        self._pending_aggregate: Resume | None = None
+        self._current_aggregate: Resume | None = None
 
     async def list_resumes(
         self, workspace_id: WorkspaceId, page: PageRequest
@@ -1144,7 +1145,7 @@ class PostgresResumeRepository:
         resume_id: ResumeId,
         *,
         for_update: bool = False,
-    ) -> ResumeAggregate | None:
+    ) -> Resume | None:
         """@brief 读取并完整 rehydrate Resume 聚合 / Read and fully rehydrate a Resume aggregate."""
         self._authorizer.require_workspace(workspace_id)
         statement = select(ResumeDocumentRecord).where(
@@ -1161,7 +1162,7 @@ class PostgresResumeRepository:
         self._current_aggregate = aggregate
         return aggregate
 
-    async def add_resume(self, aggregate: ResumeAggregate, revision: ResumeRevision) -> None:
+    async def add_resume(self, aggregate: Resume, revision: ResumeRevision) -> None:
         """@brief 添加 Resume 根与首个不可变 revision / Add a Resume root and first immutable revision."""
         document = aggregate.document
         self._authorizer.require_workspace(document.workspace_id)
@@ -1189,7 +1190,7 @@ class PostgresResumeRepository:
 
     async def save_resume(
         self,
-        aggregate: ResumeAggregate,
+        aggregate: Resume,
         revision: ResumeRevision,
         *,
         expected_revision: int,
@@ -1503,9 +1504,28 @@ class PostgresResumeRepository:
                 operation.applied_revision_no = ledger.applied_revision
             else:
                 operation.decision = "rejected"
+        await self._session.execute(
+            update(AgentToolInvocationRecord)
+            .where(
+                AgentToolInvocationRecord.workspace_id
+                == str(proposal.workspace_id),
+                AgentToolInvocationRecord.proposal_id == str(proposal.meta.id),
+                AgentToolInvocationRecord.status == "decision_required",
+            )
+            .values(
+                status="completed",
+                result={
+                    "kind": "proposal_decided",
+                    "decision": proposal.status.value,
+                },
+                updated_at=proposal.meta.updated_at,
+                revision=AgentToolInvocationRecord.revision + 1,
+            )
+            .execution_options(synchronize_session=False)
+        )
         self._pending_aggregate = None
 
-    async def _rehydrate(self, record: ResumeDocumentRecord) -> ResumeAggregate:
+    async def _rehydrate(self, record: ResumeDocumentRecord) -> Resume:
         """@brief 从 snapshot、ledger 与 change targets 重建聚合 / Rebuild an aggregate from snapshot, ledger, and change targets."""
         revision_record = await self._session.scalar(
             select(ResumeRevisionRecord).where(
@@ -1601,7 +1621,7 @@ class PostgresResumeRepository:
             for item in revision_rows
             if item.change_targets
         )
-        return ResumeAggregate(
+        return Resume(
             document,
             tuple(sorted(ledger_by_id.values(), key=lambda item: str(item.operation_id))),
             changes,
@@ -1639,6 +1659,7 @@ class PostgresResumeRepository:
             record.expires_at,
             UserId(record.decided_by_actor_id) if record.decided_by_actor_id else None,
             tuple(ResumeOperationId(item) for item in accepted_raw),
+            record.agent_run_id,
         )
 
 
@@ -2634,7 +2655,7 @@ def _summary_from_document_record(record: ResumeDocumentRecord) -> ResumeSummary
 
 def _revision_record(
     revision: ResumeRevision,
-    aggregate: ResumeAggregate,
+    aggregate: Resume,
     actor_id: UserId,
 ) -> ResumeRevisionRecord:
     """@brief 构造 append-only revision ORM 行 / Construct an append-only revision ORM row.

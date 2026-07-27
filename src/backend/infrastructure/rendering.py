@@ -212,7 +212,12 @@ class SandboxedXeLaTeXRenderer:
                     detail="Real XeLaTeX rendering requires a POSIX process sandbox.",
                 )
             )
-        latex = _safe_template(document)
+        latex = _safe_template(
+            document,
+            main_font_preamble=_configured_main_font_preamble(
+                self._settings.allowed_font_directories
+            ),
+        )
         if len(latex.encode("utf-8")) > self._settings.max_input_bytes:
             raise DomainError(
                 Problem("resume.input_too_large", 413, "Resume render input is too large")
@@ -414,13 +419,20 @@ def _minimal_pdf(title: object) -> bytes:
     return bytes(output)
 
 
-def _safe_template(document: dict[str, Any]) -> str:
+def _safe_template(
+    document: dict[str, Any],
+    *,
+    main_font_preamble: str = "\\setmainfont{Noto Sans CJK SC}\n",
+) -> str:
     """@brief 从 SIR 生成固定受限 TeX 模板 / Generate a fixed restricted TeX template from SIR.
 
     @param document 已验证 SIR / Validated SIR.
     @return 无用户 TeX 命令的固定模板 / Fixed template containing no user TeX commands.
     """
     profile = _mapping(document.get("profile"))
+    template_id = _text(_mapping(document.get("template")).get("template_id"))
+    ats_professional = template_id == "tpl_ats_professional_v1"
+    modern_professional = template_id == "tpl_modern_professional_v1"
     document_title = _latex_escape(_text(document.get("title")))
     full_name = _latex_escape(_text(profile.get("full_name")))
     headline = _latex_paragraph(_text(profile.get("headline")))
@@ -430,21 +442,38 @@ def _safe_template(document: dict[str, Any]) -> str:
         for value in _sequence(profile.get("contacts"))
         if (rendered := _latex_contact(value))
     )
-    body: list[str] = [
-        "\\begin{center}\n",
-        f"{{\\LARGE\\bfseries {full_name}}}\\\\[4pt]\n",
-    ]
+    if ats_professional:
+        body: list[str] = [
+            f"{{\\LARGE\\bfseries {full_name}}}\\\\[2pt]\n",
+        ]
+    elif modern_professional:
+        body = [
+            f"{{\\fontsize{{24}}{{28}}\\selectfont\\bfseries\\color{{AIWSAccent}} {full_name}}}\\\\[3pt]\n",
+        ]
+    else:
+        body = [
+            "\\begin{center}\n",
+            f"{{\\LARGE\\bfseries {full_name}}}\\\\[4pt]\n",
+        ]
     if headline:
         body.append(f"{{\\large {headline}}}\\\\[4pt]\n")
     if document_title:
         body.append(f"{{\\small {document_title}}}\\\\[4pt]\n")
     if contacts:
         body.append(f"{{\\small {' \\quad | \\quad '.join(contacts)}}}\n")
-    body.append("\\end{center}\n")
+    if ats_professional:
+        body.append("\\par\\noindent\\rule{\\textwidth}{0.5pt}\\vspace{3pt}\n")
+    elif modern_professional:
+        body.append(
+            "\\par\\noindent\\color{AIWSRule}\\rule{\\textwidth}{1pt}"
+            "\\color{black}\\vspace{5pt}\n"
+        )
+    else:
+        body.append("\\end{center}\n")
     if profile_summary:
         body.extend(
             (
-                "\\section*{Professional Summary}\n",
+                _section_heading("Professional Summary", modern_professional),
                 f"{profile_summary}\n",
             )
         )
@@ -461,21 +490,76 @@ def _safe_template(document: dict[str, Any]) -> str:
         )
         if not section_title or (not content and not items):
             continue
-        body.append(f"\\section*{{{section_title}}}\n")
+        body.append(_section_heading(section_title, modern_professional))
         if content:
             body.append(f"{content}\n")
         body.extend(items)
-    return (
-        "\\documentclass[10pt]{article}\n"
-        "\\usepackage{fontspec}\n"
-        "\\usepackage[margin=16mm]{geometry}\n"
-        "\\setmainfont{Noto Sans CJK SC}\n"
-        "\\setlength{\\parindent}{0pt}\n"
-        "\\setlength{\\parskip}{4pt}\n"
-        "\\setcounter{secnumdepth}{0}\n"
-        "\\pagestyle{plain}\n"
-        "\\begin{document}\n" + "".join(body) + "\\end{document}\n"
+    geometry = (
+        "margin=15mm"
+        if ats_professional
+        else "margin=17mm"
+        if modern_professional
+        else "margin=16mm"
     )
+    color_preamble = (
+        "\\usepackage{xcolor}\n"
+        "\\definecolor{AIWSAccent}{HTML}{244A65}\n"
+        "\\definecolor{AIWSRule}{HTML}{7B9AAF}\n"
+        if modern_professional
+        else ""
+    )
+    return "".join(
+        (
+            "\\documentclass[10pt]{article}\n",
+            "\\usepackage{fontspec}\n",
+            f"\\usepackage[{geometry}]{{geometry}}\n",
+            color_preamble,
+            main_font_preamble,
+            "\\setlength{\\parindent}{0pt}\n",
+            "\\setlength{\\parskip}{4pt}\n",
+            "\\setcounter{secnumdepth}{0}\n",
+            "\\pagestyle{plain}\n",
+            "\\begin{document}\n",
+            "".join(body),
+            "\\end{document}\n",
+        )
+    )
+
+
+def _configured_main_font_preamble(font_directories: tuple[str, ...]) -> str:
+    """Select the operator-provided fixed CJK font files without a warm Fontconfig cache."""
+
+    unsafe_path_characters = frozenset("\\{}[]%#")
+    for configured_directory in font_directories:
+        directory = Path(configured_directory).resolve()
+        regular = directory / "NotoSansCJK-Regular.ttc"
+        if (
+            not regular.is_file()
+            or any(character in unsafe_path_characters for character in directory.as_posix())
+        ):
+            continue
+        return (
+            "\\setmainfont["
+            f"Path={directory.as_posix()}/,"
+            "UprightFont=NotoSansCJK-Regular.ttc,"
+            "BoldFont=NotoSansCJK-Regular.ttc,"
+            "BoldFeatures={FakeBold=2}"
+            "]{NotoSansCJK-Regular.ttc}\n"
+        )
+    return "\\setmainfont{Noto Sans CJK SC}\n"
+
+
+def _section_heading(title: str, modern: bool) -> str:
+    """Render one fixed section heading without accepting user TeX."""
+
+    if modern:
+        return (
+            "\\vspace{5pt}\\noindent"
+            f"{{\\large\\bfseries\\color{{AIWSAccent}} {title}}}"
+            "\\par\\vspace{1pt}\\noindent"
+            "\\color{AIWSRule}\\rule{\\textwidth}{0.4pt}\\color{black}\\vspace{2pt}\n"
+        )
+    return f"\\section*{{{title}}}\n"
 
 
 def _mapping(value: object) -> dict[str, Any]:

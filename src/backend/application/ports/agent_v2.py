@@ -26,6 +26,7 @@ from backend.domain.agent_v2 import (
     AgentRun,
     AgentRunId,
     AgentRunSpec,
+    AgentToolInvocationTrace,
     Conversation,
     ConversationId,
     Message,
@@ -298,6 +299,18 @@ class AgentResumeProposalCommand:
     created_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class AgentToolInvocationCommand:
+    """Persist content-free diagnostics for a completed provider attempt."""
+
+    workspace_id: WorkspaceId
+    actor_id: UserId
+    run_id: AgentRunId
+    invocations: tuple[AgentToolInvocationTrace, ...]
+    proposal_ref: ResourceRef | None
+    created_at: datetime
+
+
 class AgentResumeProposalBoundary(Protocol):
     """@brief 绑定当前 Agent 事务的 Resume Proposal 应用边界 / Resume Proposal application boundary bound to the current Agent transaction."""
 
@@ -310,6 +323,12 @@ class AgentResumeProposalBoundary(Protocol):
 
     async def create(self, command: AgentResumeProposalCommand) -> ResourceRef:
         """@brief 幂等创建可审核 Proposal，不写 Resume / Idempotently create a reviewable Proposal without writing Resume."""
+
+    async def record_invocations(
+        self,
+        command: AgentToolInvocationCommand,
+    ) -> None:
+        """Persist bounded tool diagnostics in the current Agent transaction."""
 
 
 class AgentToolRegistry(Protocol):
@@ -604,6 +623,31 @@ class AgentRunExecutionClaim(Protocol):
         """@brief 返回与 Run 对齐的统一 Job 引用 / Return the unified Job reference aligned with the Run."""
 
 
+class AgentProposalDecisionClaim(Protocol):
+    """Minimal durable claim for resuming a Proposal-waiting Agent Run."""
+
+    @property
+    def id(self) -> AgentOutboxId: ...
+
+    @property
+    def workspace_id(self) -> WorkspaceId: ...
+
+    @property
+    def actor_id(self) -> UserId: ...
+
+    @property
+    def run_id(self) -> AgentRunId: ...
+
+    @property
+    def proposal_ref(self) -> ResourceRef: ...
+
+    @property
+    def decision(self) -> str: ...
+
+    @property
+    def resume_ref(self) -> ResourceRef: ...
+
+
 class AgentRunExhaustionClaim(Protocol):
     """@brief outbox 尝试耗尽后的最小领域补偿 claim / Minimal domain-compensation claim after outbox exhaustion.
 
@@ -714,6 +758,7 @@ __all__ = [
     "AgentPermissionGrant",
     "AgentPermissionRequest",
     "AgentPolicyDenied",
+    "AgentProposalDecisionClaim",
     "AgentProposalFailure",
     "AgentProviderFailure",
     "AgentRepository",
@@ -725,6 +770,7 @@ __all__ = [
     "AgentRunPolicyRequest",
     "AgentToolDecisionClaim",
     "AgentToolExecutor",
+    "AgentToolInvocationCommand",
     "AgentToolRegistry",
     "AgentUnitOfWork",
     "AgentUnitOfWorkFactory",

@@ -16,6 +16,19 @@ from backend.domain.resumes import (
     TemplateRef,
 )
 
+_RESUME_PRODUCED_OUTBOX_EVENT_TYPES = frozenset(
+    {
+        "agent.proposal_decision.recorded",
+        "resume.created",
+        "resume.deleted",
+        "resume.job_created",
+        "resume.metadata_updated",
+        "resume.operations_applied",
+        "resume.proposal_decided",
+    }
+)
+"""Events that the Resume bounded context is explicitly allowed to publish."""
+
 
 class ResumeJobKind(StrEnum):
     """@brief Resume 领域长任务种类 / Resume-domain long-running job kinds."""
@@ -141,7 +154,10 @@ class ResumeOutboxEvent:
                 "resume.invalid_outbox_event",
                 "outbox timestamp must be timezone-aware",
             )
-        if not self.event_type.startswith("resume.") or len(self.data) > 40:
+        if (
+            self.event_type not in _RESUME_PRODUCED_OUTBOX_EVENT_TYPES
+            or len(self.data) > 40
+        ):
             raise ResumeDomainError(
                 "resume.invalid_outbox_event",
                 "outbox event type or data is invalid",

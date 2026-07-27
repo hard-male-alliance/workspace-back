@@ -86,9 +86,7 @@ def _production_root() -> dict[str, Any]:
     root["database"].update(
         {
             "mode": "postgresql",
-            "application_dsn": (
-                "postgresql+asyncpg://app:password@db.hmalliances.org/workspace"
-            ),
+            "application_dsn": ("postgresql+asyncpg://app:password@db.hmalliances.org/workspace"),
         }
     )
     root["security"].update(
@@ -96,9 +94,7 @@ def _production_root() -> dict[str, Any]:
             "identity_mode": "disabled",
             "trusted_proxy_hmac_secret": None,
             "cursor_hmac_secret": "cursor-signing-secret-that-has-32-bytes",
-            "sensitive_idempotency_hmac_secret": (
-                "sensitive-idempotency-secret-that-has-32-bytes"
-            ),
+            "sensitive_idempotency_hmac_secret": ("sensitive-idempotency-secret-that-has-32-bytes"),
         }
     )
     root["hosted_identity"]["password_breach"]["mode"] = "pwned_passwords"
@@ -160,6 +156,65 @@ def test_public_example_disables_realtime_without_manufactured_secrets() -> None
     assert settings.interview.realtime.allowed_transports == ("webrtc", "websocket")
     assert settings.interview.realtime.credential_ttl_seconds == 300
     assert settings.interview.realtime.ice_urls == ()
+    assert settings.interview.report_provider_mode == "deterministic"
+
+
+def test_development_may_explicitly_enable_real_interview_reports(
+    tmp_path: Path,
+) -> None:
+    """@brief 本地真实联调必须显式选择非 mock 模型 / Local real-report integration requires an explicit non-mock model.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    """
+
+    root = _configured_development_root()
+    root["interview"]["report_provider_mode"] = "model"
+    root["ai"].update(
+        {
+            "provider": "openrouter",
+            "model": "test-real-report-model",
+            "api_key": "test-only-model-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "data_region": "global",
+        }
+    )
+
+    settings = BackendSettings.from_file(_write(root, tmp_path / "model-report.json"))
+
+    assert settings.interview.report_provider_mode == "model"
+
+
+def test_interview_report_provider_mode_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """@brief test、部署环境和 mock provider 不得伪装真实报告 / Test, deployed, and mock configurations cannot impersonate real reports.
+
+    @param tmp_path pytest 临时目录 / Pytest temporary directory.
+    """
+
+    root = _configured_development_root()
+    root["interview"]["report_provider_mode"] = "model"
+    with pytest.raises(ConfigurationError, match=r"non-mock ai\.provider"):
+        BackendSettings.from_file(_write(root, tmp_path / "mock-model.json"))
+
+    root = _configured_development_root()
+    root["environment"] = "test"
+    root["interview"]["report_provider_mode"] = "model"
+    with pytest.raises(ConfigurationError, match="must be deterministic in test"):
+        BackendSettings.from_file(_write(root, tmp_path / "test-model.json"))
+
+    root = _production_root()
+    root["interview"]["report_provider_mode"] = "deterministic"
+    with pytest.raises(
+        ConfigurationError,
+        match="must be model in staging/production",
+    ):
+        BackendSettings.from_file(_write(root, tmp_path / "production-deterministic.json"))
+
+    root = _configured_development_root()
+    root["interview"]["report_provider_mode"] = "unsupported"
+    with pytest.raises(ConfigurationError, match="report_provider_mode"):
+        BackendSettings.from_file(_write(root, tmp_path / "unsupported.json"))
 
 
 def test_configured_realtime_decodes_key_and_preserves_transport_policy(
@@ -190,9 +245,7 @@ def test_deployed_realtime_requires_keyring_and_non_placeholder_endpoint(
     @param tmp_path pytest 临时目录 / pytest temporary directory.
     """
 
-    settings = BackendSettings.from_file(
-        _write(_production_root(), tmp_path / "production.json")
-    )
+    settings = BackendSettings.from_file(_write(_production_root(), tmp_path / "production.json"))
     assert settings.interview.realtime.active_signing_key == bytes([20]) * 32
 
     root = _production_root()
@@ -205,9 +258,7 @@ def test_deployed_realtime_requires_keyring_and_non_placeholder_endpoint(
         BackendSettings.from_file(_write(root, tmp_path / "missing.json"))
 
     root = _production_root()
-    root["interview"]["realtime"]["signaling_url"] = (
-        "wss://realtime.example.test/v2/interview"
-    )
+    root["interview"]["realtime"]["signaling_url"] = "wss://realtime.example.test/v2/interview"
     with pytest.raises(ConfigurationError, match="placeholder host"):
         BackendSettings.from_file(_write(root, tmp_path / "placeholder.json"))
 
@@ -234,9 +285,7 @@ def test_realtime_bounds_and_ice_uri_grammar_are_closed(tmp_path: Path) -> None:
         BackendSettings.from_file(_write(root, tmp_path / "transport.json"))
 
     root = _configured_development_root()
-    root["interview"]["realtime"]["ice_urls"] = [
-        "turn:turn.hmalliances.org:3478?credential=leaked"
-    ]
+    root["interview"]["realtime"]["ice_urls"] = ["turn:turn.hmalliances.org:3478?credential=leaked"]
     with pytest.raises(ConfigurationError, match="invalid STUN/TURN URI"):
         BackendSettings.from_file(_write(root, tmp_path / "ice.json"))
 

@@ -13,6 +13,7 @@ from backend.api.v2_agent import router_v2_agent
 from backend.application.agent_v2 import V2_AGENT_ENDPOINT_METHODS
 from backend.application.agent_worker import AgentRunOutboxHandler
 from backend.application.ports.agent_v2 import (
+    AgentProposalDecisionClaim,
     AgentRunExecutionClaim,
     AgentRunExhaustionClaim,
     AgentToolDecisionClaim,
@@ -55,6 +56,7 @@ class _CapturingWorker:
         """@brief 初始化空捕获 / Initialize an empty capture."""
         self.claims: list[AgentRunExecutionClaim] = []
         self.tool_decisions: list[AgentToolDecisionClaim] = []
+        self.proposal_decisions: list[AgentProposalDecisionClaim] = []
         self.exhausted: list[AgentRunExhaustionClaim] = []
 
     async def execute_run(self, dispatch: AgentRunExecutionClaim) -> AgentRunView:
@@ -73,6 +75,13 @@ class _CapturingWorker:
     async def fail_exhausted(self, dispatch: AgentRunExhaustionClaim) -> AgentRunView:
         """@brief 捕获不依赖 payload 的耗尽 claim / Capture a payload-independent exhaustion claim."""
         self.exhausted.append(dispatch)
+        return cast(AgentRunView, object())
+
+    async def resume_after_proposal_decision(
+        self,
+        dispatch: AgentProposalDecisionClaim,
+    ) -> AgentRunView:
+        self.proposal_decisions.append(dispatch)
         return cast(AgentRunView, object())
 
 
@@ -125,6 +134,26 @@ def _tool_decision_claim(
         payload,
         1,
         OutboxLease("agent-decision-lease-token-with-adequate-entropy"),
+        NOW + timedelta(minutes=2),
+    )
+
+
+def _proposal_decision_claim() -> OutboxDispatchClaim:
+    return OutboxDispatchClaim(
+        ApiEventId("event_proposaldecision01"),
+        WorkspaceId("workspace_agentworker01"),
+        UserId("user_agentworker01"),
+        ResourceRef("resume_proposal", "proposal_worker0001", 2),
+        "agent.proposal_decision.recorded",
+        {
+            "actor_id": "user_agentworker01",
+            "run_id": "agent_run_worker0001",
+            "decision": "accept",
+            "resume_id": "resume_worker0000001",
+            "resume_revision": 3,
+        },
+        1,
+        OutboxLease("proposal-decision-lease-token-with-adequate-entropy"),
         NOW + timedelta(minutes=2),
     )
 
@@ -182,6 +211,23 @@ async def test_outbox_handler_strictly_binds_tool_decision_payload() -> None:
         ):
             await handler.handle(invalid)
     assert len(worker.tool_decisions) == 1
+
+
+@pytest.mark.asyncio
+async def test_outbox_handler_binds_resume_proposal_continuation() -> None:
+    worker = _CapturingWorker()
+    await AgentRunOutboxHandler(worker).handle(_proposal_decision_claim())
+
+    assert len(worker.proposal_decisions) == 1
+    decision = worker.proposal_decisions[0]
+    assert decision.run_id == "agent_run_worker0001"
+    assert decision.proposal_ref == ResourceRef(
+        "resume_proposal",
+        "proposal_worker0001",
+        2,
+    )
+    assert decision.resume_ref == ResourceRef("resume", "resume_worker0000001", 3)
+    assert decision.decision == "accept"
 
 
 @pytest.mark.asyncio

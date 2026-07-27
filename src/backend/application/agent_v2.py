@@ -24,6 +24,7 @@ from backend.application.ports.agent_v2 import (
     AgentPermissionGrant,
     AgentPermissionRequest,
     AgentPolicyDenied,
+    AgentProposalDecisionClaim,
     AgentProposalFailure,
     AgentProviderFailure,
     AgentResumeProposalCommand,
@@ -32,6 +33,7 @@ from backend.application.ports.agent_v2 import (
     AgentRunPolicyRequest,
     AgentToolDecisionClaim,
     AgentToolExecutor,
+    AgentToolInvocationCommand,
     AgentToolRegistry,
     AgentUnitOfWork,
     AgentUnitOfWorkFactory,
@@ -44,9 +46,11 @@ from backend.domain.agent_v2 import (
     AgentExecutionGrant,
     AgentKnowledgeEvidence,
     AgentOutboxId,
+    AgentProposalDecisionContext,
     AgentProviderApprovalRequired,
     AgentProviderCompleted,
     AgentProviderOutcome,
+    AgentProviderProposalDecisionRequired,
     AgentProviderRequest,
     AgentResumeContext,
     AgentRun,
@@ -105,6 +109,12 @@ V2_AGENT_ENDPOINT_METHODS = (
     "decide_tool_approval",
 )
 """@brief 5.4 实际 12 个路由对应的应用方法 / Application methods for the 12 actual section-5.4 routes."""
+
+_PROVIDER_HISTORY_MESSAGE_LIMIT = 40
+"""@brief 单次模型请求携带的最近会话消息上限 / Recent conversation-message limit sent to one model request."""
+
+_PROVIDER_HISTORY_SCAN_LIMIT = 2_000
+"""@brief 为取得最近消息最多扫描的有界消息数 / Bounded number of messages scanned for recent history."""
 
 
 class Clock(Protocol):
@@ -1199,8 +1209,37 @@ class _PreparedAgentExecution:
     input_message: Message
     """@brief 精确用户输入 / Exact user input."""
 
+    conversation_history: tuple[Message, ...]
+    """@brief 同一会话中位于当前输入前的最近消息 / Recent same-conversation messages preceding the input."""
+
     resume_context: AgentResumeContext | None
     """@brief 可选精确 Resume SIR / Optional exact Resume SIR."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ResumedExecutionClaim:
+    """Internal exact claim after a Proposal wait has been resumed."""
+
+    workspace_id: WorkspaceId
+    actor_id: UserId
+    run_ref: ResourceRef
+    job_ref: ResourceRef
+
+
+def _proposal_execution_claim(
+    dispatch: AgentProposalDecisionClaim,
+    prepared: _PreparedAgentExecution,
+) -> _ResumedExecutionClaim:
+    return _ResumedExecutionClaim(
+        dispatch.workspace_id,
+        prepared.run.created_by,
+        ResourceRef(
+            "agent_run",
+            prepared.run.meta.id,
+            prepared.run.meta.revision,
+        ),
+        ResourceRef("job", prepared.job.meta.id, prepared.job.meta.revision),
+    )
 
 
 class AgentWorkerService:
@@ -1314,6 +1353,171 @@ class AgentWorkerService:
             problem,
         )
 
+    async def resume_after_proposal_decision(
+        self,
+        dispatch: AgentProposalDecisionClaim,
+    ) -> AgentRunView:
+        """Resume the same Agent Run after a committed human Proposal decision."""
+
+        prepared = await self._prepare_proposal_continuation(dispatch)
+        if isinstance(prepared, AgentRunView):
+            return prepared
+        decision_context = AgentProposalDecisionContext(
+            dispatch.proposal_ref,
+            dispatch.decision,
+            dispatch.resume_ref,
+        )
+        try:
+            request = await self._build_provider_request(
+                _proposal_execution_claim(dispatch, prepared),
+                prepared,
+                proposal_decision=decision_context,
+            )
+            outcome = await self._model_provider.execute(request)
+            if not isinstance(outcome, AgentProviderCompleted):
+                raise AgentDomainError(
+                    "a Proposal continuation cannot request an unrelated tool approval"
+                )
+            outcome.validate_for(request)
+            return await self._commit_provider_outcome(
+                _proposal_execution_claim(dispatch, prepared),
+                prepared,
+                request,
+                outcome,
+            )
+        except asyncio.CancelledError:
+            raise
+        except AgentProviderFailure as error:
+            problem = error.problem
+        except AgentDomainError:
+            problem = _provider_protocol_problem(dispatch.run_id)
+        except Exception:
+            problem = _unexpected_provider_problem(dispatch.run_id)
+        return await self._record_run_failure(
+            dispatch.workspace_id,
+            dispatch.run_id,
+            prepared.run,
+            prepared.job,
+            problem,
+        )
+
+    async def _prepare_proposal_continuation(
+        self,
+        dispatch: AgentProposalDecisionClaim,
+    ) -> _PreparedAgentExecution | AgentRunView:
+        """Validate the cross-context binding and durably resume Run/Job."""
+
+        resumed_at = self._clock.now()
+        try:
+            async with self._uow_factory(
+                dispatch.workspace_id,
+                dispatch.actor_id,
+            ) as uow:
+                run = await _worker_run(
+                    uow,
+                    dispatch.workspace_id,
+                    dispatch.run_id,
+                    for_update=True,
+                )
+                job = await _worker_job(
+                    uow,
+                    dispatch.workspace_id,
+                    run.job_id,
+                    for_update=True,
+                )
+                validate_run_job_alignment(run, job)
+                if run.is_terminal:
+                    await uow.commit()
+                    return run.view
+                if (
+                    run.view.status is AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION
+                    and run.matches_proposal_decision(dispatch.proposal_ref)
+                ):
+                    if (
+                        job.progress is not None
+                        and job.progress.phase == "proposal_decision_recorded"
+                    ):
+                        resumed_run = run
+                        resumed_job = job
+                    else:
+                        resumed_run = run
+                        resumed_job = job.report_progress(
+                            JobProgress(
+                                phase="proposal_decision_recorded",
+                                completed=0,
+                                total=None,
+                                unit=JobProgressUnit.STEPS,
+                            ),
+                            at=resumed_at,
+                        )
+                        await uow.jobs.save(
+                            resumed_job,
+                            expected_revision=job.meta.revision,
+                        )
+                        await uow.outbox.add(
+                            self._run_state_dispatch(
+                                resumed_run,
+                                resumed_job,
+                                resumed_at,
+                            )
+                        )
+                elif run.view.status is AgentRunStatus.RUNNING:
+                    if (
+                        job.progress is None
+                        or job.progress.phase != "proposal_decision_recorded"
+                    ):
+                        raise AgentPortProtocolError(
+                            "agent_run.worker_state_mismatch",
+                            "Agent Run is not a resumable Proposal continuation",
+                        )
+                    resumed_run = run
+                    resumed_job = job
+                else:
+                    raise AgentPortProtocolError(
+                        "agent.proposal_decision_binding_mismatch",
+                        "Proposal decision does not match the waiting Agent Run",
+                    )
+                conversation, input_message = await _worker_run_input(
+                    uow,
+                    dispatch.workspace_id,
+                    resumed_run,
+                )
+                history = await _load_provider_conversation_history(
+                    uow,
+                    dispatch.workspace_id,
+                    resumed_run.spec.conversation_id,
+                    input_message,
+                )
+                grant = await _refresh_execution_grant(
+                    uow,
+                    resumed_run.created_by,
+                    dispatch.workspace_id,
+                    resumed_run,
+                    conversation,
+                    input_message,
+                )
+                if grant != resumed_run.grant:
+                    raise AgentPolicyDenied(
+                        "execution grant changed while awaiting Proposal decision"
+                    )
+                resume_context = await uow.resume_proposals.load_base(
+                    dispatch.workspace_id,
+                    dispatch.resume_ref,
+                )
+                await uow.commit()
+                return _PreparedAgentExecution(
+                    resumed_run,
+                    resumed_job,
+                    input_message,
+                    history,
+                    resume_context,
+                )
+        except AgentCasMismatch as error:
+            raise AgentConflict(
+                "agent_run.worker_race",
+                "Agent Run changed while its Proposal continuation was prepared",
+            ) from error
+
     async def _prepare_execution(
         self,
         dispatch: AgentRunExecutionClaim,
@@ -1336,6 +1540,12 @@ class AgentWorkerService:
                     uow,
                     workspace_id,
                     run,
+                )
+                conversation_history = await _load_provider_conversation_history(
+                    uow,
+                    workspace_id,
+                    run.spec.conversation_id,
+                    input_message,
                 )
                 grant = await _refresh_execution_grant(
                     uow,
@@ -1408,6 +1618,7 @@ class AgentWorkerService:
                     started_run,
                     started_job,
                     input_message,
+                    conversation_history,
                     resume_context,
                 )
         except AgentCasMismatch as error:
@@ -1435,6 +1646,15 @@ class AgentWorkerService:
                 phase="waiting_for_approval",
             )
             return run.view
+        if run.view.status is AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION:
+            _require_queued_handoff_revision(
+                run,
+                job,
+                dispatch,
+                revision_offset=2,
+                phase="waiting_for_proposal_decision",
+            )
+            return run.view
         if (
             run.view.status is AgentRunStatus.RUNNING
             and job.progress is not None
@@ -1454,6 +1674,8 @@ class AgentWorkerService:
         self,
         dispatch: AgentRunExecutionClaim,
         prepared: _PreparedAgentExecution,
+        *,
+        proposal_decision: AgentProposalDecisionContext | None = None,
     ) -> AgentProviderRequest:
         """@brief 在事务外取得授权证据并构造模型请求 / Retrieve authorized evidence and build a model request outside transactions."""
         evidence: tuple[AgentKnowledgeEvidence, ...] = ()
@@ -1483,8 +1705,16 @@ class AgentWorkerService:
             spec=prepared.run.spec,
             grant=prepared.run.grant,
             input_message=prepared.input_message,
+            actor_id=prepared.run.created_by,
             knowledge_evidence=evidence,
             resume_context=prepared.resume_context,
+            conversation_history=prepared.conversation_history,
+            proposal_decision=proposal_decision,
+            provider_state=(
+                prepared.run.provider_state
+                if proposal_decision is not None
+                else None
+            ),
         )
 
     async def _commit_provider_outcome(
@@ -1540,17 +1770,27 @@ class AgentWorkerService:
                     raise AgentPolicyDenied(
                         "execution authorization changed during provider execution"
                     )
-                resume_context = await _load_resume_context(
-                    uow,
-                    workspace_id,
-                    current,
-                )
-                if resume_context != request.resume_context:
-                    raise AgentPolicyDenied(
-                        "Resume context changed during provider execution"
+                if request.proposal_decision is None:
+                    resume_context = await _load_resume_context(
+                        uow,
+                        workspace_id,
+                        current,
                     )
+                    if resume_context != request.resume_context:
+                        raise AgentPolicyDenied(
+                            "Resume context changed during provider execution"
+                        )
                 if isinstance(outcome, AgentProviderCompleted):
                     result = await self._commit_completion(
+                        uow,
+                        current,
+                        current_job,
+                        request,
+                        outcome,
+                        finished_at,
+                    )
+                elif isinstance(outcome, AgentProviderProposalDecisionRequired):
+                    result = await self._commit_proposal_interruption(
                         uow,
                         current,
                         current_job,
@@ -1588,22 +1828,18 @@ class AgentWorkerService:
         proposal_refs: tuple[ResourceRef, ...] = ()
         content = outcome.content
         if outcome.resume_operations:
-            if request.resume_context is None or outcome.proposal_title is None:
-                raise AgentProviderFailure(_provider_protocol_problem(run.meta.id))
-            proposal_ref = await uow.resume_proposals.create(
-                AgentResumeProposalCommand(
+            raise AgentProviderFailure(_provider_protocol_problem(run.meta.id))
+        if outcome.tool_invocations:
+            await uow.resume_proposals.record_invocations(
+                AgentToolInvocationCommand(
                     workspace_id=run.workspace_id,
                     actor_id=run.created_by,
                     run_id=run.meta.id,
-                    base=request.resume_context,
-                    title=outcome.proposal_title,
-                    operations=outcome.resume_operations,
-                    evidence=request.knowledge_evidence,
+                    invocations=outcome.tool_invocations,
+                    proposal_ref=proposal_refs[0] if proposal_refs else None,
                     created_at=finished_at,
                 )
             )
-            proposal_refs = (proposal_ref,)
-            content = (*content, ResumeProposalContentPart(proposal_ref))
         reservation = await uow.repository.allocate_message_sequence(
             run.workspace_id,
             run.spec.conversation_id,
@@ -1617,19 +1853,25 @@ class AgentWorkerService:
             conversation_id=run.spec.conversation_id,
             sequence=reservation.sequence,
             role=MessageRole.ASSISTANT,
-            parent_message_id=run.spec.input_message_id,
+            parent_message_id=(
+                run.view.output_message_id
+                if request.proposal_decision is not None
+                else run.spec.input_message_id
+            ),
             content=content,
             source_run_id=run.meta.id,
         )
         await uow.repository.add_message(output)
         completed_run = run.succeed(
             output_id,
-            proposal_refs,
-            outcome.usage,
+            run.view.proposal_refs,
+            _combined_usage(run.view.usage, outcome.usage),
             at=finished_at,
         )
-        result_refs = [ResourceRef("message", output_id, 1), *proposal_refs]
-        completed_job = job.succeed(result_refs, at=finished_at)
+        completed_job = job.succeed(
+            [ResourceRef("message", output_id, 1)],
+            at=finished_at,
+        )
         validate_run_job_alignment(completed_run, completed_job)
         await uow.repository.save_run(
             completed_run,
@@ -1640,6 +1882,85 @@ class AgentWorkerService:
             self._run_state_dispatch(completed_run, completed_job, finished_at)
         )
         return completed_run.view
+
+    async def _commit_proposal_interruption(
+        self,
+        uow: AgentUnitOfWork,
+        run: AgentRun,
+        job: Job,
+        request: AgentProviderRequest,
+        outcome: AgentProviderProposalDecisionRequired,
+        finished_at: datetime,
+    ) -> AgentRunView:
+        """Materialize an SDK tool interruption as a reviewable Proposal and durable checkpoint."""
+
+        if request.resume_context is None:
+            raise AgentProviderFailure(_provider_protocol_problem(run.meta.id))
+        proposal_ref = await uow.resume_proposals.create(
+            AgentResumeProposalCommand(
+                workspace_id=run.workspace_id,
+                actor_id=run.created_by,
+                run_id=run.meta.id,
+                base=request.resume_context,
+                title=outcome.proposal_title,
+                operations=outcome.resume_operations,
+                evidence=request.knowledge_evidence,
+                created_at=finished_at,
+            )
+        )
+        if outcome.tool_invocations:
+            await uow.resume_proposals.record_invocations(
+                AgentToolInvocationCommand(
+                    workspace_id=run.workspace_id,
+                    actor_id=run.created_by,
+                    run_id=run.meta.id,
+                    invocations=outcome.tool_invocations,
+                    proposal_ref=proposal_ref,
+                    created_at=finished_at,
+                )
+            )
+        reservation = await uow.repository.allocate_message_sequence(
+            run.workspace_id,
+            run.spec.conversation_id,
+            expected_conversation_revision=None,
+            at=finished_at,
+        )
+        output_id = MessageId(self._ids("msg"))
+        await uow.repository.add_message(
+            Message(
+                meta=ResourceMeta(output_id, 1, finished_at, finished_at),
+                workspace_id=run.workspace_id,
+                conversation_id=run.spec.conversation_id,
+                sequence=reservation.sequence,
+                role=MessageRole.ASSISTANT,
+                parent_message_id=run.spec.input_message_id,
+                content=(*outcome.content, ResumeProposalContentPart(proposal_ref)),
+                source_run_id=run.meta.id,
+            )
+        )
+        waiting_run = run.wait_for_proposal_decision(
+            output_id,
+            proposal_ref,
+            outcome.usage,
+            outcome.provider_state,
+            at=finished_at,
+        )
+        waiting_job = job.report_progress(
+            JobProgress(
+                phase="waiting_for_proposal_decision",
+                completed=0,
+                total=None,
+                unit=JobProgressUnit.STEPS,
+            ),
+            at=finished_at,
+        )
+        validate_run_job_alignment(waiting_run, waiting_job)
+        await uow.repository.save_run(waiting_run, expected_revision=run.meta.revision)
+        await uow.jobs.save(waiting_job, expected_revision=job.meta.revision)
+        await uow.outbox.add(
+            self._run_state_dispatch(waiting_run, waiting_job, finished_at)
+        )
+        return waiting_run.view
 
     async def _commit_tool_approval(
         self,
@@ -2181,6 +2502,95 @@ async def _worker_run_input(
     return conversation, input_message
 
 
+async def _load_provider_conversation_history(
+    uow: AgentUnitOfWork,
+    workspace_id: WorkspaceId,
+    conversation_id: ConversationId,
+    input_message: Message,
+) -> tuple[Message, ...]:
+    """Load a bounded, ordered history snapshot from the exact Run conversation."""
+
+    collected: list[Message] = []
+    after: str | None = None
+    remaining = _PROVIDER_HISTORY_SCAN_LIMIT
+    while remaining > 0:
+        page_limit = min(200, remaining)
+        page = await uow.repository.list_messages(
+            workspace_id,
+            conversation_id,
+            AgentPageRequest(page_limit, after),
+        )
+        if any(
+            item.workspace_id != workspace_id or item.conversation_id != conversation_id
+            for item in page.items
+        ):
+            raise AgentPortProtocolError(
+                "agent.repository_scope_violation",
+                "message repository returned history outside the Run conversation",
+            )
+        collected.extend(
+            item
+            for item in page.items
+            if item.sequence < input_message.sequence
+            and item.role in {MessageRole.USER, MessageRole.ASSISTANT}
+        )
+        remaining -= len(page.items)
+        if page.next_position is None or not page.items:
+            break
+        after = page.next_position
+    runs: list[AgentRun] = []
+    run_after: str | None = None
+    remaining_runs = _PROVIDER_HISTORY_SCAN_LIMIT
+    while remaining_runs > 0:
+        page_limit = min(200, remaining_runs)
+        run_page = await uow.repository.list_runs_for_conversation(
+            workspace_id,
+            conversation_id,
+            AgentPageRequest(page_limit, run_after),
+        )
+        runs.extend(run_page.items)
+        remaining_runs -= len(run_page.items)
+        if run_page.next_position is None or not run_page.items:
+            break
+        run_after = run_page.next_position
+
+    eligible_statuses = {
+        AgentRunStatus.SUCCEEDED,
+        AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
+    }
+    runs_by_input: dict[MessageId, list[AgentRun]] = {}
+    for run in runs:
+        if (
+            run.workspace_id != workspace_id
+            or run.spec.conversation_id != conversation_id
+        ):
+            raise AgentPortProtocolError(
+                "agent.repository_scope_violation",
+                "run repository returned history outside the Run conversation",
+            )
+        runs_by_input.setdefault(run.spec.input_message_id, []).append(run)
+
+    def belongs_to_complete_turn(message: Message) -> bool:
+        if message.role is MessageRole.USER:
+            linked_runs = runs_by_input.get(message.meta.id)
+            return linked_runs is None or any(
+                run.view.status in eligible_statuses for run in linked_runs
+            )
+        if message.source_run_id is None:
+            return False
+        return any(
+            run.meta.id == message.source_run_id
+            and run.view.status in eligible_statuses
+            for run in runs
+        )
+
+    ordered = sorted(
+        (item for item in collected if belongs_to_complete_turn(item)),
+        key=lambda item: (item.sequence, item.meta.id),
+    )
+    return tuple(ordered[-_PROVIDER_HISTORY_MESSAGE_LIMIT:])
+
+
 async def _refresh_execution_grant(
     uow: AgentUnitOfWork,
     actor_id: UserId,
@@ -2249,6 +2659,21 @@ def _message_text(message: Message) -> str:
     if not value:
         raise AgentDomainError("agent input contains no searchable text")
     return value[:8_000]
+
+
+def _combined_usage(
+    prior: AgentUsage | None,
+    current: AgentUsage,
+) -> AgentUsage:
+    """Combine metering across the initial and post-decision model calls."""
+
+    if prior is None:
+        return current
+    return AgentUsage(
+        prior.input_tokens + current.input_tokens,
+        prior.output_tokens + current.output_tokens,
+        str(int(prior.cost_micro_usd) + int(current.cost_micro_usd)),
+    )
 
 
 async def _worker_run(

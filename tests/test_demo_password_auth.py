@@ -84,9 +84,13 @@ def _begin(
     return started.headers["location"], csrf.group(1), browser_cookie
 
 
-def _form_headers(browser_cookie: str) -> dict[str, str]:
+def _form_headers(
+    browser_cookie: str,
+    *,
+    origin: str = PUBLIC_ORIGIN,
+) -> dict[str, str]:
     return {
-        "Origin": PUBLIC_ORIGIN,
+        "Origin": origin,
         "Sec-Fetch-Site": "same-origin",
         "Cookie": f"{IDENTITY_BROWSER_COOKIE}={browser_cookie}",
     }
@@ -278,6 +282,28 @@ def test_demo_form_rejects_cross_site_missing_csrf_and_wrong_password(
     )
     assert mismatch.status_code == 400
     assert _PASSWORD not in mismatch.text
+
+
+def test_demo_form_accepts_exact_local_development_origin(
+    demo_client: TestClient,
+) -> None:
+    continue_uri, csrf, browser_cookie = _begin(demo_client, "signup")
+    response = demo_client.post(
+        continue_uri,
+        headers=_form_headers(
+            browser_cookie,
+            origin="http://localhost:8000",
+        ),
+        data={
+            "purpose": "register",
+            "csrf_token": csrf,
+            "email": "local-origin@example.test",
+            "password": _PASSWORD,
+            "confirm_password": _PASSWORD,
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
 
 
 def test_demo_validation_failure_can_retry_the_same_form(

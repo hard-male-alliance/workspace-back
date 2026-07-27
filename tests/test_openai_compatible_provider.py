@@ -183,7 +183,7 @@ async def test_openai_compatible_provider_streams_delta_and_builds_safe_payload(
     assert payload["model"] == "openai/gpt-5-mini"
     assert payload["stream"] is True
     assert payload["messages"][0]["role"] == "system"
-    assert "resume wording" in payload["messages"][0]["content"]
+    assert "client does not classify intent" in payload["messages"][0]["content"]
     assert payload["messages"][1] == {"role": "assistant", "content": "上一轮建议"}
     assert payload["messages"][-1] == {"role": "user", "content": "请帮我润色项目经历。"}
 

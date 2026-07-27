@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.application.ports.agent_v2 import (
     AgentProposalFailure,
     AgentResumeProposalCommand,
+    AgentToolInvocationCommand,
 )
 from backend.domain.agent_v2 import (
     AgentResumeContext,
@@ -33,6 +34,7 @@ from backend.domain.resumes import (
     resume_operation_fingerprint,
 )
 from backend.infrastructure.persistence.models import (
+    AgentToolInvocationRecord,
     JsonObject,
     ResumeDocumentRecord,
     ResumeProposalOperationRecord,
@@ -339,6 +341,84 @@ class PostgresAgentResumeProposalBoundary:
                 409,
             )
 
+    async def record_invocations(
+        self,
+        command: AgentToolInvocationCommand,
+    ) -> None:
+        """Persist only diagnostic shape; never persist arguments or tool result content."""
+
+        self._scope.require_workspace(command.workspace_id)
+        actor_id = self._scope.require_actor()
+        if actor_id != command.actor_id:
+            raise PermissionError("Agent tool diagnostic actor does not match worker scope")
+        proposal_id = (
+            command.proposal_ref.id if command.proposal_ref is not None else None
+        )
+        for invocation in command.invocations:
+            persisted_status = _persisted_invocation_status(invocation.status)
+            invocation_id = _stable_id(
+                "toolinv",
+                f"{command.run_id}:{invocation.ordinal}",
+            )
+            existing = await self._session.scalar(
+                select(AgentToolInvocationRecord).where(
+                    AgentToolInvocationRecord.workspace_id
+                    == str(command.workspace_id),
+                    AgentToolInvocationRecord.id == invocation_id,
+                )
+            )
+            arguments: JsonObject = {"keys": list(invocation.argument_keys)}
+            result: JsonObject = {
+                "kind": invocation.status,
+                "duration_ms": round(invocation.duration_ms, 3),
+            }
+            bound_proposal_id = (
+                proposal_id
+                if invocation.tool_name == "resume_request_proposal_decision"
+                else None
+            )
+            if existing is not None:
+                if (
+                    existing.run_id != str(command.run_id)
+                    or existing.ordinal != invocation.ordinal
+                    or existing.tool_name != invocation.tool_name
+                    or existing.arguments != arguments
+                    or existing.result != result
+                    or existing.status != persisted_status
+                    or existing.proposal_id != bound_proposal_id
+                ):
+                    raise _proposal_failure(
+                        str(command.run_id),
+                        "agent.tool_invocation_identity_conflict",
+                        "Agent tool invocation identity is already bound",
+                        409,
+                    )
+                continue
+            self._session.add(
+                AgentToolInvocationRecord(
+                    id=invocation_id,
+                    workspace_id=str(command.workspace_id),
+                    resource_owner_id=str(actor_id),
+                    run_id=str(command.run_id),
+                    ordinal=invocation.ordinal,
+                    tool_name=invocation.tool_name,
+                    arguments=arguments,
+                    result=result,
+                    status=persisted_status,
+                    proposal_id=bound_proposal_id,
+                    created_at=command.created_at,
+                    updated_at=command.created_at,
+                    revision=1,
+                    extensions={},
+                )
+            )
+
+
+def _persisted_invocation_status(status: str) -> str:
+    """Map richer provider diagnostics onto the closed database status contract."""
+
+    return "failed" if status in {"invalid", "failure"} else status
+
 
 class UnavailableAgentResumeProposalBoundary:
     """@brief 内存运行时拒绝伪造 durable Resume Proposal / Reject fake durable Resume Proposals in memory mode."""
@@ -368,6 +448,15 @@ class UnavailableAgentResumeProposalBoundary:
         """
 
         raise _durable_runtime_failure(str(command.run_id))
+
+    async def record_invocations(
+        self,
+        command: AgentToolInvocationCommand,
+    ) -> None:
+        """Memory mode has no durable Resume tool session to record."""
+
+        if command.invocations:
+            raise _durable_runtime_failure(str(command.run_id))
 
 
 def _materialize_operations(
@@ -467,6 +556,18 @@ def _materialize_operations(
             )
         operations.append(operation)
     return tuple(operations)
+
+
+def validate_resume_operation_drafts(
+    validation_id: str,
+    base: AgentResumeContext,
+    drafts: Sequence[AgentResumeOperationDraft],
+) -> tuple[ResumeOperation, ...]:
+    """Materialize and preview a draft prefix without persistence or Resume mutation."""
+
+    operations = _materialize_operations(validation_id, base, drafts)
+    preview_resume_operations(base.document, operations)
+    return operations
 
 
 def _register_new_entity(
