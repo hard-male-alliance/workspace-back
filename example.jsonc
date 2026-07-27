@@ -133,6 +133,8 @@
   },
   // Interview V2 realtime 凭据必须是独立、短期且绑定 audience 的 HMAC grant。
   "interview": {
+    // development 省略时默认 deterministic；本地真实联调可显式设置为 model。
+    // test 只允许 deterministic，staging/production 省略时默认且只允许 model。
     // 包含排队和完整流式输出；必须有界，配置解析硬限制为最多 120 秒。
     "report_timeout_ms": 60000,
     // WebSocket 媒体分片先写受控目录；多 worker 部署必须挂载同一受限持久卷。

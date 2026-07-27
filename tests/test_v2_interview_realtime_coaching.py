@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 
 from backend.application.interview_v2 import RealtimeCoachingContext
+from backend.domain.interview_v2 import JobTarget
+from backend.domain.principals import UserId, WorkspaceId
 from backend.infrastructure.interview_realtime_coaching import (
     ProviderRealtimeInterviewCoach,
 )
@@ -42,6 +44,19 @@ async def test_followup_stream_uses_frozen_policy_and_visual_context() -> None:
         True,
         (),
         "global",
+        WorkspaceId("workspace_realtime_coach01"),
+        UserId("user_realtime_coach0001"),
+        "interview_coach",
+        (),
+        JobTarget(
+            "Backend Engineer",
+            "Example",
+            None,
+            "Build reliable services.",
+            None,
+            "senior",
+            ("Python", "PostgreSQL"),
+        ),
     )
 
     chunks = [

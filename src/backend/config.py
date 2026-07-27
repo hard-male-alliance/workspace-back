@@ -68,6 +68,9 @@ ConnectionValidationMethod = Literal["GET", "POST"]
 InterviewRealtimeTransport = Literal["webrtc", "websocket"]
 """@brief Interview V2 实时传输类型 / Interview V2 realtime transport types."""
 
+InterviewReportProviderMode = Literal["deterministic", "model"]
+"""@brief Interview Report 生成适配器选择 / Interview Report generation-adapter selection."""
+
 _CONNECTION_PROVIDER_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{2,100}$")
 """@brief Connection provider 稳定名称语法 / Stable Connection-provider name grammar."""
 
@@ -493,9 +496,7 @@ class InterviewRealtimeSettings:
         active_key_id = self.signing_keyring.active_key_id
         if active_key_id is None:
             return None
-        return next(
-            item.key for item in self.signing_keyring.keys if item.key_id == active_key_id
-        )
+        return next(item.key for item in self.signing_keyring.keys if item.key_id == active_key_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,11 +504,14 @@ class InterviewSettings:
     """@brief Interview V2 外部端口配置 / Interview V2 external-port configuration.
 
     @param realtime 实时信令与 TURN 凭据策略 / Realtime signaling and TURN-credential policy.
+    @param report_provider_mode Report 使用确定性开发适配器或真实模型 / Whether Report
+        generation uses the deterministic development adapter or the real model.
     @param report_timeout_ms 一次模型报告生成的 wall-time 上限 / Whole-call wall-time limit
         for one model-backed report generation.
     """
 
     realtime: InterviewRealtimeSettings
+    report_provider_mode: InterviewReportProviderMode
     report_timeout_ms: int
     recording_directory: Path
     media_chunk_max_bytes: int
@@ -805,6 +809,14 @@ class BackendSettings:
             raise ConfigurationError(
                 "ai.api_key is required when a model or embedding provider is not mock"
             )
+        if (
+            interview_settings.report_provider_mode == "model"
+            and ai_provider == "mock"
+            and environment in _DEVELOPMENT_IDENTITY_ENVIRONMENTS
+        ):
+            raise ConfigurationError(
+                "interview.report_provider_mode model requires a non-mock ai.provider"
+            )
         public_base_url = _require_string(network, "public_base_url").rstrip("/")
         _validate_deployed_capabilities(
             environment=environment,
@@ -944,9 +956,7 @@ def _api_surface_settings(value: Any, *, environment: str) -> ApiSurfaceSettings
     _reject_unknown_keys(mapping, {"legacy_v1_enabled"}, "api")
     legacy_v1_enabled = _require_bool(mapping, "legacy_v1_enabled")
     if legacy_v1_enabled and environment in {"staging", "production"}:
-        raise ConfigurationError(
-            "api.legacy_v1_enabled must be false in staging/production"
-        )
+        raise ConfigurationError("api.legacy_v1_enabled must be false in staging/production")
     return ApiSurfaceSettings(legacy_v1_enabled=legacy_v1_enabled)
 
 
@@ -979,24 +989,18 @@ def _validate_deployed_capabilities(
     if environment not in {"staging", "production"}:
         return
     if renderer_adapter == "mock":
-        raise ConfigurationError(
-            "resume_rendering.adapter must not be mock in staging/production"
-        )
+        raise ConfigurationError("resume_rendering.adapter must not be mock in staging/production")
     if ai_provider == "mock" or ai_model.startswith("mock-"):
         raise ConfigurationError("ai.provider/model must be real in staging/production")
     if embedding_provider == "mock" or embedding_model.startswith("mock-"):
-        raise ConfigurationError(
-            "ai.embedding_provider/model must be real in staging/production"
-        )
+        raise ConfigurationError("ai.embedding_provider/model must be real in staging/production")
     if embedding_model_revision.lower() in {"mock", "test"}:
         raise ConfigurationError(
             "ai.embedding_model_revision must be production-identifying in staging/production"
         )
     _require_deployed_https_url(ai_base_url, "ai.base_url")
     if environment == "production" and public_base_url != _PRODUCTION_PUBLIC_ORIGIN:
-        raise ConfigurationError(
-            "network.public_base_url must match the API V2 production origin"
-        )
+        raise ConfigurationError("network.public_base_url must match the API V2 production origin")
     if environment == "staging":
         _require_deployed_https_url(public_base_url, "network.public_base_url")
 
@@ -1238,9 +1242,7 @@ def _optional_bounded_positive_int(
     """
     value = _optional_positive_int(mapping, key, default)
     if value > maximum:
-        raise ConfigurationError(
-            f"configuration key {key!r} must not exceed {maximum}"
-        )
+        raise ConfigurationError(f"configuration key {key!r} must not exceed {maximum}")
     return value
 
 
@@ -1447,6 +1449,7 @@ def _interview_settings(
         mapping,
         {
             "realtime",
+            "report_provider_mode",
             "report_timeout_ms",
             "recording_directory",
             "media_chunk_max_bytes",
@@ -1463,6 +1466,27 @@ def _interview_settings(
         },
         "interview",
     )
+    default_report_provider_mode = (
+        "deterministic" if environment in _DEVELOPMENT_IDENTITY_ENVIRONMENTS else "model"
+    )
+    report_provider_mode = cast(
+        InterviewReportProviderMode,
+        (
+            _require_choice(
+                mapping,
+                "report_provider_mode",
+                {"deterministic", "model"},
+            )
+            if "report_provider_mode" in mapping
+            else default_report_provider_mode
+        ),
+    )
+    if environment == "test" and report_provider_mode != "deterministic":
+        raise ConfigurationError("interview.report_provider_mode must be deterministic in test")
+    if environment in {"staging", "production"} and report_provider_mode != "model":
+        raise ConfigurationError(
+            "interview.report_provider_mode must be model in staging/production"
+        )
     report_timeout_ms = _optional_bounded_positive_int(
         mapping,
         "report_timeout_ms",
@@ -1490,6 +1514,7 @@ def _interview_settings(
             mapping.get("realtime"),
             environment=environment,
         ),
+        report_provider_mode,
         report_timeout_ms,
         Path(_optional_string(mapping.get("recording_directory")) or "data/interview-media"),
         chunk_max,
@@ -1585,9 +1610,7 @@ def _interview_realtime_settings(
     credential_ttl_seconds = _require_positive_int(mapping, "credential_ttl_seconds")
     heartbeat_interval_ms = _require_positive_int(mapping, "heartbeat_interval_ms")
     if credential_ttl_seconds > 900:
-        raise ConfigurationError(
-            "interview.realtime.credential_ttl_seconds must not exceed 900"
-        )
+        raise ConfigurationError("interview.realtime.credential_ttl_seconds must not exceed 900")
     if not 1_000 <= heartbeat_interval_ms <= 120_000:
         raise ConfigurationError(
             "interview.realtime.heartbeat_interval_ms must be between 1000 and 120000"
@@ -1603,10 +1626,7 @@ def _interview_realtime_settings(
         mapping.get("turn_shared_secret"),
         f"{label}.turn_shared_secret",
     )
-    if (
-        turn_shared_secret is not None
-        and len(turn_shared_secret.encode("utf-8")) < 32
-    ):
+    if turn_shared_secret is not None and len(turn_shared_secret.encode("utf-8")) < 32:
         raise ConfigurationError(
             "interview.realtime.turn_shared_secret must contain at least 32 bytes"
         )
@@ -1616,9 +1636,7 @@ def _interview_realtime_settings(
             "interview.realtime.turn_shared_secret must be configured exactly when TURN URLs are present"
         )
     active_signing_key = (
-        next(
-            item.key for item in keyring.keys if item.key_id == keyring.active_key_id
-        )
+        next(item.key for item in keyring.keys if item.key_id == keyring.active_key_id)
         if keyring.active_key_id is not None
         else None
     )
@@ -1648,8 +1666,10 @@ def _interview_realtime_settings(
         raise ConfigurationError(
             "interview.realtime.ice_urls require a configured realtime endpoint"
         )
-    if deployed and signaling_hostname is not None and _is_development_endpoint_host(
-        signaling_hostname
+    if (
+        deployed
+        and signaling_hostname is not None
+        and _is_development_endpoint_host(signaling_hostname)
     ):
         raise ConfigurationError(
             "interview.realtime.signaling_url cannot use a development placeholder host"
@@ -1720,16 +1740,11 @@ def _require_interview_signaling_url(
         or parsed.fragment
         or "%" in parsed.hostname
     ):
-        raise ConfigurationError(
-            f"{label} must be an exact credential-free HTTPS/WSS URL"
-        )
+        raise ConfigurationError(f"{label} must be an exact credential-free HTTPS/WSS URL")
     hostname = parsed.hostname.rstrip(".").lower()
-    development_endpoint = (
-        parsed.scheme in {"http", "ws"}
-        and (
-            (hostname == "dev.hmalliances.org" and parsed.port == 9000)
-            or (hostname in {"127.0.0.1", "localhost"} and parsed.port == 8000)
-        )
+    development_endpoint = parsed.scheme in {"http", "ws"} and (
+        (hostname == "dev.hmalliances.org" and parsed.port == 9000)
+        or (hostname in {"127.0.0.1", "localhost"} and parsed.port == 8000)
     )
     if parsed.scheme in {"http", "ws"} and (
         not allow_development_endpoint or not development_endpoint
@@ -1927,8 +1942,7 @@ def _knowledge_connection_settings(
     if not isinstance(raw_providers, list) or len(raw_providers) > 100:
         raise ConfigurationError("knowledge.connections.providers must be an array of at most 100")
     providers = tuple(
-        _knowledge_connection_provider(item, index)
-        for index, item in enumerate(raw_providers)
+        _knowledge_connection_provider(item, index) for index, item in enumerate(raw_providers)
     )
     provider_names = [provider.provider for provider in providers]
     if len(provider_names) != len(set(provider_names)):
@@ -1937,9 +1951,7 @@ def _knowledge_connection_settings(
         raise ConfigurationError(
             "knowledge.connections.providers must be empty in memory database mode"
         )
-    requires_durable_keys = (
-        bool(providers) or environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS
-    )
+    requires_durable_keys = bool(providers) or environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS
     if requires_durable_keys and (
         provider_session_keyring.active_key_id is None
         or not provider_session_keyring.keys
@@ -2068,9 +2080,7 @@ def _knowledge_connection_provider(
         if endpoint is not None:
             _require_exact_https_url(endpoint, f"{label}.{name}")
     if authorization_endpoint is not None and (token_endpoint is None or redirect_uri is None):
-        raise ConfigurationError(
-            f"{label} browser OAuth requires token_endpoint and redirect_uri"
-        )
+        raise ConfigurationError(f"{label} browser OAuth requires token_endpoint and redirect_uri")
     if redirect_uri is not None:
         _require_exact_https_url(redirect_uri, f"{label}.redirect_uri")
     if device_endpoint is not None and token_endpoint is None:
@@ -2500,9 +2510,7 @@ def _knowledge_source_network_settings(
         )
     maximum_redirects = _require_non_negative_int(mapping, "maximum_redirects")
     if maximum_redirects > 20:
-        raise ConfigurationError(
-            "knowledge.source_network.maximum_redirects must not exceed 20"
-        )
+        raise ConfigurationError("knowledge.source_network.maximum_redirects must not exceed 20")
     maximum_body_bytes = _bounded_positive_int(
         mapping,
         "maximum_body_bytes",
@@ -2588,9 +2596,7 @@ def _knowledge_search_settings(value: object) -> KnowledgeSearchSettings:
         raise ConfigurationError("knowledge.search weights must not exceed 100")
     candidate_multiplier = _require_positive_int(mapping, "candidate_multiplier")
     if not 2 <= candidate_multiplier <= 20:
-        raise ConfigurationError(
-            "knowledge.search.candidate_multiplier must be between 2 and 20"
-        )
+        raise ConfigurationError("knowledge.search.candidate_multiplier must be between 2 and 20")
     return KnowledgeSearchSettings(
         lexical_weight,
         semantic_weight,
@@ -2787,8 +2793,7 @@ def _text_secret_reuses_key_material(
     encoded_secret = secret.encode("utf-8")
     return any(
         encoded_secret == material
-        or secret
-        == base64.urlsafe_b64encode(material).rstrip(b"=").decode("ascii")
+        or secret == base64.urlsafe_b64encode(material).rstrip(b"=").decode("ascii")
         for material in materials
     )
 
@@ -2864,10 +2869,7 @@ def _unique_string_array(
         not isinstance(value, list)
         or not minimum <= len(value) <= maximum
         or any(
-            not isinstance(item, str)
-            or not item
-            or item.strip() != item
-            or "\x00" in item
+            not isinstance(item, str) or not item or item.strip() != item or "\x00" in item
             for item in value
         )
     ):
@@ -2997,10 +2999,7 @@ def _canonical_source_host_pattern(value: str) -> str:
         return literal.compressed
     labels = ascii_host.split(".")
     if any(
-        not label
-        or len(label) > 63
-        or label.startswith("-")
-        or label.endswith("-")
+        not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
         for label in labels
     ):
         raise ConfigurationError(
@@ -3128,9 +3127,7 @@ def _security_settings(
     if cursor_secret is not None and len(cursor_secret.encode("utf-8")) < 32:
         raise ConfigurationError("security.cursor_hmac_secret must contain at least 32 bytes")
     if environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS and cursor_secret is None:
-        raise ConfigurationError(
-            "security.cursor_hmac_secret is required outside development/test"
-        )
+        raise ConfigurationError("security.cursor_hmac_secret is required outside development/test")
     if (
         sensitive_idempotency_secret is not None
         and len(sensitive_idempotency_secret.encode("utf-8")) < 32
@@ -3150,15 +3147,16 @@ def _security_settings(
         and sensitive_idempotency_secret is not None
         and cursor_secret == sensitive_idempotency_secret
     ):
-        raise ConfigurationError(
-            "cursor and sensitive-idempotency HMAC secrets must be distinct"
-        )
+        raise ConfigurationError("cursor and sensitive-idempotency HMAC secrets must be distinct")
     if max_clock_skew_seconds > _MAX_TRUSTED_PROXY_CLOCK_SKEW_SECONDS:
         raise ConfigurationError(
             "security.trusted_proxy_max_clock_skew_seconds must not exceed "
             f"{_MAX_TRUSTED_PROXY_CLOCK_SKEW_SECONDS}"
         )
-    if identity_mode == "development_mock" and environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS:
+    if (
+        identity_mode == "development_mock"
+        and environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS
+    ):
         raise ConfigurationError(
             "security.identity_mode development_mock is only allowed in development/test"
         )
@@ -3167,9 +3165,7 @@ def _security_settings(
             "security.identity_mode must authenticate explicitly enabled API V1 routes"
         )
     if environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS and identity_mode != "disabled":
-        raise ConfigurationError(
-            "security.identity_mode must be disabled outside development/test"
-        )
+        raise ConfigurationError("security.identity_mode must be disabled outside development/test")
     return SecuritySettings(
         identity_mode=identity_mode,
         trusted_proxy_hmac_secret=secret,
@@ -3266,9 +3262,7 @@ def _oauth_settings(value: object, environment: str) -> OAuthSettings:
             raise ConfigurationError(
                 "oauth.legacy_access_token_accept_until must be after oauth.origin_cutover_at"
             )
-        if legacy_accept_until > origin_cutover_at + timedelta(
-            seconds=access_ttl_seconds + 30
-        ):
+        if legacy_accept_until > origin_cutover_at + timedelta(seconds=access_ttl_seconds + 30):
             raise ConfigurationError(
                 "oauth legacy access-token window must not exceed the access-token lifetime "
                 "plus clock skew"
@@ -3404,17 +3398,13 @@ def _identity_email_outbox_settings(value: object) -> IdentityEmailOutboxSetting
             "hosted_identity.email.outbox batch_size or max_attempts exceeds its hard cap"
         )
     if lease_seconds > 3_600:
-        raise ConfigurationError(
-            "hosted_identity.email.outbox.lease_seconds must not exceed 3600"
-        )
+        raise ConfigurationError("hosted_identity.email.outbox.lease_seconds must not exceed 3600")
     if retry_base_seconds > retry_cap_seconds or retry_cap_seconds > 86_400:
         raise ConfigurationError(
             "hosted_identity.email.outbox retry delays must be ordered and capped at one day"
         )
     if retention_days > 365:
-        raise ConfigurationError(
-            "hosted_identity.email.outbox.retention_days must not exceed 365"
-        )
+        raise ConfigurationError("hosted_identity.email.outbox.retention_days must not exceed 365")
     return IdentityEmailOutboxSettings(
         active_key_id=active_key_id,
         encryption_keys=tuple(keys),
@@ -3465,9 +3455,13 @@ def _valid_key_id(value: str) -> bool:
     @return 仅 portable ASCII 子集且不超过 64 字符时为真 / True for the portable subset up to 64 chars.
     """
 
-    return bool(value) and len(value) <= 64 and all(
-        character.isascii() and (character.isalnum() or character in "._-")
-        for character in value
+    return (
+        bool(value)
+        and len(value) <= 64
+        and all(
+            character.isascii() and (character.isalnum() or character in "._-")
+            for character in value
+        )
     )
 
 
@@ -3519,9 +3513,7 @@ def _hosted_identity_settings(value: object, environment: str) -> HostedIdentity
     mapping = require_mapping(value, "hosted_identity")
     demo_password_auth_enabled = mapping.get("demo_password_auth_enabled", False)
     if not isinstance(demo_password_auth_enabled, bool):
-        raise ConfigurationError(
-            "hosted_identity.demo_password_auth_enabled must be a boolean"
-        )
+        raise ConfigurationError("hosted_identity.demo_password_auth_enabled must be a boolean")
     if demo_password_auth_enabled and environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS:
         raise ConfigurationError(
             "hosted_identity.demo_password_auth_enabled is restricted to development/test"
@@ -3577,9 +3569,7 @@ def _hosted_identity_settings(value: object, environment: str) -> HostedIdentity
                 "hosted_identity.email SMTP username and password must be configured together"
             )
     if environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS and mode != "smtp":
-        raise ConfigurationError(
-            "hosted_identity.email.mode must be smtp outside development/test"
-        )
+        raise ConfigurationError("hosted_identity.email.mode must be smtp outside development/test")
 
     breach_mapping = require_mapping(
         mapping.get("password_breach"), "hosted_identity.password_breach"
@@ -3603,10 +3593,7 @@ def _hosted_identity_settings(value: object, environment: str) -> HostedIdentity
         raise ConfigurationError(
             "hosted_identity.password_breach.max_cache_entries must not exceed 65536"
         )
-    if (
-        environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS
-        and breach_mode != "pwned_passwords"
-    ):
+    if environment not in _DEVELOPMENT_IDENTITY_ENVIRONMENTS and breach_mode != "pwned_passwords":
         raise ConfigurationError(
             "hosted_identity.password_breach.mode must be pwned_passwords outside development/test"
         )

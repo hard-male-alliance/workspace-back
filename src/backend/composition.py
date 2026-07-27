@@ -801,9 +801,7 @@ async def build_container(
                 hosted_identity_repository,
                 oauth_service,
                 identity_email_runtime.sender,
-                demo_password_auth_enabled=(
-                    settings.hosted_identity.demo_password_auth_enabled
-                ),
+                demo_password_auth_enabled=(settings.hosted_identity.demo_password_auth_enabled),
                 breached_password_checker=breached_password_checker,
                 lifetime_seconds=settings.hosted_identity.flow_ttl_seconds,
                 email_code_ttl_seconds=settings.hosted_identity.email_code_ttl_seconds,
@@ -869,6 +867,7 @@ async def build_container(
             interview_runtime = _interview_runtime_for(
                 settings,
                 database=database,
+                embedder=embedding_provider,
                 memory_access_store=memory_access_store,
                 provider=provider,
                 media_store=interview_media_store,
@@ -1264,6 +1263,7 @@ def _interview_runtime_for(
     settings: BackendSettings,
     *,
     database: AsyncDatabase | None,
+    embedder: EmbeddingProvider,
     memory_access_store: InMemoryAccessStore | None,
     provider: AgentModelProvider,
     media_store: LocalInterviewMediaStore,
@@ -1299,7 +1299,11 @@ def _interview_runtime_for(
             realtime_gateway,
             realtime_gateway,
             None,
-            ProviderRealtimeInterviewCoach(provider, None),
+            ProviderRealtimeInterviewCoach(
+                provider,
+                None,
+                MemoryHybridKnowledgeSearch(()),
+            ),
         )
 
     if memory_access_store is not None:
@@ -1330,6 +1334,22 @@ def _interview_runtime_for(
         settings.network,
         environment=settings.environment,
     )
+    embedding_space = EmbeddingSpaceSelection(
+        settings.ai.embedding_provider,
+        settings.ai.embedding_model,
+        settings.ai.embedding_model_revision,
+        settings.ai.embedding_dimension,
+        settings.ai.embedding_distance_metric,
+        settings.ai.embedding_normalization,
+    )
+    realtime_knowledge_search = PostgresHybridKnowledgeSearch(
+        database,
+        embedder,
+        embedding_space,
+        lexical_weight=settings.knowledge.search.lexical_weight,
+        semantic_weight=settings.knowledge.search.semantic_weight,
+        candidate_multiplier=settings.knowledge.search.candidate_multiplier,
+    )
     worker = InterviewWorkerService(
         postgres_uow,
         ConsentAwareInterviewMediaFinalizer(media_store),
@@ -1356,7 +1376,11 @@ def _interview_runtime_for(
         realtime_gateway,
         realtime_gateway,
         media_analyzer,
-        ProviderRealtimeInterviewCoach(provider, media_analyzer),
+        ProviderRealtimeInterviewCoach(
+            provider,
+            media_analyzer,
+            realtime_knowledge_search,
+        ),
     )
 
 
@@ -1377,7 +1401,7 @@ def _interview_report_provider(
         fallback consent, so this boundary disables provider fallback rather than treating global
         configuration as user authorization.
     """
-    if settings.environment in {"development", "test"}:
+    if settings.interview.report_provider_mode == "deterministic":
         return DeterministicInterviewReportProvider(
             environment=settings.environment,
         )

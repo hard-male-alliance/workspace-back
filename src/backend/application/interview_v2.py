@@ -41,6 +41,7 @@ from backend.domain.interview_v2 import (
     EndSessionJobSpec,
     InterviewerUtteranceInput,
     InterviewJobQueuedRecord,
+    InterviewKnowledgeContext,
     InterviewMediaPreferences,
     InterviewOutboxId,
     InterviewReport,
@@ -147,6 +148,11 @@ class RealtimeCoachingContext:
     allow_barge_in: bool
     transcript: tuple[TranscriptSegment, ...]
     data_region: str
+    workspace_id: WorkspaceId
+    actor_id: UserId
+    agent_scope: str
+    knowledge_contexts: tuple[InterviewKnowledgeContext, ...]
+    job_target: JobTarget
 
 
 class _NoopInterviewMediaAnalyzer:
@@ -1112,6 +1118,11 @@ class InterviewApplicationService:
                 allow_barge_in=scenario.spec.allow_barge_in,
                 transcript=transcript[-40:],
                 data_region=session.spec.inference.data_region.value,
+                workspace_id=workspace_id,
+                actor_id=UserId(audience.id),
+                agent_scope=session.grant.agent_scope,
+                knowledge_contexts=session.grant.knowledge_contexts,
+                job_target=session.spec.job_target,
             )
 
     async def _authorize(

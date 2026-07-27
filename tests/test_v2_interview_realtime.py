@@ -19,6 +19,7 @@ from backend.application.interview_v2 import RealtimeCoachingContext
 from backend.domain.interview_v2 import (
     CandidateUtteranceInput,
     InterviewerUtteranceInput,
+    JobTarget,
     RealtimeControl,
     RealtimeControlInput,
     RealtimeInputEnvelope,
@@ -27,6 +28,7 @@ from backend.domain.interview_v2 import (
     TranscriptSegmentId,
     TranscriptSpeaker,
 )
+from backend.domain.principals import UserId, WorkspaceId
 from backend.domain.resources import ResourceRef
 
 WORKSPACE_ID = "workspace_realtime01"
@@ -146,6 +148,19 @@ class _Service:
             True,
             tuple(self.transcript),
             "global",
+            WorkspaceId(WORKSPACE_ID),
+            UserId(USER_ID),
+            "interview_coach",
+            (),
+            JobTarget(
+                "Backend Engineer",
+                None,
+                None,
+                None,
+                None,
+                None,
+                ("Python", "databases"),
+            ),
         )
 
 
