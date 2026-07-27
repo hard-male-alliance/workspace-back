@@ -24,6 +24,7 @@ from backend.infrastructure.agent_resume_proposals import validate_resume_operat
 _PROFILE = TypeAdapter(ResumeProfile)
 _SECTION = TypeAdapter(ResumeSection)
 _ITEM = TypeAdapter(ResumeItem)
+_JSON_VALUE: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 
 
 class _ClosedInput(BaseModel):
@@ -117,7 +118,7 @@ class ResumeToolSession:
         return _json_result(
             {
                 "kind": "resume_section_list",
-                "items": [
+                "items": tuple(
                     {
                         "id": section.id,
                         "kind": section.kind.value,
@@ -126,7 +127,7 @@ class ResumeToolSession:
                         "has_content": section.content is not None,
                     }
                     for section in self.context.document.sections
-                ],
+                ),
             }
         )
 
@@ -228,7 +229,7 @@ def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]
             {
                 "op": "set_field",
                 "entity_id": entity_id,
-                "field_path": field_path,
+                "field_path": tuple(field_path),
                 "value": value,
             }
         )
@@ -379,10 +380,19 @@ def tool_catalog(tools: Sequence[StructuredTool]) -> tuple[dict[str, JsonValue],
         {
             "name": tool.name,
             "description": tool.description,
-            "input_schema": _json_value(tool.tool_call_schema.model_json_schema()),
+            "input_schema": _tool_input_schema(tool),
         }
         for tool in tools
     )
+
+
+def _tool_input_schema(tool: StructuredTool) -> JsonValue:
+    schema = tool.tool_call_schema
+    if isinstance(schema, dict):
+        return _json_value(schema)
+    if hasattr(schema, "model_json_schema"):
+        return _json_value(schema.model_json_schema())
+    return _json_value(schema.schema())
 
 
 def _json_result(value: Mapping[str, JsonValue]) -> str:
@@ -390,7 +400,7 @@ def _json_result(value: Mapping[str, JsonValue]) -> str:
 
 
 def _json_value(value: object) -> JsonValue:
-    return json.loads(
+    return _JSON_VALUE.validate_json(
         json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     )
 
