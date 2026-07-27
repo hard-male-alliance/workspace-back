@@ -106,6 +106,12 @@ V2_AGENT_ENDPOINT_METHODS = (
 )
 """@brief 5.4 实际 12 个路由对应的应用方法 / Application methods for the 12 actual section-5.4 routes."""
 
+_PROVIDER_HISTORY_MESSAGE_LIMIT = 40
+"""@brief 单次模型请求携带的最近会话消息上限 / Recent conversation-message limit sent to one model request."""
+
+_PROVIDER_HISTORY_SCAN_LIMIT = 2_000
+"""@brief 为取得最近消息最多扫描的有界消息数 / Bounded number of messages scanned for recent history."""
+
 
 class Clock(Protocol):
     """@brief 应用层可替换时钟 / Replaceable application clock."""
@@ -1199,6 +1205,9 @@ class _PreparedAgentExecution:
     input_message: Message
     """@brief 精确用户输入 / Exact user input."""
 
+    conversation_history: tuple[Message, ...]
+    """@brief 同一会话中位于当前输入前的最近消息 / Recent same-conversation messages preceding the input."""
+
     resume_context: AgentResumeContext | None
     """@brief 可选精确 Resume SIR / Optional exact Resume SIR."""
 
@@ -1337,6 +1346,12 @@ class AgentWorkerService:
                     workspace_id,
                     run,
                 )
+                conversation_history = await _load_provider_conversation_history(
+                    uow,
+                    workspace_id,
+                    run.spec.conversation_id,
+                    input_message,
+                )
                 grant = await _refresh_execution_grant(
                     uow,
                     dispatch.actor_id,
@@ -1408,6 +1423,7 @@ class AgentWorkerService:
                     started_run,
                     started_job,
                     input_message,
+                    conversation_history,
                     resume_context,
                 )
         except AgentCasMismatch as error:
@@ -1485,6 +1501,7 @@ class AgentWorkerService:
             input_message=prepared.input_message,
             knowledge_evidence=evidence,
             resume_context=prepared.resume_context,
+            conversation_history=prepared.conversation_history,
         )
 
     async def _commit_provider_outcome(
@@ -2179,6 +2196,46 @@ async def _worker_run_input(
             "agent run input message is missing or invalid",
         )
     return conversation, input_message
+
+
+async def _load_provider_conversation_history(
+    uow: AgentUnitOfWork,
+    workspace_id: WorkspaceId,
+    conversation_id: ConversationId,
+    input_message: Message,
+) -> tuple[Message, ...]:
+    """Load a bounded, ordered history snapshot from the exact Run conversation."""
+
+    collected: list[Message] = []
+    after: str | None = None
+    remaining = _PROVIDER_HISTORY_SCAN_LIMIT
+    while remaining > 0:
+        page_limit = min(200, remaining)
+        page = await uow.repository.list_messages(
+            workspace_id,
+            conversation_id,
+            AgentPageRequest(page_limit, after),
+        )
+        if any(
+            item.workspace_id != workspace_id or item.conversation_id != conversation_id
+            for item in page.items
+        ):
+            raise AgentPortProtocolError(
+                "agent.repository_scope_violation",
+                "message repository returned history outside the Run conversation",
+            )
+        collected.extend(
+            item
+            for item in page.items
+            if item.sequence < input_message.sequence
+            and item.role in {MessageRole.USER, MessageRole.ASSISTANT}
+        )
+        remaining -= len(page.items)
+        if page.next_position is None or not page.items:
+            break
+        after = page.next_position
+    ordered = sorted(collected, key=lambda item: (item.sequence, item.meta.id))
+    return tuple(ordered[-_PROVIDER_HISTORY_MESSAGE_LIMIT:])
 
 
 async def _refresh_execution_grant(

@@ -965,6 +965,7 @@ class AgentProviderRequest:
     input_message: Message
     knowledge_evidence: tuple[AgentKnowledgeEvidence, ...] = ()
     resume_context: AgentResumeContext | None = None
+    conversation_history: tuple[Message, ...] = ()
 
     def __post_init__(self) -> None:
         """@brief 校验输入消息与 Run 请求一致 / Validate input Message against the Run request."""
@@ -974,6 +975,23 @@ class AgentProviderRequest:
             or self.input_message.role is not MessageRole.USER
         ):
             raise AgentDomainError("provider request requires the exact user input message")
+        if len(self.conversation_history) > 40:
+            raise AgentDomainError("provider conversation history cannot exceed 40 messages")
+        history_order = tuple(item.sequence for item in self.conversation_history)
+        if history_order != tuple(sorted(history_order)) or len(set(history_order)) != len(
+            history_order
+        ):
+            raise AgentDomainError("provider conversation history must be strictly ordered")
+        if any(
+            item.workspace_id != self.input_message.workspace_id
+            or item.conversation_id != self.input_message.conversation_id
+            or item.sequence >= self.input_message.sequence
+            or item.role not in {MessageRole.USER, MessageRole.ASSISTANT}
+            for item in self.conversation_history
+        ):
+            raise AgentDomainError(
+                "provider conversation history exceeds the exact conversation boundary"
+            )
         labels = tuple(item.label for item in self.knowledge_evidence)
         if labels != tuple(range(len(labels))):
             raise AgentDomainError("provider evidence labels must be contiguous from zero")
@@ -1075,7 +1093,10 @@ class AgentProviderCompleted:
             raise AgentDomainError("provider returned unrequested Proposal references")
         if (AgentOutputMode.TEXT in allowed) != (text_count == 1):
             raise AgentDomainError("provider must return exactly one requested text output")
-        if (AgentOutputMode.CITATIONS in allowed) != bool(citations):
+        wants_citations = AgentOutputMode.CITATIONS in allowed
+        if (not wants_citations and citations) or (
+            wants_citations and request.knowledge_evidence and not citations
+        ):
             raise AgentDomainError("provider must return every requested citation output")
         if len(set(citations)) != len(citations):
             raise AgentDomainError("provider citation selections must be unique")

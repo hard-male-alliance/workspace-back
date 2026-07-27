@@ -104,7 +104,11 @@ class CapabilityBlindProvider:
         yield "{}"
 
 
-def _request(*, modes: tuple[AgentOutputMode, ...]) -> AgentProviderRequest:
+def _request(
+    *,
+    modes: tuple[AgentOutputMode, ...],
+    with_evidence: bool = True,
+) -> AgentProviderRequest:
     """构造已授权 provider request。"""
     conversation_id = ConversationId("conversation_provider_0001")
     message_id = MessageId("message_provider_0001")
@@ -173,7 +177,7 @@ def _request(*, modes: tuple[AgentOutputMode, ...]) -> AgentProviderRequest:
         spec,
         grant,
         message,
-        evidence if wants_citations else (),
+        evidence if wants_citations and with_evidence else (),
     )
 
 
@@ -203,6 +207,57 @@ async def test_streaming_provider_returns_public_text_and_integer_metering() -> 
 
 
 @pytest.mark.asyncio
+async def test_provider_receives_bounded_prior_user_and_assistant_messages() -> None:
+    """同一会话历史进入独立可信边界，且不会与当前用户指令混写。"""
+    delegate = RecordingStreamProvider()
+    provider = StreamingTextAgentProvider(
+        delegate,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+    request = _request(modes=(AgentOutputMode.TEXT,))
+    current = replace(request.input_message, sequence=3)
+    prior_user = Message(
+        ResourceMeta(MessageId("message_provider_history_user"), 1, NOW, NOW),
+        WORKSPACE_ID,
+        current.conversation_id,
+        1,
+        MessageRole.USER,
+        None,
+        (TextContentPart("我有三年前端开发经验"),),
+    )
+    prior_assistant = Message(
+        ResourceMeta(MessageId("message_provider_history_assistant"), 1, NOW, NOW),
+        WORKSPACE_ID,
+        current.conversation_id,
+        2,
+        MessageRole.ASSISTANT,
+        prior_user.meta.id,
+        (TextContentPart("可以先整理项目经历"),),
+        AgentRunId("agent_run_provider_history"),
+    )
+
+    await provider.execute(
+        replace(
+            request,
+            input_message=current,
+            conversation_history=(prior_user, prior_assistant),
+        )
+    )
+
+    assert delegate.calls[0][0] == "hello"
+    messages = delegate.calls[0][1]["messages"]
+    assert isinstance(messages, list)
+    history = json.loads(messages[0]["content"])
+    assert history["kind"] == "authorized_conversation_history"
+    assert history["items"] == [
+        {"role": "user", "text": "我有三年前端开发经验"},
+        {"role": "assistant", "text": "可以先整理项目经历"},
+    ]
+    assert "suggestions, not independent facts" in history["instruction"]
+
+
+@pytest.mark.asyncio
 async def test_text_adapter_fails_explicitly_when_text_was_not_requested() -> None:
     """不能以文本假冒 citation-only 请求。"""
     provider = StreamingTextAgentProvider(
@@ -223,6 +278,30 @@ async def test_text_adapter_fails_explicitly_when_text_was_not_requested() -> No
 
     assert captured.value.problem.code == "agent.provider_protocol_error"
     assert captured.value.problem.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_requested_citations_allow_empty_result_when_retrieval_found_no_evidence() -> None:
+    """已授权来源检索无命中时允许空引用，不把正常无结果伪装成 Provider 失败。"""
+
+    provider = StreamingTextAgentProvider(
+        RecordingStreamProvider(
+            {
+                "protocol_version": "agent.output.strict_json.v1",
+                "text": None,
+                "citation_indices": [],
+                "resume_proposal": None,
+            }
+        ),
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+    request = _request(modes=(AgentOutputMode.CITATIONS,), with_evidence=False)
+
+    outcome = await provider.execute(request)
+    assert isinstance(outcome, AgentProviderCompleted)
+    outcome.validate_for(request)
+    assert outcome.content == ()
 
 
 @pytest.mark.asyncio

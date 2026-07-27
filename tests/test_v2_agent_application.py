@@ -460,11 +460,12 @@ class FakeProvider:
         self.state = state
         self.outcome = outcome
         self.calls = 0
+        self.requests: list[AgentProviderRequest] = []
 
-    async def execute(self, request: object) -> object:
-        del request
+    async def execute(self, request: AgentProviderRequest) -> object:
         assert self.state.active_transactions == 0
         self.calls += 1
+        self.requests.append(request)
         return self.outcome
 
 
@@ -1207,6 +1208,62 @@ async def test_provider_network_io_occurs_outside_transactions_and_completion_ap
     assert output.source_run_id == run.meta.id
     assert provider.calls == 1
     assert state.active_transactions == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_supplies_prior_same_conversation_messages_to_provider() -> None:
+    """当前输入前的历史消息会随 Run 进入 provider，当前消息本身不会重复。"""
+    state = State()
+    ids = DeterministicIds()
+    service = _service(state, ids)
+    conversation = await service.create_conversation(
+        PRINCIPAL,
+        WORKSPACE,
+        CreateConversationCommand(ConversationCapability.GENERAL, "history"),
+        CONTEXT,
+    )
+    first = await service.create_message(
+        PRINCIPAL,
+        WORKSPACE,
+        conversation.meta.id,
+        CreateMessageCommand(None, (TextContentPart("我有三年前端开发经验"),)),
+        expected_conversation_revision=1,
+        context=CONTEXT,
+    )
+    second = await service.create_message(
+        PRINCIPAL,
+        WORKSPACE,
+        conversation.meta.id,
+        CreateMessageCommand(first.meta.id, (TextContentPart("请根据以上资料继续"),)),
+        expected_conversation_revision=2,
+        context=CONTEXT,
+    )
+    run = await service.create_agent_run(
+        PRINCIPAL,
+        WORKSPACE,
+        _spec(conversation.meta.id, second.meta.id),
+        CONTEXT,
+    )
+    provider = FakeProvider(
+        state,
+        AgentProviderCompleted(
+            (TextContentPart("好的"),),
+            (),
+            AgentUsage(3, 2, "5"),
+        ),
+    )
+    worker = AgentWorkerService(
+        FakeWorkerUowFactory(state),
+        provider,  # type: ignore[arg-type]
+        FakeToolExecutor(state),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+
+    await worker.execute_run(_queued_dispatch(state, run.meta.id))
+
+    assert provider.requests[0].input_message == second
+    assert provider.requests[0].conversation_history == (first,)
 
 
 @pytest.mark.asyncio
