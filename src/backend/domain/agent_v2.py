@@ -606,7 +606,7 @@ class AgentToolInvocationTrace:
             or len(self.tool_name) > 101
             or self.argument_keys != tuple(sorted(set(self.argument_keys)))
             or any(not key or len(key) > 100 for key in self.argument_keys)
-            or self.status not in {"completed", "decision_required"}
+            or self.status not in {"completed", "invalid", "failure", "decision_required"}
             or isinstance(self.duration_ms, bool)
             or not 0 <= self.duration_ms <= 3_600_000
         ):

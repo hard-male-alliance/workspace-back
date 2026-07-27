@@ -355,6 +355,7 @@ class PostgresAgentResumeProposalBoundary:
             command.proposal_ref.id if command.proposal_ref is not None else None
         )
         for invocation in command.invocations:
+            persisted_status = _persisted_invocation_status(invocation.status)
             invocation_id = _stable_id(
                 "toolinv",
                 f"{command.run_id}:{invocation.ordinal}",
@@ -383,7 +384,7 @@ class PostgresAgentResumeProposalBoundary:
                     or existing.tool_name != invocation.tool_name
                     or existing.arguments != arguments
                     or existing.result != result
-                    or existing.status != invocation.status
+                    or existing.status != persisted_status
                     or existing.proposal_id != bound_proposal_id
                 ):
                     raise _proposal_failure(
@@ -403,7 +404,7 @@ class PostgresAgentResumeProposalBoundary:
                     tool_name=invocation.tool_name,
                     arguments=arguments,
                     result=result,
-                    status=invocation.status,
+                    status=persisted_status,
                     proposal_id=bound_proposal_id,
                     created_at=command.created_at,
                     updated_at=command.created_at,
@@ -411,6 +412,12 @@ class PostgresAgentResumeProposalBoundary:
                     extensions={},
                 )
             )
+
+
+def _persisted_invocation_status(status: str) -> str:
+    """Map richer provider diagnostics onto the closed database status contract."""
+
+    return "failed" if status in {"invalid", "failure"} else status
 
 
 class UnavailableAgentResumeProposalBoundary:
@@ -549,6 +556,18 @@ def _materialize_operations(
             )
         operations.append(operation)
     return tuple(operations)
+
+
+def validate_resume_operation_drafts(
+    validation_id: str,
+    base: AgentResumeContext,
+    drafts: Sequence[AgentResumeOperationDraft],
+) -> tuple[ResumeOperation, ...]:
+    """Materialize and preview a draft prefix without persistence or Resume mutation."""
+
+    operations = _materialize_operations(validation_id, base, drafts)
+    preview_resume_operations(base.document, operations)
+    return operations
 
 
 def _register_new_entity(

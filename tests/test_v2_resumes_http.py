@@ -656,6 +656,7 @@ def test_proposal_list_detail_and_decision_are_workspace_bound_and_replayable() 
                     "Staff Systems Researcher",
                 ),
             ),
+            source_agent_run_id="run_http_000001",
         )
         harness.factory.store.proposals[(WORKSPACE_ID, proposal_id)] = proposal
 
@@ -685,6 +686,19 @@ def test_proposal_list_detail_and_decision_are_workspace_bound_and_replayable() 
         assert decision.status_code == 200
         assert decision.json()["resume"]["title"] == "Staff Systems Researcher"
         harness.validator.validate_definition("ResumeOperationResult", decision.json())
+        continuation_events = [
+            event
+            for event in harness.factory.store.outbox_events.values()
+            if event.event_type == "agent.proposal_decision.recorded"
+        ]
+        assert len(continuation_events) == 1
+        assert continuation_events[0].data == {
+            "actor_id": str(USER_ID),
+            "run_id": "run_http_000001",
+            "decision": "accept",
+            "resume_id": str(resume_id),
+            "resume_revision": 2,
+        }
 
         replay = harness.client.post(
             f"/api/v2/workspaces/{WORKSPACE_ID}/resume-proposals/{proposal_id}/decisions",
@@ -711,6 +725,57 @@ def test_proposal_list_detail_and_decision_are_workspace_bound_and_replayable() 
         )
         assert hidden.status_code == 404
         assert hidden.json()["code"] == "resource.not_found"
+
+
+def test_agent_proposal_rejection_emits_continuation_without_changing_resume() -> None:
+    """Rejecting an Agent Proposal must resume the Run without applying operations."""
+
+    with _harness() as harness:
+        created = _create_resume(harness)
+        resume_id = ResumeId(created.json()["id"])
+        proposal_id = ResumeProposalId("proposal_http_reject1")
+        harness.factory.store.proposals[(WORKSPACE_ID, proposal_id)] = ResumeProposal(
+            ResourceMeta(proposal_id, 1, NOW, NOW),
+            WORKSPACE_ID,
+            resume_id,
+            1,
+            "Reject title",
+            ResumeProposalStatus.PENDING,
+            (
+                SetResumeField(
+                    ResumeOperationId("operation_http_reject1"),
+                    str(resume_id),
+                    ("title",),
+                    "Rejected title",
+                ),
+            ),
+            source_agent_run_id="run_http_reject01",
+        )
+        detail = harness.client.get(
+            f"/api/v2/workspaces/{WORKSPACE_ID}/resume-proposals/{proposal_id}",
+            headers=_headers(),
+        )
+
+        decision = harness.client.post(
+            f"/api/v2/workspaces/{WORKSPACE_ID}/resume-proposals/{proposal_id}/decisions",
+            headers=_headers(
+                idempotency_key="proposal-decision-reject-0001",
+                etag=detail.headers["etag"],
+            ),
+            json={"decision": "reject", "accepted_operation_ids": []},
+        )
+
+        assert decision.status_code == 200
+        assert decision.json()["resume"]["revision"] == 1
+        assert decision.json()["resume"]["title"] != "Rejected title"
+        continuation_events = [
+            event
+            for event in harness.factory.store.outbox_events.values()
+            if event.event_type == "agent.proposal_decision.recorded"
+        ]
+        assert len(continuation_events) == 1
+        assert continuation_events[0].data["decision"] == "reject"
+        assert continuation_events[0].data["resume_revision"] == 1
 
 
 def test_strict_schema_scope_query_body_depth_and_cursor_boundaries_fail_closed() -> None:

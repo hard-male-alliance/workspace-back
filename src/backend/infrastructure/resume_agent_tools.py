@@ -18,7 +18,8 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from backend.domain.agent_v2 import AgentResumeContext, AgentResumeOperationDraft
 from backend.domain.platform import JsonValue
-from backend.domain.resumes import ResumeItem, ResumeProfile, ResumeSection
+from backend.domain.resumes import ResumeDomainError, ResumeItem, ResumeProfile, ResumeSection
+from backend.infrastructure.agent_resume_proposals import validate_resume_operation_drafts
 
 _PROFILE = TypeAdapter(ResumeProfile)
 _SECTION = TypeAdapter(ResumeSection)
@@ -44,6 +45,11 @@ class _ItemInput(_ClosedInput):
 class _SetFieldInput(_ClosedInput):
     entity_id: str = Field(min_length=1, max_length=160)
     field_path: list[str] = Field(min_length=1, max_length=16)
+    value: JsonValue
+
+
+class _SetProfileFieldInput(_ClosedInput):
+    field: str = Field(pattern=r"^(full_name|headline|summary|contacts)$")
     value: JsonValue
 
 
@@ -162,7 +168,27 @@ class ResumeToolSession:
             raise ValueError("Resume proposal was already submitted for decision")
         if len(self._drafts) >= 200:
             raise ValueError("Resume proposal cannot exceed 200 operations")
-        self._drafts.append(AgentResumeOperationDraft(payload))
+        candidate = AgentResumeOperationDraft(payload)
+        try:
+            validate_resume_operation_drafts(
+                f"validate:{self.context.resume_ref.id}",
+                self.context,
+                (*self._drafts, candidate),
+            )
+        except (TypeError, ValueError) as error:
+            code = (
+                error.code
+                if isinstance(error, ResumeDomainError)
+                else "resume.operation_invalid"
+            )
+            return _json_result(
+                {
+                    "kind": "invalid_draft",
+                    "code": code,
+                    "recoverable": True,
+                }
+            )
+        self._drafts.append(candidate)
         return _json_result(
             {
                 "kind": "resume_change_staged",
@@ -186,6 +212,16 @@ class ResumeToolSession:
 
 def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]:
     """Build the small LangChain instruction set for an authorized Run."""
+
+    def set_profile_field(field: str, value: JsonValue) -> str:
+        return session.stage(
+            {
+                "op": "set_field",
+                "entity_id": str(session.context.document.meta.id),
+                "field_path": ("profile", field),
+                "value": value,
+            }
+        )
 
     def set_field(entity_id: str, field_path: list[str], value: JsonValue) -> str:
         return session.stage(
@@ -278,6 +314,15 @@ def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]
             name="resume_read_item",
             description="Read one Resume item by semantic item ID.",
             args_schema=_ItemInput,
+        ),
+        StructuredTool.from_function(
+            func=set_profile_field,
+            name="resume_draft_set_profile_field",
+            description=(
+                "Stage one candidate profile field replacement for user review; "
+                "the Resume root identity is bound by the server and does not write."
+            ),
+            args_schema=_SetProfileFieldInput,
         ),
         StructuredTool.from_function(
             func=set_field,

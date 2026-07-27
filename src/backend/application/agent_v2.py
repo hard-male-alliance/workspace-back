@@ -2538,7 +2538,56 @@ async def _load_provider_conversation_history(
         if page.next_position is None or not page.items:
             break
         after = page.next_position
-    ordered = sorted(collected, key=lambda item: (item.sequence, item.meta.id))
+    runs: list[AgentRun] = []
+    run_after: str | None = None
+    remaining_runs = _PROVIDER_HISTORY_SCAN_LIMIT
+    while remaining_runs > 0:
+        page_limit = min(200, remaining_runs)
+        run_page = await uow.repository.list_runs_for_conversation(
+            workspace_id,
+            conversation_id,
+            AgentPageRequest(page_limit, run_after),
+        )
+        runs.extend(run_page.items)
+        remaining_runs -= len(run_page.items)
+        if run_page.next_position is None or not run_page.items:
+            break
+        run_after = run_page.next_position
+
+    eligible_statuses = {
+        AgentRunStatus.SUCCEEDED,
+        AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
+    }
+    runs_by_input: dict[MessageId, list[AgentRun]] = {}
+    for run in runs:
+        if (
+            run.workspace_id != workspace_id
+            or run.spec.conversation_id != conversation_id
+        ):
+            raise AgentPortProtocolError(
+                "agent.repository_scope_violation",
+                "run repository returned history outside the Run conversation",
+            )
+        runs_by_input.setdefault(run.spec.input_message_id, []).append(run)
+
+    def belongs_to_complete_turn(message: Message) -> bool:
+        if message.role is MessageRole.USER:
+            linked_runs = runs_by_input.get(message.meta.id)
+            return linked_runs is None or any(
+                run.view.status in eligible_statuses for run in linked_runs
+            )
+        if message.source_run_id is None:
+            return False
+        return any(
+            run.meta.id == message.source_run_id
+            and run.view.status in eligible_statuses
+            for run in runs
+        )
+
+    ordered = sorted(
+        (item for item in collected if belongs_to_complete_turn(item)),
+        key=lambda item: (item.sequence, item.meta.id),
+    )
     return tuple(ordered[-_PROVIDER_HISTORY_MESSAGE_LIMIT:])
 
 

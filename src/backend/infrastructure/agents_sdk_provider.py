@@ -277,6 +277,7 @@ class OpenAIAgentsSDKProvider:
         tool_name: str,
         outcome: str,
         duration_ms: float,
+        diagnostic_attributes: Mapping[str, str | int | float | bool] | None = None,
     ) -> None:
         if self._telemetry is None:
             return
@@ -285,6 +286,8 @@ class OpenAIAgentsSDKProvider:
             "operation": tool_name,
             "outcome": outcome,
         }
+        if diagnostic_attributes is not None:
+            attributes.update(diagnostic_attributes)
         scope = _scope(request)
         request_id = str(request.run_id)
         self._telemetry.record_metric(
@@ -403,6 +406,7 @@ def _sdk_tools(
             name: str = tool_name,
         ) -> str:
             started = perf_counter()
+            arguments: object = {}
             try:
                 arguments = json.loads(arguments_json)
                 if name == _PROPOSAL_TOOL:
@@ -419,16 +423,60 @@ def _sdk_tools(
                 else:
                     result = await delegate.ainvoke(arguments)
             except BaseException:
-                recorder(request, name, "failure", (perf_counter() - started) * 1000)
+                duration = (perf_counter() - started) * 1000
+                argument_keys = (
+                    tuple(sorted(arguments))
+                    if isinstance(arguments, dict)
+                    else ()
+                )
+                recorder(request, name, "failure", duration)
+                traces.append(
+                    AgentToolInvocationTrace(
+                        ordinal_offset + len(traces) + 1,
+                        name,
+                        argument_keys,
+                        "failure",
+                        duration,
+                    )
+                )
                 raise
             duration = (perf_counter() - started) * 1000
-            recorder(request, name, "success", duration)
+            argument_keys = (
+                tuple(sorted(arguments))
+                if isinstance(arguments, dict)
+                else ()
+            )
+            result_kind: str | None = None
+            result_code: str | None = None
+            try:
+                decoded_result = json.loads(result)
+                if isinstance(decoded_result, dict):
+                    raw_kind = decoded_result.get("kind")
+                    raw_code = decoded_result.get("code")
+                    result_kind = raw_kind if isinstance(raw_kind, str) else None
+                    result_code = raw_code if isinstance(raw_code, str) else None
+            except (TypeError, json.JSONDecodeError):
+                pass
+            trace_status = "invalid" if result_kind == "invalid_draft" else "completed"
+            diagnostic_attributes: dict[str, str | int | float | bool] = {
+                "validation_phase": "draft" if trace_status == "invalid" else "tool",
+                "draft_count": len(session.drafts),
+            }
+            if result_code is not None:
+                diagnostic_attributes["domain_code"] = result_code
+            recorder(
+                request,
+                name,
+                trace_status,
+                duration,
+                diagnostic_attributes,
+            )
             traces.append(
                 AgentToolInvocationTrace(
                     ordinal_offset + len(traces) + 1,
                     name,
-                    tuple(sorted(arguments)),
-                    "completed",
+                    argument_keys,
+                    trace_status,
                     duration,
                 )
             )

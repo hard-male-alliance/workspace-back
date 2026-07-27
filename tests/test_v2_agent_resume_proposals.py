@@ -35,7 +35,10 @@ from backend.domain.resumes import (
     preview_resume_operations,
 )
 from backend.infrastructure.access import InMemoryAccessStore
-from backend.infrastructure.agent_resume_proposals import _materialize_operations
+from backend.infrastructure.agent_resume_proposals import (
+    _materialize_operations,
+    _persisted_invocation_status,
+)
 from backend.infrastructure.agent_v2 import (
     InMemoryAgentPolicyStore,
     InMemoryAgentStore,
@@ -186,6 +189,24 @@ def test_materialization_validates_all_six_operations_and_derives_stable_ids() -
     assert temporary_item_two not in serialized
     assert preview.sections[0].items[0].title == "Senior Backend Engineer"
     assert len(preview.sections[0].items) == 1
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "persisted_status"),
+    (
+        ("completed", "completed"),
+        ("decision_required", "decision_required"),
+        ("invalid", "failed"),
+        ("failure", "failed"),
+    ),
+)
+def test_tool_diagnostic_status_matches_closed_persistence_contract(
+    provider_status: str,
+    persisted_status: str,
+) -> None:
+    """Richer provider outcomes must not violate the existing database constraint."""
+
+    assert _persisted_invocation_status(provider_status) == persisted_status
 
 
 @pytest.mark.parametrize(

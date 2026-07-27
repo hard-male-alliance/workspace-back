@@ -58,8 +58,9 @@ def _context() -> AgentResumeContext:
 def test_prompt_is_a_resource_and_assigns_orchestration_to_the_agent() -> None:
     prompt = render_resume_agent_system_prompt(response_locale="zh-CN")
 
-    assert "client only transports messages" in prompt
+    assert "client does not classify intent" in prompt
     assert "ProposalDecision" in prompt
+    assert "`resume_draft_set_profile_field`" in prompt
     assert "`resume_draft_upsert_section`" in prompt
     assert "`resume_request_proposal_decision`" in prompt
     assert "tmp_section_projects_01" in prompt
@@ -67,6 +68,9 @@ def test_prompt_is_a_resource_and_assigns_orchestration_to_the_agent() -> None:
     assert '"kind":"project"' in prompt
     assert '"visible":true,"content":null,"items"' in prompt
     assert "conversation only; no tool and no proposal" in prompt
+    assert "no Resume root ID is supplied or guessed" in prompt
+    assert '"kind":"invalid_draft"' in prompt
+    assert "do not retry or continue the earlier failed edit" in prompt
     assert "ask before staging any change" in prompt
     assert "Respond in zh-CN" in prompt
 
@@ -77,7 +81,7 @@ async def test_tools_hide_run_metadata_and_stage_small_operations() -> None:
     tools = {tool.name: tool for tool in resume_agent_tools(session)}
     catalog = tool_catalog(tuple(tools.values()))
 
-    assert len(tools) == 11
+    assert len(tools) == 12
     assert all(
         "workspace_id" not in str(item)
         and "resume_id" not in str(item)
@@ -89,6 +93,32 @@ async def test_tools_hide_run_metadata_and_stage_small_operations() -> None:
     profile = await tools["resume_read_profile"].ainvoke({})
     assert '"kind":"resume_profile"' in profile
 
+    staged_profile = await tools["resume_draft_set_profile_field"].ainvoke(
+        {
+            "field": "full_name",
+            "value": "Klee",
+        }
+    )
+    assert staged_profile == '{"kind":"resume_change_staged","operation_number":1}'
+    assert session.drafts[0].payload == {
+        "op": "set_field",
+        "entity_id": "resume_tool_test",
+        "field_path": ("profile", "full_name"),
+        "value": "Klee",
+    }
+
+    invalid = await tools["resume_draft_set_field"].ainvoke(
+        {
+            "entity_id": "section_does_not_exist",
+            "field_path": ["title"],
+            "value": "Invalid",
+        }
+    )
+    assert invalid == (
+        '{"kind":"invalid_draft","code":"resume.entity_not_found","recoverable":true}'
+    )
+    assert len(session.drafts) == 1
+
     staged = await tools["resume_draft_set_field"].ainvoke(
         {
             "entity_id": "resume_tool_test",
@@ -96,12 +126,12 @@ async def test_tools_hide_run_metadata_and_stage_small_operations() -> None:
             "value": "A better title",
         }
     )
-    assert staged == '{"kind":"resume_change_staged","operation_number":1}'
-    assert session.drafts[0].payload["op"] == "set_field"
-    assert "operation_id" not in session.drafts[0].payload
+    assert staged == '{"kind":"resume_change_staged","operation_number":2}'
+    assert session.drafts[1].payload["op"] == "set_field"
+    assert "operation_id" not in session.drafts[1].payload
 
     decision = await tools["resume_request_proposal_decision"].ainvoke(
         {"title": "Improve the Resume title"}
     )
-    assert decision == '{"kind":"proposal_decision_required","operation_count":1}'
+    assert decision == '{"kind":"proposal_decision_required","operation_count":2}'
     assert session.proposal_title == "Improve the Resume title"
