@@ -716,6 +716,12 @@ def test_proposal_list_detail_and_decision_are_workspace_bound_and_replayable() 
         assert decision.status_code == 200
         assert decision.json()["resume"]["title"] == "Staff Systems Researcher"
         harness.validator.validate_definition("ResumeOperationResult", decision.json())
+        current = harness.client.get(
+            f"/api/v2/workspaces/{WORKSPACE_ID}/resumes/{resume_id}",
+            headers=_headers(),
+        )
+        assert current.status_code == 200
+        assert decision.headers["etag"] == current.headers["etag"]
         continuation_events = [
             event
             for event in harness.factory.store.outbox_events.values()
