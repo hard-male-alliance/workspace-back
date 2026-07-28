@@ -1406,8 +1406,8 @@ async def test_controlled_provider_failure_persists_content_free_tool_traces() -
 
 
 @pytest.mark.asyncio
-async def test_failed_run_input_is_excluded_from_later_provider_history() -> None:
-    """失败编辑输入不能在后续普通对话中被当成仍待执行的指令。"""
+async def test_failed_run_input_is_preserved_in_later_provider_history() -> None:
+    """@brief 失败 Run 的用户信息仍应进入后续上下文 / Preserve failed-Run user input in later context."""
 
     state = State()
     ids = DeterministicIds()
@@ -1483,7 +1483,7 @@ async def test_failed_run_input_is_excluded_from_later_provider_history() -> Non
     await worker.execute_run(_queued_dispatch(state, current_run.meta.id))
 
     assert provider.requests[0].input_message == current_input
-    assert provider.requests[0].conversation_history == ()
+    assert provider.requests[0].conversation_history == (failed_input,)
 
 
 @pytest.mark.asyncio

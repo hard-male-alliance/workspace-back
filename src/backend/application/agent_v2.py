@@ -2505,7 +2505,15 @@ async def _load_provider_conversation_history(
     conversation_id: ConversationId,
     input_message: Message,
 ) -> tuple[Message, ...]:
-    """Load a bounded, ordered history snapshot from the exact Run conversation."""
+    """@brief 加载有界且有序的精确会话历史 / Load bounded, ordered history from the exact conversation.
+
+    @param uow 当前工作单元 / Current unit of work.
+    @param workspace_id Run 所属 Workspace / Workspace owning the Run.
+    @param conversation_id Run 所属 Conversation / Conversation owning the Run.
+    @param input_message 当前 Run 的用户输入 / User input of the current Run.
+    @return 保留全部既往用户消息、仅保留可靠助手输出的历史 / History preserving all prior user messages and only reliable assistant output.
+    @note Run 失败只表示执行未完成，不会使用户提供的信息失效 / A failed Run means execution did not complete; it does not invalidate user-provided information.
+    """
 
     collected: list[Message] = []
     after: str | None = None
@@ -2555,7 +2563,6 @@ async def _load_provider_conversation_history(
         AgentRunStatus.SUCCEEDED,
         AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
     }
-    runs_by_input: dict[MessageId, list[AgentRun]] = {}
     for run in runs:
         if (
             run.workspace_id != workspace_id
@@ -2565,14 +2572,15 @@ async def _load_provider_conversation_history(
                 "agent.repository_scope_violation",
                 "run repository returned history outside the Run conversation",
             )
-        runs_by_input.setdefault(run.spec.input_message_id, []).append(run)
 
-    def belongs_to_complete_turn(message: Message) -> bool:
+    def belongs_to_reliable_history(message: Message) -> bool:
+        """@brief 判断消息能否安全进入后续上下文 / Decide whether a message is safe for later context.
+
+        @param message 候选历史消息 / Candidate history message.
+        @return 用户消息始终保留；助手消息仅在来源 Run 可靠时保留 / Always retain user messages; retain assistant messages only from reliable Runs.
+        """
         if message.role is MessageRole.USER:
-            linked_runs = runs_by_input.get(message.meta.id)
-            return linked_runs is None or any(
-                run.view.status in eligible_statuses for run in linked_runs
-            )
+            return True
         if message.source_run_id is None:
             return False
         return any(
@@ -2582,7 +2590,7 @@ async def _load_provider_conversation_history(
         )
 
     ordered = sorted(
-        (item for item in collected if belongs_to_complete_turn(item)),
+        (item for item in collected if belongs_to_reliable_history(item)),
         key=lambda item: (item.sequence, item.meta.id),
     )
     recent = ordered[-_PROVIDER_HISTORY_MESSAGE_LIMIT:]
