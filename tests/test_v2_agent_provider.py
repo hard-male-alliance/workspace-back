@@ -59,10 +59,27 @@ from backend.domain.resumes import (
     TemplateZonePolicy,
     create_resume_document,
 )
-from backend.infrastructure.agents_sdk_provider import OpenAIAgentsSDKProvider
+from backend.infrastructure.agents_sdk_provider import (
+    OpenAIAgentsSDKProvider,
+    _checkpoint_tool_call_count,
+)
 
 NOW = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
 WORKSPACE_ID = WorkspaceId("workspace_provider_0001")
+
+
+def test_persisted_checkpoint_preserves_tool_ordinal_offset() -> None:
+    """@brief JSONB 数组仍须计入既有工具序号 / Count persisted JSONB arrays in the tool ordinal offset."""
+
+    assert _checkpoint_tool_call_count(
+        {
+            "generated_items": [
+                {"type": "tool_call_item"},
+                {"type": "tool_call_output_item"},
+                {"type": "tool_call_item"},
+            ]
+        }
+    ) == 2
 
 
 def _text_response(text: str, response_id: str) -> ModelResponse:

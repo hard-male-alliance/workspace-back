@@ -915,7 +915,7 @@ def _checkpoint_tool_call_count(
     if state is None:
         return 0
     items = state.get("generated_items")
-    if not isinstance(items, tuple):
+    if not isinstance(items, (list, tuple)):
         return 0
     return sum(
         isinstance(item, Mapping) and item.get("type") == "tool_call_item"
