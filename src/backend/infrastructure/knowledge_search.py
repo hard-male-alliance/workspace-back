@@ -7,6 +7,7 @@ dense 使用 pgvector cosine distance，最终在有界候选集上做可解释�
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -154,8 +155,23 @@ class PostgresHybridKnowledgeSearch:
         lexical_weight: float = 0.45,
         semantic_weight: float = 0.55,
         candidate_multiplier: int = 4,
+        semantic_timeout_seconds: float | None = None,
+        allow_lexical_fallback: bool = False,
+        substring_lexical_fallback: bool = False,
     ) -> None:
-        """@brief 注入查询 embedder 与融合参数 / Inject the query embedder and fusion parameters."""
+        """@brief 注入查询 embedder、融合参数与可选降级策略 / Inject the query embedder, fusion parameters, and optional degradation policy.
+
+        @param database PostgreSQL 资源所有者 / PostgreSQL resource owner.
+        @param embedder 查询向量生成器 / Query-vector embedder.
+        @param embedding_space 不可变向量空间 / Immutable embedding space.
+        @param lexical_weight 词法召回权重 / Lexical-recall weight.
+        @param semantic_weight 语义召回权重 / Semantic-recall weight.
+        @param candidate_multiplier 每路候选数相对 top-k 的倍数 / Per-recall candidate multiplier relative to top-k.
+        @param semantic_timeout_seconds 可选语义检索总预算 / Optional total semantic-recall budget.
+        @param allow_lexical_fallback 语义检索失败时是否保留词法结果 / Whether lexical results survive semantic failure.
+        @param substring_lexical_fallback 是否为实时短查询启用 Unicode substring 召回 / Whether to enable Unicode substring recall for short realtime queries.
+        @return 无返回值 / No return value.
+        """
 
         if (
             not math.isfinite(lexical_weight)
@@ -166,6 +182,11 @@ class PostgresHybridKnowledgeSearch:
             raise ValueError("hybrid-search weights must be finite and positive")
         if not 2 <= candidate_multiplier <= 20:
             raise ValueError("hybrid-search candidate multiplier must be 2 to 20")
+        if semantic_timeout_seconds is not None and (
+            not math.isfinite(semantic_timeout_seconds)
+            or not 0.05 <= semantic_timeout_seconds <= 30
+        ):
+            raise ValueError("semantic search timeout must be 0.05 to 30 seconds")
         total = lexical_weight + semantic_weight
         self._database = database
         self._embedder = embedder
@@ -173,19 +194,23 @@ class PostgresHybridKnowledgeSearch:
         self._lexical_weight = lexical_weight / total
         self._semantic_weight = semantic_weight / total
         self._candidate_multiplier = candidate_multiplier
+        self._semantic_timeout_seconds = semantic_timeout_seconds
+        self._allow_lexical_fallback = allow_lexical_fallback
+        self._substring_lexical_fallback = substring_lexical_fallback
 
     async def search(self, plan: KnowledgeSearchPlan) -> HybridSearchResponse:
-        """@brief 在 SQL allowlist 中分别召回后融合 / Recall within the SQL allowlist, then fuse."""
+        """@brief 先保留词法结果，再在有界预算内融合语义结果 / Preserve lexical results before fusing semantic results within a bounded budget.
+
+        @param plan 已授权检索计划 / Authorized retrieval plan.
+        @return 带冻结 policy watermark 的有界结果 / Bounded results with a frozen policy watermark.
+        @note 默认行为仍要求语义检索成功；只有显式启用 ``allow_lexical_fallback`` 的
+            低延迟调用方才会在 embedding 超时或失败时返回词法结果。
+            / Default behavior still requires semantic retrieval to succeed; only explicitly
+            configured low-latency callers retain lexical results after embedding timeout/failure.
+        """
 
         if not plan.scopes:
             return HybridSearchResponse((), 1)
-        vectors = await self._embedder.embed([plan.query])
-        if len(vectors) != 1:
-            raise RuntimeError("query embedder returned an incompatible vector")
-        query_vector = l2_normalized_vector(
-            vectors[0],
-            expected_dimension=self._embedding_space.dimension,
-        )
         filters, filter_parameters = _sql_filters(plan.filters.values)
         limit = min(200, plan.top_k * self._candidate_multiplier)
         parameters: dict[str, object] = {
@@ -194,18 +219,87 @@ class PostgresHybridKnowledgeSearch:
             "version_ids": [str(scope.version_id) for scope in plan.scopes],
             "policy_versions": [scope.policy_version for scope in plan.scopes],
             "query": plan.query,
-            "query_vector": _vector_literal(query_vector),
-            "provider": self._embedding_space.provider,
-            "model": self._embedding_space.model,
-            "model_revision": self._embedding_space.model_revision,
-            "dimension": self._embedding_space.dimension,
-            "distance_metric": self._embedding_space.distance_metric,
-            "normalization": self._embedding_space.normalization,
             "candidate_limit": limit,
             **filter_parameters,
         }
-        lexical_sql = _LEXICAL_SQL.format(filters=filters)
-        dense_sql = _DENSE_SQL.format(filters=filters)
+        lexical_sql = (
+            _SUBSTRING_LEXICAL_SQL if self._substring_lexical_fallback else _LEXICAL_SQL
+        ).format(filters=filters)
+        if self._substring_lexical_fallback:
+            parameters["substring_terms"] = list(_substring_terms(plan.query))
+        lexical_rows = await self._recall_rows(plan, lexical_sql, parameters)
+        try:
+            dense_rows = await self._semantic_rows(plan, filters, parameters)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if not self._allow_lexical_fallback:
+                raise
+            dense_rows = ()
+        return self._response(plan, lexical_rows, dense_rows)
+
+    async def _semantic_rows(
+        self,
+        plan: KnowledgeSearchPlan,
+        filters: str,
+        parameters: Mapping[str, object],
+    ) -> Sequence[Mapping[str, object] | RowMapping]:
+        """@brief 在可选总预算内生成查询向量并执行 dense recall / Embed and execute dense recall within an optional total budget.
+
+        @param plan 已授权检索计划 / Authorized retrieval plan.
+        @param filters 已校验 SQL filter 片段 / Validated SQL filter fragment.
+        @param parameters 词法与语义共用参数 / Parameters shared by lexical and semantic recall.
+        @return Dense recall 行 / Dense-recall rows.
+        """
+
+        async def recall() -> Sequence[Mapping[str, object] | RowMapping]:
+            """@brief 执行单次语义召回 / Execute one semantic recall.
+
+            @return Dense recall 行 / Dense-recall rows.
+            """
+
+            vectors = await self._embedder.embed([plan.query])
+            if len(vectors) != 1:
+                raise RuntimeError("query embedder returned an incompatible vector")
+            query_vector = l2_normalized_vector(
+                vectors[0],
+                expected_dimension=self._embedding_space.dimension,
+            )
+            dense_parameters = {
+                **parameters,
+                "query_vector": _vector_literal(query_vector),
+                "provider": self._embedding_space.provider,
+                "model": self._embedding_space.model,
+                "model_revision": self._embedding_space.model_revision,
+                "dimension": self._embedding_space.dimension,
+                "distance_metric": self._embedding_space.distance_metric,
+                "normalization": self._embedding_space.normalization,
+            }
+            return await self._recall_rows(
+                plan,
+                _DENSE_SQL.format(filters=filters),
+                dense_parameters,
+            )
+
+        if self._semantic_timeout_seconds is None:
+            return await recall()
+        async with asyncio.timeout(self._semantic_timeout_seconds):
+            return await recall()
+
+    async def _recall_rows(
+        self,
+        plan: KnowledgeSearchPlan,
+        statement: str,
+        parameters: Mapping[str, object],
+    ) -> Sequence[Mapping[str, object] | RowMapping]:
+        """@brief 在真实 actor 与 Workspace RLS 下执行一条召回 SQL / Execute one recall SQL under real actor and Workspace RLS.
+
+        @param plan 已授权检索计划 / Authorized retrieval plan.
+        @param statement 仅由本模块常量生成的 SQL / SQL generated only from this module's constants.
+        @param parameters 参数化绑定 / Parameter bindings.
+        @return 已物化查询行 / Materialized query rows.
+        """
+
         async with self._database.new_session() as session:
             async with session.begin():
                 await self._database.install_v2_request_scope(
@@ -213,12 +307,24 @@ class PostgresHybridKnowledgeSearch:
                     actor_id=str(plan.actor_id),
                     workspace_id=str(plan.workspace_id),
                 )
-                lexical_rows = (
-                    (await session.execute(sa.text(lexical_sql), parameters)).mappings().all()
+                return (
+                    (await session.execute(sa.text(statement), dict(parameters))).mappings().all()
                 )
-                dense_rows = (
-                    (await session.execute(sa.text(dense_sql), parameters)).mappings().all()
-                )
+
+    def _response(
+        self,
+        plan: KnowledgeSearchPlan,
+        lexical_rows: Sequence[Mapping[str, object] | RowMapping],
+        dense_rows: Sequence[Mapping[str, object] | RowMapping],
+    ) -> HybridSearchResponse:
+        """@brief 融合两路候选并保持确定性排序 / Fuse both candidate sets with deterministic ordering.
+
+        @param plan 已授权检索计划 / Authorized retrieval plan.
+        @param lexical_rows 词法候选 / Lexical candidates.
+        @param dense_rows 语义候选 / Semantic candidates.
+        @return 有界融合结果 / Bounded fused result.
+        """
+
         candidates: dict[str, _Candidate] = {}
         for row in lexical_rows:
             candidate = _candidate_from_row(
@@ -421,6 +527,48 @@ LIMIT :candidate_limit
 )
 """@brief SQL-side lexical recall / SQL-side lexical recall."""
 
+_SUBSTRING_LEXICAL_SQL = (
+    _AUTHORIZED_CTE
+    + """
+, lexical_candidates AS (
+    SELECT id AS chunk_id,
+           source_id,
+           version_id,
+           ordinal,
+           text_content,
+           origin,
+           ts_rank_cd(
+               search_vector,
+               plainto_tsquery('simple', :query),
+               32
+           ) AS fts_score,
+           (
+               SELECT count(*)::double precision
+               FROM unnest(CAST(:substring_terms AS text[])) AS lexical_term(term)
+               WHERE strpos(lower(text_content), lexical_term.term) > 0
+           ) / GREATEST(cardinality(CAST(:substring_terms AS text[])), 1) AS substring_score
+    FROM bounded_chunks
+    WHERE search_vector @@ plainto_tsquery('simple', :query)
+       OR EXISTS (
+           SELECT 1
+           FROM unnest(CAST(:substring_terms AS text[])) AS lexical_term(term)
+           WHERE strpos(lower(text_content), lexical_term.term) > 0
+       )
+)
+SELECT chunk_id,
+       source_id,
+       version_id,
+       COALESCE(origin #>> '{{metadata,path}}', origin ->> 'path',
+                'chunk/' || ordinal::text) AS locator,
+       left(text_content, 4000) AS quote,
+       LEAST(1.0, GREATEST(0.0, GREATEST(fts_score, substring_score))) AS score
+FROM lexical_candidates
+ORDER BY score DESC, chunk_id ASC
+LIMIT :candidate_limit
+"""
+)
+"""@brief 实时短查询的 FTS + Unicode substring 召回 / FTS plus Unicode-substring recall for short realtime queries."""
+
 _DENSE_SQL = (
     _AUTHORIZED_CTE
     + """
@@ -617,6 +765,28 @@ def _tokens(value: str) -> set[str]:
     """@brief development adapter 的 Unicode-ish token set / Unicode-ish token set for the development adapter."""
 
     return {item.casefold() for item in re.findall(r"[\w-]+", value, flags=re.UNICODE)}
+
+
+def _substring_terms(value: str) -> tuple[str, ...]:
+    """@brief 提取有界且确定性的 Unicode substring 查询词 / Extract bounded deterministic Unicode substring terms.
+
+    @param value 用户查询文本 / User query text.
+    @return 按首次出现顺序去重、最多十六项的查询词 / At most sixteen unique terms in first-seen order.
+    @note 单字符词会制造过宽召回，因此仅保留长度 2..64 的项。
+        / Single-character terms create excessively broad recall, so only lengths 2..64 survive.
+    """
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for match in re.findall(r"[\w-]+", value, flags=re.UNICODE):
+        term = match.casefold()
+        if not 2 <= len(term) <= 64 or term in seen:
+            continue
+        seen.add(term)
+        terms.append(term)
+        if len(terms) == 16:
+            break
+    return tuple(terms)
 
 
 def _cosine_score(left: Sequence[float], right: Sequence[float]) -> float:

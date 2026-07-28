@@ -173,6 +173,9 @@ _MAX_CONNECTION_LIFETIME = timedelta(minutes=15)
 _REALTIME_KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 """@brief realtime signing key ID 的稳定语法 / Stable syntax for realtime signing-key IDs."""
 
+_INTERVIEW_KNOWLEDGE_AGENT_SCOPES = ("interview_coach", "interview_agent")
+"""@brief 当前面试知识 scope 与只读旧版兼容别名 / Current Interview knowledge scope and read-only legacy alias."""
+
 _PERMISSION_ACTION: Mapping[InterviewPermission, WorkspaceAction] = {
     InterviewPermission.LIST_SCENARIOS: WorkspaceAction.LIST_INTERVIEW_SCENARIOS,
     InterviewPermission.CREATE_SCENARIO: WorkspaceAction.CREATE_INTERVIEW_SCENARIO,
@@ -188,6 +191,22 @@ _PERMISSION_ACTION: Mapping[InterviewPermission, WorkspaceAction] = {
     InterviewPermission.READ_REPORT: WorkspaceAction.READ_INTERVIEW_REPORT,
 }
 """@brief Interview endpoint permission 到集中 action 的穷尽映射 / Exhaustive Interview-permission to central-action mapping."""
+
+
+def _knowledge_grant_scopes(agent_scope: str) -> tuple[str, ...]:
+    """@brief 解析面试知识授权的兼容 scope / Resolve compatible scopes for Interview knowledge grants.
+
+    @param agent_scope Session 请求中冻结的 Agent scope / Agent scope frozen in the Session request.
+    @return 面试 scope 的当前与旧版名称，或其他 scope 的精确单值 / Current and legacy
+        names for an Interview scope, or the exact singleton for another scope.
+    @note 只扩展授权读取，不改写持久策略或 Session 中的 canonical scope。
+        / This expands authorization reads only and never rewrites persisted policy or the
+        canonical scope stored in the Session.
+    """
+
+    if agent_scope in _INTERVIEW_KNOWLEDGE_AGENT_SCOPES:
+        return _INTERVIEW_KNOWLEDGE_AGENT_SCOPES
+    return (agent_scope,)
 
 
 def _json_fallback(value: Any) -> Any:
@@ -1744,8 +1763,9 @@ class PostgresInterviewSessionPolicy:
                     select(KnowledgeVisibilityGrantRecord).where(
                         KnowledgeVisibilityGrantRecord.workspace_id == str(workspace_id),
                         KnowledgeVisibilityGrantRecord.policy_id == policy.id,
-                        KnowledgeVisibilityGrantRecord.agent_scope
-                        == spec.knowledge.agent_scope,
+                        KnowledgeVisibilityGrantRecord.agent_scope.in_(
+                            _knowledge_grant_scopes(spec.knowledge.agent_scope)
+                        ),
                     )
                 )
             ).all()
