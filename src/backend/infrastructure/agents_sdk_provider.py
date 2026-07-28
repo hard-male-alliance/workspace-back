@@ -247,7 +247,7 @@ class OpenAIAgentsSDKProvider:
                 else:
                     state = await RunState.from_json(
                         agent,
-                        _plain_json_object(request.provider_state),
+                        _provider_state_for_resume(request.provider_state),
                         context_override={
                             "proposal_decision": (
                                 None
@@ -873,6 +873,40 @@ def _usage(
 
 def _plain_json_object(value: Mapping[str, JsonValue]) -> dict[str, Any]:
     return cast(dict[str, Any], _plain_json(value))
+
+
+def _provider_state_for_resume(value: Mapping[str, JsonValue]) -> dict[str, Any]:
+    """@brief 修复 SDK 序列化的 assistant 历史消息形状 / Normalize SDK-serialized assistant history for resume.
+
+    @param value 持久化的 SDK RunState / Persisted SDK RunState.
+    @return 可由当前 SDK 严格恢复的独立 JSON 对象 / An independent JSON object accepted by the current SDK restore path.
+    @note Agents SDK 会给原始 assistant 历史补 ``status`` 和 ``output_text``，但遗漏
+        ``type=message``；仅修复这一种已确认的序列化形状，不放宽其他 provider state 校验。
+        / The Agents SDK adds ``status`` and ``output_text`` to original assistant history but
+        omits ``type=message``; only that confirmed shape is repaired.
+    """
+
+    state = _plain_json_object(value)
+    original_input = state.get("original_input")
+    if not isinstance(original_input, list):
+        return state
+
+    normalized_input: list[Any] = []
+    for item in original_input:
+        if (
+            isinstance(item, dict)
+            and item.get("role") == "assistant"
+            and item.get("status") == "completed"
+            and "type" not in item
+            and isinstance(item.get("content"), list)
+        ):
+            normalized_item = dict(item)
+            normalized_item["type"] = "message"
+            normalized_input.append(normalized_item)
+            continue
+        normalized_input.append(item)
+    state["original_input"] = normalized_input
+    return state
 
 
 def _checkpoint_tool_call_count(

@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from agents.exceptions import ModelBehaviorError
 from agents.items import ModelResponse, TResponseStreamEvent
+from agents.models.chatcmpl_converter import Converter
 from agents.models.interface import Model, ModelTracing
 from agents.usage import Usage
 from openai.types.responses import (
@@ -144,6 +145,53 @@ class SequenceModel(Model):
         del args, kwargs
         if False:
             yield
+
+
+class ChatCompletionValidatingSequenceModel(SequenceModel):
+    """@brief 使用真实 Chat Completions 转换器校验 SDK 输入 / Validate SDK input with the real Chat Completions converter."""
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: Any,
+        model_settings: Any,
+        tools: list[Any],
+        output_schema: Any,
+        handoffs: list[Any],
+        tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
+        conversation_id: str | None,
+        prompt: Any,
+    ) -> ModelResponse:
+        """@brief 在返回脚本响应前执行生产转换 / Run the production conversion before returning a scripted response.
+
+        @param system_instructions 系统指令 / System instructions.
+        @param input SDK 模型输入 / SDK model input.
+        @param model_settings 模型设置 / Model settings.
+        @param tools 工具目录 / Tool catalog.
+        @param output_schema 输出 Schema / Output schema.
+        @param handoffs Agent 交接 / Agent handoffs.
+        @param tracing 跟踪设置 / Tracing settings.
+        @param previous_response_id 前一响应 ID / Previous response ID.
+        @param conversation_id Provider 会话 ID / Provider conversation ID.
+        @param prompt Provider prompt / Provider prompt.
+        @return 下一条脚本化模型响应 / The next scripted model response.
+        """
+
+        Converter.items_to_messages(input)
+        return await super().get_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+            prompt=prompt,
+        )
 
 
 class RecordingTelemetry:
@@ -504,6 +552,76 @@ async def test_native_tool_call_interrupts_and_resumes_same_sdk_state() -> None:
     assert resumed.tool_invocations[0].tool_name == "resume_request_proposal_decision"
     resumed_input = model.calls[-1][0]
     assert "call_proposal_0001" in repr(resumed_input)
+
+
+@pytest.mark.asyncio
+async def test_proposal_resume_normalizes_serialized_assistant_history_for_chat_completions() -> None:
+    """@brief 恢复 Proposal 时保持历史 assistant 消息可被真实转换器读取 / Keep restored assistant history readable by the production converter."""
+
+    model = ChatCompletionValidatingSequenceModel(
+        [
+            _tool_response(
+                "resume_draft_set_field",
+                '{"entity_id":"resume_provider_0001","field_path":["title"],'
+                '"value":"Focused title"}',
+                "call_draft_history_0001",
+            ),
+            _tool_response(
+                "resume_request_proposal_decision",
+                '{"title":"Improve title with history"}',
+                "call_proposal_history_0001",
+            ),
+            _text_response("Proposal continuation completed.", "response_history_resumed"),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+    request = _resume_request()
+    history = Message(
+        ResourceMeta(MessageId("message_assistant_history_0001"), 1, NOW, NOW),
+        WORKSPACE_ID,
+        request.spec.conversation_id,
+        1,
+        MessageRole.ASSISTANT,
+        None,
+        (TextContentPart("Previously confirmed facts."),),
+        source_run_id=AgentRunId("agent_run_history_0001"),
+    )
+    request_with_history = replace(
+        request,
+        input_message=replace(request.input_message, sequence=2),
+        conversation_history=(history,),
+    )
+
+    interrupted = await provider.execute(request_with_history)
+    assert isinstance(interrupted, AgentProviderProposalDecisionRequired)
+    assert request.resume_context is not None
+    accepted_ref = ResourceRef("resume", "resume_provider_0001", 2)
+    accepted_document = replace(
+        request.resume_context.document,
+        meta=request.resume_context.document.meta.advance(NOW),
+    )
+
+    resumed = await provider.execute(
+        replace(
+            request_with_history,
+            spec=replace(request.spec, context_refs=(accepted_ref,)),
+            grant=replace(request.grant, context_refs=(accepted_ref,)),
+            resume_context=AgentResumeContext(accepted_ref, accepted_document),
+            proposal_decision=AgentProposalDecisionContext(
+                ResourceRef("resume_proposal", "proposal_provider_history_0001", 2),
+                "accept",
+                accepted_ref,
+            ),
+            provider_state=interrupted.provider_state,
+        )
+    )
+
+    assert isinstance(resumed, AgentProviderCompleted)
+    assert resumed.content == (TextContentPart("Proposal continuation completed."),)
 
 
 @pytest.mark.asyncio
