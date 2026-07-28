@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import pytest
 
 from backend.application.ports.agent_v2 import (
+    AgentContextRevisionSuperseded,
     AgentModelRoute,
     AgentPolicyDenied,
     AgentRunPolicyRequest,
@@ -208,3 +209,19 @@ async def test_policy_fails_closed_across_each_cross_domain_boundary(failure: st
 
     with pytest.raises(AgentPolicyDenied):
         await policy.authorize_run(_request(spec))
+
+
+@pytest.mark.asyncio
+async def test_context_resolver_marks_an_older_resume_revision_as_superseded() -> None:
+    """An older exact Resume ref has a distinct, fail-closed policy signal."""
+
+    resolver = InMemoryAgentContextResolver(_store())
+
+    with pytest.raises(AgentContextRevisionSuperseded) as captured:
+        await resolver.resolve(
+            WORKSPACE,
+            (ResourceRef("resume", "resume_policy0001", 6),),
+        )
+
+    assert captured.value.reference == ResourceRef("resume", "resume_policy0001", 6)
+    assert captured.value.current_revision == 7

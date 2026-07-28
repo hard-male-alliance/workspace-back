@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
+from typing import cast
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.application.agent_worker import _proposal_decision_claim
 from backend.application.ports.access import WORKSPACE_AUTHORIZATION_MATRIX
+from backend.application.ports.outbox_dispatch import OutboxDispatchClaim, OutboxLease
 from backend.application.ports.resumes import (
     CollectionPage,
     OperationBatchReceipt,
@@ -24,7 +29,7 @@ from backend.application.resumes import (
     ResumePreconditionFailed,
     UpdateResumeMetadataCommand,
 )
-from backend.domain.platform import Job, JobId
+from backend.domain.platform import ApiEventId, Job, JobId, JsonValue
 from backend.domain.principals import (
     AuthenticatedActor,
     ClientId,
@@ -38,6 +43,7 @@ from backend.domain.principals import (
     WorkspaceId,
     _issue_workspace_access_context,
 )
+from backend.domain.resources import ResourceRef
 from backend.domain.resume_jobs import (
     RenderFormat,
     RenderMode,
@@ -90,6 +96,8 @@ from backend.domain.resumes import (
     create_resume_document,
 )
 from backend.domain.workspaces import WorkspaceRole
+from backend.infrastructure.persistence.models import OutboxEventRecord
+from backend.infrastructure.resumes import _PostgresResumeOutbox, _TrackingResumeAuthorizer
 
 NOW = datetime(2026, 7, 23, 12, 0, tzinfo=UTC)
 """@brief 测试固定时刻 / Fixed test instant."""
@@ -662,6 +670,44 @@ class MemorySink:
         self.target.append(value)
 
 
+class _OutboxRecordCapture:
+    """Capture the ORM record added by the real PostgreSQL Resume outbox adapter."""
+
+    def __init__(self) -> None:
+        self.records: list[OutboxEventRecord] = []
+
+    def add(self, record: object) -> None:
+        if not isinstance(record, OutboxEventRecord):
+            raise AssertionError("Resume outbox must add an OutboxEventRecord")
+        self.records.append(record)
+
+
+async def _persisted_resume_event_claim(event: ResumeOutboxEvent) -> OutboxDispatchClaim:
+    """Serialize one real Resume event through its PostgreSQL outbox adapter for parsing."""
+
+    session = _OutboxRecordCapture()
+    authorizer = _TrackingResumeAuthorizer(
+        None,
+        worker_scope=(event.workspace_id, event.actor_id),
+    )
+    authorizer.actor_id = event.actor_id
+    authorizer.workspace_id = event.workspace_id
+    await _PostgresResumeOutbox(cast(AsyncSession, session), authorizer).add(event)
+    assert len(session.records) == 1
+    record = session.records[0]
+    return OutboxDispatchClaim(
+        ApiEventId(event.event_id),
+        event.workspace_id,
+        event.actor_id,
+        event.subject,
+        event.event_type,
+        cast(Mapping[str, JsonValue], record.payload),
+        1,
+        OutboxLease("resume-proposal-envelope-lease-token-with-adequate-entropy"),
+        event.occurred_at + timedelta(minutes=2),
+    )
+
+
 class MemoryJobSink:
     """@brief 保留统一 Job 与 typed spec 的测试 adapter / Test adapter retaining unified Jobs and typed specs."""
 
@@ -972,8 +1018,8 @@ async def test_application_creates_import_restore_and_render_jobs_after_validati
 
 
 @pytest.mark.asyncio
-async def test_proposal_decision_applies_operations_and_terminal_state_atomically() -> None:
-    """@brief 验证 proposal 决策与 Resume revision 在一个工作单元内提交 / Verify proposal decision and Resume revision share a unit of work."""
+async def test_proposal_decision_applies_operations_and_emits_parseable_agent_continuation() -> None:
+    """Verify a decision atomically writes the Resume and emits a worker-parseable continuation."""
     store = MemoryStore()
     service = _service(store)
     principal = _principal("resume.read", "resume.write")
@@ -998,6 +1044,7 @@ async def test_proposal_decision_applies_operations_and_terminal_state_atomicall
                 "Staff Backend Resume",
             ),
         ),
+        source_agent_run_id="agent_run_worker0001",
     )
     store.proposals[(WORKSPACE_ID, proposal_id)] = proposal
 
@@ -1015,6 +1062,22 @@ async def test_proposal_decision_applies_operations_and_terminal_state_atomicall
     assert saved.status is ResumeProposalStatus.ACCEPTED
     assert saved.meta.revision == 2
     assert saved.accepted_operation_ids == (ResumeOperationId("op_00000001"),)
+    continuation_events = [
+        event
+        for event in store.events
+        if event.event_type == "agent.proposal_decision.recorded"
+    ]
+    assert len(continuation_events) == 1
+
+    parsed = _proposal_decision_claim(
+        await _persisted_resume_event_claim(continuation_events[0])
+    )
+
+    assert parsed.actor_id == USER_ID
+    assert parsed.run_id == "agent_run_worker0001"
+    assert parsed.proposal_ref == ResourceRef("resume_proposal", str(proposal_id), 2)
+    assert parsed.resume_ref == ResourceRef("resume", str(created.meta.id), 2)
+    assert parsed.decision == "accept"
 
 
 def test_central_authorization_matrix_uses_resume_scopes_and_denies_viewer_writes() -> None:

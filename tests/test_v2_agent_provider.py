@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from agents.exceptions import ModelBehaviorError
 from agents.items import ModelResponse, TResponseStreamEvent
+from agents.models.chatcmpl_converter import Converter
 from agents.models.interface import Model, ModelTracing
 from agents.usage import Usage
 from openai.types.responses import (
@@ -25,6 +26,7 @@ from backend.application.ports.agent_v2 import (
     AgentProviderFailure,
 )
 from backend.domain.agent_v2 import (
+    AgentDomainError,
     AgentExecutionGrant,
     AgentKnowledgeEvidence,
     AgentOutputMode,
@@ -67,10 +69,27 @@ from backend.domain.resumes import (
     TemplateZonePolicy,
     create_resume_document,
 )
-from backend.infrastructure.agents_sdk_provider import OpenAIAgentsSDKProvider
+from backend.infrastructure.agents_sdk_provider import (
+    OpenAIAgentsSDKProvider,
+    _checkpoint_tool_call_count,
+)
 
 NOW = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
 WORKSPACE_ID = WorkspaceId("workspace_provider_0001")
+
+
+def test_persisted_checkpoint_preserves_tool_ordinal_offset() -> None:
+    """@brief JSONB 数组仍须计入既有工具序号 / Count persisted JSONB arrays in the tool ordinal offset."""
+
+    assert _checkpoint_tool_call_count(
+        {
+            "generated_items": [
+                {"type": "tool_call_item"},
+                {"type": "tool_call_output_item"},
+                {"type": "tool_call_item"},
+            ]
+        }
+    ) == 2
 
 
 def _text_response(text: str, response_id: str) -> ModelResponse:
@@ -117,6 +136,7 @@ class SequenceModel(Model):
     def __init__(self, responses: list[ModelResponse]) -> None:
         self.responses = responses
         self.calls: list[tuple[Any, list[Any], Any]] = []
+        self.instructions: list[str | None] = []
 
     async def get_response(
         self,
@@ -133,7 +153,6 @@ class SequenceModel(Model):
         prompt: Any,
     ) -> ModelResponse:
         del (
-            system_instructions,
             model_settings,
             handoffs,
             tracing,
@@ -141,6 +160,7 @@ class SequenceModel(Model):
             conversation_id,
             prompt,
         )
+        self.instructions.append(system_instructions)
         self.calls.append((input, tools, output_schema))
         return self.responses.pop(0)
 
@@ -152,6 +172,53 @@ class SequenceModel(Model):
         del args, kwargs
         if False:
             yield
+
+
+class ChatCompletionValidatingSequenceModel(SequenceModel):
+    """@brief 使用真实 Chat Completions 转换器校验 SDK 输入 / Validate SDK input with the real Chat Completions converter."""
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: Any,
+        model_settings: Any,
+        tools: list[Any],
+        output_schema: Any,
+        handoffs: list[Any],
+        tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
+        conversation_id: str | None,
+        prompt: Any,
+    ) -> ModelResponse:
+        """@brief 在返回脚本响应前执行生产转换 / Run the production conversion before returning a scripted response.
+
+        @param system_instructions 系统指令 / System instructions.
+        @param input SDK 模型输入 / SDK model input.
+        @param model_settings 模型设置 / Model settings.
+        @param tools 工具目录 / Tool catalog.
+        @param output_schema 输出 Schema / Output schema.
+        @param handoffs Agent 交接 / Agent handoffs.
+        @param tracing 跟踪设置 / Tracing settings.
+        @param previous_response_id 前一响应 ID / Previous response ID.
+        @param conversation_id Provider 会话 ID / Provider conversation ID.
+        @param prompt Provider prompt / Provider prompt.
+        @return 下一条脚本化模型响应 / The next scripted model response.
+        """
+
+        Converter.items_to_messages(input)
+        return await super().get_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+            prompt=prompt,
+        )
 
 
 class RecordingTelemetry:
@@ -444,6 +511,77 @@ def _resume_request() -> AgentProviderRequest:
         ),
         resume_context=AgentResumeContext(resume_ref, document),
     )
+
+
+def test_proposal_continuation_cannot_supply_resume_context_outside_grant() -> None:
+    """A committed decision does not exempt its Resume snapshot from grant coverage."""
+
+    request = _resume_request()
+    assert request.resume_context is not None
+    with pytest.raises(AgentDomainError, match="Resume context exceeds"):
+        replace(
+            request,
+            grant=replace(request.grant, context_refs=()),
+            proposal_decision=AgentProposalDecisionContext(
+                ResourceRef("resume_proposal", "proposal_provider_0001", 2),
+                "accept",
+                request.resume_context.resume_ref,
+            ),
+            provider_state={"response_id": "response_proposal_0001"},
+        )
+
+
+def test_proposal_continuation_requires_its_authorized_resume_context() -> None:
+    """A Proposal decision is only valid for a Resume-edit provider request."""
+
+    request = _request()
+    with pytest.raises(AgentDomainError, match="Proposal decision does not match"):
+        replace(
+            request,
+            proposal_decision=AgentProposalDecisionContext(
+                ResourceRef("resume_proposal", "proposal_provider_0001", 2),
+                "accept",
+                ResourceRef("resume", "resume_provider_0001", 1),
+            ),
+            provider_state={"response_id": "response_proposal_0001"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_resume_provider_preserves_explicit_date_facts_in_model_input() -> None:
+    """@brief 显式年份进入模型输入且提示禁止替换 / Preserve an explicit year and forbid replacing it."""
+
+    model = SequenceModel([_text_response("已记住。", "response_explicit_year")])
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+    request = _resume_request()
+    history = Message(
+        ResourceMeta(MessageId("message_explicit_year_0001"), 1, NOW, NOW),
+        WORKSPACE_ID,
+        request.spec.conversation_id,
+        1,
+        MessageRole.USER,
+        None,
+        (TextContentPart("我于 2026 年毕业。"),),
+    )
+
+    await provider.execute(
+        replace(
+            request,
+            input_message=replace(request.input_message, sequence=2),
+            conversation_history=(history,),
+        )
+    )
+
+    model_input = repr(model.calls[0][0])
+    assert "2026" in model_input
+    assert "2025" not in model_input
+    instructions = model.instructions[0] or ""
+    assert "explicit dates" in instructions
+    assert "Never replace" in instructions
 
 
 @pytest.mark.asyncio
@@ -777,6 +915,7 @@ async def test_native_tool_call_interrupts_and_resumes_same_sdk_state() -> None:
     native_tools = model.calls[0][1]
     assert {tool.name for tool in native_tools} >= {
         "resume_read_section",
+        "resume_draft_set_document_title",
         "resume_draft_set_field",
         "resume_request_proposal_decision",
     }
@@ -786,13 +925,22 @@ async def test_native_tool_call_interrupts_and_resumes_same_sdk_state() -> None:
     assert proposal_tool.needs_approval is True
     assert model.calls[0][2] is None
 
+    assert request.resume_context is not None
+    accepted_document = replace(
+        request.resume_context.document,
+        meta=request.resume_context.document.meta.advance(NOW),
+    )
+    accepted_ref = ResourceRef("resume", "resume_provider_0001", 2)
     resumed = await provider.execute(
         replace(
             request,
+            spec=replace(request.spec, context_refs=(accepted_ref,)),
+            grant=replace(request.grant, context_refs=(accepted_ref,)),
+            resume_context=AgentResumeContext(accepted_ref, accepted_document),
             proposal_decision=AgentProposalDecisionContext(
                 ResourceRef("resume_proposal", "proposal_provider_0001", 2),
                 "accept",
-                ResourceRef("resume", "resume_provider_0001", 2),
+                accepted_ref,
             ),
             provider_state=interrupted.provider_state,
         )
@@ -804,6 +952,76 @@ async def test_native_tool_call_interrupts_and_resumes_same_sdk_state() -> None:
     assert resumed.tool_invocations[0].tool_name == "resume_request_proposal_decision"
     resumed_input = model.calls[-1][0]
     assert "call_proposal_0001" in repr(resumed_input)
+
+
+@pytest.mark.asyncio
+async def test_proposal_resume_normalizes_serialized_assistant_history_for_chat_completions() -> None:
+    """@brief 恢复 Proposal 时保持历史 assistant 消息可被真实转换器读取 / Keep restored assistant history readable by the production converter."""
+
+    model = ChatCompletionValidatingSequenceModel(
+        [
+            _tool_response(
+                "resume_draft_set_field",
+                '{"entity_id":"resume_provider_0001","field_path":["title"],'
+                '"value":"Focused title"}',
+                "call_draft_history_0001",
+            ),
+            _tool_response(
+                "resume_request_proposal_decision",
+                '{"title":"Improve title with history"}',
+                "call_proposal_history_0001",
+            ),
+            _text_response("Proposal continuation completed.", "response_history_resumed"),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+    request = _resume_request()
+    history = Message(
+        ResourceMeta(MessageId("message_assistant_history_0001"), 1, NOW, NOW),
+        WORKSPACE_ID,
+        request.spec.conversation_id,
+        1,
+        MessageRole.ASSISTANT,
+        None,
+        (TextContentPart("Previously confirmed facts."),),
+        source_run_id=AgentRunId("agent_run_history_0001"),
+    )
+    request_with_history = replace(
+        request,
+        input_message=replace(request.input_message, sequence=2),
+        conversation_history=(history,),
+    )
+
+    interrupted = await provider.execute(request_with_history)
+    assert isinstance(interrupted, AgentProviderProposalDecisionRequired)
+    assert request.resume_context is not None
+    accepted_ref = ResourceRef("resume", "resume_provider_0001", 2)
+    accepted_document = replace(
+        request.resume_context.document,
+        meta=request.resume_context.document.meta.advance(NOW),
+    )
+
+    resumed = await provider.execute(
+        replace(
+            request_with_history,
+            spec=replace(request.spec, context_refs=(accepted_ref,)),
+            grant=replace(request.grant, context_refs=(accepted_ref,)),
+            resume_context=AgentResumeContext(accepted_ref, accepted_document),
+            proposal_decision=AgentProposalDecisionContext(
+                ResourceRef("resume_proposal", "proposal_provider_history_0001", 2),
+                "accept",
+                accepted_ref,
+            ),
+            provider_state=interrupted.provider_state,
+        )
+    )
+
+    assert isinstance(resumed, AgentProviderCompleted)
+    assert resumed.content == (TextContentPart("Proposal continuation completed."),)
 
 
 @pytest.mark.asyncio
@@ -933,14 +1151,25 @@ async def test_proposal_decision_remains_resumable_at_tool_call_budget() -> None
 
     interrupted = await provider.execute(request)
     assert isinstance(interrupted, AgentProviderProposalDecisionRequired)
+    assert request.resume_context is not None
+    # @brief 接受修改后的权威简历引用 / Authoritative Resume reference after acceptance.
+    accepted_ref = ResourceRef("resume", "resume_provider_0001", 2)
+    # @brief 接受修改后的权威简历文档 / Authoritative Resume document after acceptance.
+    accepted_document = replace(
+        request.resume_context.document,
+        meta=request.resume_context.document.meta.advance(NOW),
+    )
 
     resumed = await provider.execute(
         replace(
             request,
+            spec=replace(request.spec, context_refs=(accepted_ref,)),
+            grant=replace(request.grant, context_refs=(accepted_ref,)),
+            resume_context=AgentResumeContext(accepted_ref, accepted_document),
             proposal_decision=AgentProposalDecisionContext(
                 ResourceRef("resume_proposal", "proposal_provider_budget_0001", 2),
                 "accept",
-                ResourceRef("resume", "resume_provider_0001", 2),
+                accepted_ref,
             ),
             provider_state=interrupted.provider_state,
         )
@@ -994,6 +1223,35 @@ async def test_invalid_tool_arguments_are_returned_to_model_for_recovery() -> No
     assert invalid_trace.validation_phase == "arguments_schema"
     assert invalid_trace.consecutive_invalid_count == 1
     assert invalid_trace.argument_signature is not None
+
+
+@pytest.mark.asyncio
+async def test_invalid_section_json_feedback_recommends_smaller_draft_tools() -> None:
+    """@brief 章节 JSON 错误返回可执行的拆分建议 / Return an executable decomposition hint for invalid section JSON."""
+
+    model = SequenceModel(
+        [
+            _tool_response(
+                "resume_draft_upsert_section",
+                '{"section":',
+                "call_invalid_section_json_0001",
+            ),
+            _text_response("请重试。", "response_after_invalid_section_json"),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+
+    outcome = await provider.execute(_resume_request())
+
+    assert isinstance(outcome, AgentProviderCompleted)
+    feedback = repr(model.calls[1][0])
+    assert "resume_draft_upsert_section" in feedback
+    assert "items=[]" in feedback
+    assert "resume_draft_upsert_item" in feedback
 
 
 @pytest.mark.asyncio
@@ -1082,6 +1340,11 @@ async def test_repeated_identical_invalid_call_stops_with_recovery_error() -> No
                 '{"updates":[]}',
                 "call_invalid_batch_0002",
             ),
+            _tool_response(
+                "resume_draft_set_fields",
+                '{"updates":[]}',
+                "call_invalid_batch_0003",
+            ),
         ]
     )
     provider = OpenAIAgentsSDKProvider(
@@ -1096,10 +1359,74 @@ async def test_repeated_identical_invalid_call_stops_with_recovery_error() -> No
     assert captured.value.problem.code == "agent.tool_recovery_exhausted"
     assert captured.value.problem.status == 502
     assert captured.value.problem.retryable is True
-    assert len(captured.value.invocations) == 2
-    assert captured.value.invocations[-1].consecutive_invalid_count == 2
+    assert len(captured.value.invocations) == 3
+    assert captured.value.invocations[-1].consecutive_invalid_count == 3
     assert captured.value.invocations[-1].validation_issues == (("updates", "too_short"),)
     assert (
         captured.value.invocations[0].argument_signature
-        == captured.value.invocations[1].argument_signature
+        == captured.value.invocations[2].argument_signature
     )
+
+
+@pytest.mark.asyncio
+async def test_second_identical_invalid_section_call_can_recover_on_final_attempt() -> None:
+    """@brief 第二次相同参数错误仍把纠正信息返回模型 / Return correction feedback after a second identical argument error."""
+
+    invalid_arguments = '{"section":"education","after_section_id":null}'
+    valid_arguments = json.dumps(
+        {
+            "section": {
+                "id": "tmp_section_education_01",
+                "kind": "education",
+                "title": "教育经历",
+                "visible": True,
+                "content": None,
+                "items": [],
+            },
+            "after_section_id": None,
+        },
+        ensure_ascii=False,
+    )
+    model = SequenceModel(
+        [
+            _tool_response(
+                "resume_draft_upsert_section",
+                invalid_arguments,
+                "call_invalid_section_0001",
+            ),
+            _tool_response(
+                "resume_draft_upsert_section",
+                invalid_arguments,
+                "call_invalid_section_0002",
+            ),
+            _tool_response(
+                "resume_draft_upsert_section",
+                valid_arguments,
+                "call_recovered_section_0001",
+            ),
+            _tool_response(
+                "resume_request_proposal_decision",
+                '{"title":"新增教育经历"}',
+                "call_recovered_section_proposal_0001",
+            ),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+
+    outcome = await provider.execute(_resume_request())
+
+    assert isinstance(outcome, AgentProviderProposalDecisionRequired)
+    assert [trace.status for trace in outcome.tool_invocations] == [
+        "invalid",
+        "invalid",
+        "completed",
+        "decision_required",
+    ]
+    second_feedback = repr(model.calls[2][0])
+    assert '"path":"section"' in second_feedback
+    assert '"issue":"model_type"' in second_feedback
+    assert outcome.resume_operations[0].payload["op"] == "upsert_section"

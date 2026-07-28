@@ -70,8 +70,9 @@ from workspace_shared.tenancy import ActorScope
 
 _MAX_TURNS = 20
 _MAX_TOOL_CALLS = 16
-_MAX_INVALID_TOOL_CALLS = 6
-_MAX_REPEATED_INVALID_SIGNATURE = 2
+_MAX_INVALID_TOOL_CALLS = 3
+# @brief 相同无效参数也应获得完整纠错预算 / Give repeated invalid arguments the full recovery budget.
+_MAX_REPEATED_INVALID_SIGNATURE = _MAX_INVALID_TOOL_CALLS
 _MAX_KNOWLEDGE_RETRIEVALS = 8
 _MAX_INPUT_CHARACTERS = 1_000_000
 _PROPOSAL_TOOL = "resume_request_proposal_decision"
@@ -310,7 +311,7 @@ class OpenAIAgentsSDKProvider:
                 else:
                     state = await RunState.from_json(
                         agent,
-                        _plain_json_object(request.provider_state),
+                        _provider_state_for_resume(request.provider_state),
                         context_override={
                             "proposal_decision": (
                                 None
@@ -1265,13 +1266,47 @@ def _plain_json_object(value: Mapping[str, JsonValue]) -> dict[str, Any]:
     return cast(dict[str, Any], _plain_json(value))
 
 
+def _provider_state_for_resume(value: Mapping[str, JsonValue]) -> dict[str, Any]:
+    """@brief 修复 SDK 序列化的 assistant 历史消息形状 / Normalize SDK-serialized assistant history for resume.
+
+    @param value 持久化的 SDK RunState / Persisted SDK RunState.
+    @return 可由当前 SDK 严格恢复的独立 JSON 对象 / An independent JSON object accepted by the current SDK restore path.
+    @note Agents SDK 会给原始 assistant 历史补 ``status`` 和 ``output_text``，但遗漏
+        ``type=message``；仅修复这一种已确认的序列化形状，不放宽其他 provider state 校验。
+        / The Agents SDK adds ``status`` and ``output_text`` to original assistant history but
+        omits ``type=message``; only that confirmed shape is repaired.
+    """
+
+    state = _plain_json_object(value)
+    original_input = state.get("original_input")
+    if not isinstance(original_input, list):
+        return state
+
+    normalized_input: list[Any] = []
+    for item in original_input:
+        if (
+            isinstance(item, dict)
+            and item.get("role") == "assistant"
+            and item.get("status") == "completed"
+            and "type" not in item
+            and isinstance(item.get("content"), list)
+        ):
+            normalized_item = dict(item)
+            normalized_item["type"] = "message"
+            normalized_input.append(normalized_item)
+            continue
+        normalized_input.append(item)
+    state["original_input"] = normalized_input
+    return state
+
+
 def _checkpoint_tool_call_count(
     state: Mapping[str, JsonValue] | None,
 ) -> int:
     if state is None:
         return 0
     items = state.get("generated_items")
-    if not isinstance(items, tuple):
+    if not isinstance(items, (list, tuple)):
         return 0
     return sum(isinstance(item, Mapping) and item.get("type") == "tool_call_item" for item in items)
 
@@ -1365,6 +1400,7 @@ def _invalid_tool_arguments_result(
         "resume_draft_upsert_sections": "resume_draft_upsert_section",
         "resume_draft_upsert_items": "resume_draft_upsert_item",
     }.get(tool_name, tool_name)
+    correction = _tool_argument_correction(tool_name)
     result: dict[str, JsonValue] = {
         "kind": "invalid_tool_arguments",
         "code": "agent.tool_arguments_invalid",
@@ -1375,6 +1411,7 @@ def _invalid_tool_arguments_result(
             "strategy": "correct_arguments",
             "suggested_tool": suggested_tool,
             "repeat_unchanged": False,
+            **({"correction": correction} if correction is not None else {}),
         },
     }
     expectation = _tool_argument_expectation(tool_name)
@@ -1385,6 +1422,26 @@ def _invalid_tool_arguments_result(
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
+    )
+
+
+def _tool_argument_correction(tool_name: str) -> str | None:
+    """@brief 返回不含用户内容的工具参数纠正建议 / Return content-free tool argument correction guidance.
+
+    @param tool_name 参数校验失败的工具 / Tool whose arguments failed validation.
+    @return 可空纠正建议 / Optional correction guidance.
+    """
+
+    if tool_name not in {
+        "resume_draft_upsert_section",
+        "resume_draft_upsert_sections",
+    }:
+        return None
+    return (
+        "Send exactly one valid JSON object matching the runtime schema. "
+        "For a new section with items, first call resume_draft_upsert_section "
+        "with section.items=[], then call resume_draft_upsert_item or "
+        "resume_draft_upsert_items with complete items."
     )
 
 

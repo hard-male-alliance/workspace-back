@@ -23,6 +23,7 @@ from backend.application.agent_v2 import (
 )
 from backend.application.ports.agent_v2 import (
     AgentCasMismatch,
+    AgentContextRevisionSuperseded,
     AgentPage,
     AgentPageRequest,
     AgentPermissionGrant,
@@ -38,12 +39,16 @@ from backend.application.ports.agent_v2 import (
     ToolExecutionReceipt,
 )
 from backend.domain.agent_v2 import (
+    AgentDomainError,
     AgentExecutionGrant,
+    AgentOutboxId,
     AgentOutputMode,
     AgentProviderApprovalRequired,
     AgentProviderCompleted,
+    AgentProviderProposalDecisionRequired,
     AgentProviderRequest,
     AgentResumeContext,
+    AgentResumeOperationDraft,
     AgentRun,
     AgentRunId,
     AgentRunQueuedDispatch,
@@ -86,6 +91,15 @@ from backend.domain.principals import (
     WorkspaceId,
 )
 from backend.domain.resources import ResourceRef
+from backend.domain.resumes import (
+    PageSize,
+    ResumeId,
+    ResumeSectionKind,
+    TemplatePolicy,
+    TemplateRef,
+    TemplateZonePolicy,
+    create_resume_document,
+)
 
 NOW = datetime(2026, 7, 23, 2, 0, tzinfo=UTC)
 WORKSPACE = WorkspaceId("workspace_0001")
@@ -134,10 +148,29 @@ class State:
     audits: list[AuditEvent] = field(default_factory=list)
     permission_requests: list[AgentPermissionRequest] = field(default_factory=list)
     worker_scopes: list[tuple[WorkspaceId, UserId]] = field(default_factory=list)
+    resume_contexts: dict[ResourceRef, AgentResumeContext] = field(default_factory=dict)
+    created_resume_proposals: list[AgentResumeProposalCommand] = field(
+        default_factory=list
+    )
     active_transactions: int = 0
     malicious_conversation: Conversation | None = None
     policy_denied: bool = False
     invocation_commands: list[AgentToolInvocationCommand] = field(default_factory=list)
+    resume_context_superseded: bool = False
+    resume_grant_revision: int | None = None
+    grant_policy_version: int | None = None
+    history_error: Exception | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FakeProposalDecisionClaim:
+    id: AgentOutboxId
+    workspace_id: WorkspaceId
+    actor_id: UserId
+    run_id: AgentRunId
+    proposal_ref: ResourceRef
+    decision: str
+    resume_ref: ResourceRef
 
 
 class FakeAuthorizer:
@@ -160,8 +193,23 @@ class FakePolicy:
     async def authorize_run(self, request: AgentRunPolicyRequest) -> AgentExecutionGrant:
         if self.state.policy_denied:
             raise AgentPolicyDenied("revoked in test")
+        if self.state.resume_context_superseded:
+            reference = request.spec.context_refs[0]
+            assert reference.revision is not None
+            raise AgentContextRevisionSuperseded(reference, reference.revision + 1)
         resolved_refs = tuple(
-            ResourceRef(item.resource_type, item.id, item.revision or 1)
+            ResourceRef(
+                item.resource_type,
+                item.id,
+                (
+                    self.state.resume_grant_revision
+                    if (
+                        item.resource_type == "resume"
+                        and self.state.resume_grant_revision is not None
+                    )
+                    else item.revision or 1
+                ),
+            )
             for item in request.spec.context_refs
         )
         return AgentExecutionGrant(
@@ -176,7 +224,11 @@ class FakePolicy:
             external_model_processing=False,
             context_refs=resolved_refs,
             knowledge_contexts=(),
-            policy_version=1,
+            policy_version=(
+                1
+                if self.state.grant_policy_version is None
+                else self.state.grant_policy_version
+            ),
         )
 
 
@@ -302,6 +354,8 @@ class FakeRepository:
         conversation_id: ConversationId,
         page: AgentPageRequest,
     ) -> AgentPage[AgentRun]:
+        if self.state.history_error is not None:
+            raise self.state.history_error
         items = [
             item
             for item in self.state.runs.values()
@@ -410,12 +464,32 @@ class FakeResumeProposals:
         workspace_id: WorkspaceId,
         resume_ref: ResourceRef,
     ) -> AgentResumeContext:
-        del workspace_id, resume_ref
+        del workspace_id
+        if resume_ref.revision is None:
+            matches = tuple(
+                context
+                for reference, context in self.state.resume_contexts.items()
+                if (
+                    reference.resource_type == resume_ref.resource_type
+                    and reference.id == resume_ref.id
+                    and reference.revision == self.state.resume_grant_revision
+                )
+            )
+            if len(matches) == 1:
+                return matches[0]
+        else:
+            context = self.state.resume_contexts.get(resume_ref)
+            if context is not None:
+                return context
         raise AssertionError("unexpected Resume Proposal base load")
 
     async def create(self, command: AgentResumeProposalCommand) -> ResourceRef:
-        del command
-        raise AssertionError("unexpected Resume Proposal creation")
+        self.state.created_resume_proposals.append(command)
+        return ResourceRef(
+            "resume_proposal",
+            f"proposal_{len(self.state.created_resume_proposals):08d}",
+            1,
+        )
 
     async def record_invocations(self, command: AgentToolInvocationCommand) -> None:
         self.state.invocation_commands.append(command)
@@ -574,6 +648,117 @@ def _spec(conversation_id: ConversationId, message_id: MessageId) -> AgentRunSpe
     )
 
 
+def _resume_spec(
+    conversation_id: ConversationId,
+    message_id: MessageId,
+) -> AgentRunSpec:
+    return AgentRunSpec(
+        conversation_id=conversation_id,
+        input_message_id=message_id,
+        capability=ConversationCapability.RESUME_EDIT,
+        context_refs=(ResourceRef("resume", "resume_proposal_0001", 1),),
+        knowledge=KnowledgeSelection(
+            KnowledgeSelectionMode.NONE,
+            (),
+            (),
+            (),
+            "resume_assistant",
+        ),
+        inference=InferenceIntent(
+            InferenceQualityTier.BALANCED,
+            10_000,
+            InferenceCostTier.STANDARD,
+            ModelRegion.CN,
+            False,
+            False,
+        ),
+        output_modes=(AgentOutputMode.TEXT, AgentOutputMode.RESUME_OPERATIONS),
+        response_locale="zh-CN",
+    )
+
+
+def _resume_context(revision: int) -> AgentResumeContext:
+    kinds = frozenset(ResumeSectionKind)
+    document = create_resume_document(
+        resume_id=ResumeId("resume_proposal_0001"),
+        workspace_id=WORKSPACE,
+        title="Original resume",
+        locale="zh-CN",
+        template_policy=TemplatePolicy(
+            TemplateRef("template_proposal_0001", "1"),
+            frozenset({"zh-CN"}),
+            frozenset({PageSize.A4}),
+            frozenset({"pdf"}),
+            kinds,
+            (TemplateZonePolicy("main", kinds, 100),),
+            frozenset({"sans"}),
+            frozenset({"yyyy-mm"}),
+            frozenset({"disc"}),
+        ),
+        created_at=NOW,
+    )
+    for _ in range(1, revision):
+        document = replace(document, meta=document.meta.advance(NOW))
+    return AgentResumeContext(
+        ResourceRef("resume", str(document.meta.id), document.meta.revision),
+        document,
+    )
+
+
+async def _wait_for_resume_proposal(
+    state: State,
+    ids: DeterministicIds,
+) -> tuple[AgentRunId, ResourceRef]:
+    initial_context = _resume_context(1)
+    state.resume_contexts[initial_context.resume_ref] = initial_context
+    state.resume_grant_revision = initial_context.resume_ref.revision
+    service = _service(state, ids)
+    conversation = await service.create_conversation(
+        PRINCIPAL,
+        WORKSPACE,
+        CreateConversationCommand(ConversationCapability.RESUME_EDIT, "resume proposal"),
+        CONTEXT,
+    )
+    message = await service.create_message(
+        PRINCIPAL,
+        WORKSPACE,
+        conversation.meta.id,
+        CreateMessageCommand(None, (TextContentPart("请优化简历"),)),
+        expected_conversation_revision=conversation.meta.revision,
+        context=CONTEXT,
+    )
+    created = await service.create_agent_run(
+        PRINCIPAL,
+        WORKSPACE,
+        _resume_spec(conversation.meta.id, message.meta.id),
+        CONTEXT,
+    )
+    worker = AgentWorkerService(
+        FakeWorkerUowFactory(state),
+        FakeProvider(
+            state,
+            AgentProviderProposalDecisionRequired(
+                content=(TextContentPart("我已准备好修改方案。"),),
+                usage=AgentUsage(3, 2, "5"),
+                resume_operations=(
+                    AgentResumeOperationDraft({"op": "set_field"}),
+                ),
+                proposal_title="Improve resume title",
+                provider_state={"response_id": "response_proposal_0001"},
+                tool_call_id=ToolCallId("tool_call_proposal_0001"),
+            ),
+        ),  # type: ignore[arg-type]
+        FakeToolExecutor(state),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+    waiting = await worker.execute_run(_queued_dispatch(state, created.meta.id))
+
+    assert waiting.status is AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION
+    assert waiting.proposal_refs[0].revision is not None
+    return created.meta.id, waiting.proposal_refs[0]
+
+
 async def _prepare_decided_tool_run(
     state: State,
     ids: DeterministicIds,
@@ -635,6 +820,171 @@ async def _prepare_decided_tool_run(
         if isinstance(item, ToolDecisionDispatch) and item.run_ref.id == created.meta.id
     )
     return worker, dispatch, created.meta.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "decision_kind",
+        "resume_revision",
+        "legacy_session_gap",
+        "grant_policy_version",
+        "allows_continuation",
+    ),
+    (
+        ("accept", 2, 0, None, True),
+        ("reject", 1, 0, None, True),
+        ("accept_selected", 1, 0, None, True),
+        ("accept", 2, 1, None, True),
+        ("accept", 2, 2, None, False),
+        ("accept", 2, 0, 2, False),
+    ),
+    ids=(
+        "accepts_committed_resume_revision",
+        "reject_keeps_original_resume_revision",
+        "accept_selected_allows_zero_operation_revision",
+        "allows_legacy_own_output_session_plus_one",
+        "rejects_session_plus_two",
+        "rejects_unexpected_policy_version_change",
+    ),
+)
+async def test_proposal_continuation_allows_only_committed_resume_and_legacy_session_deltas(
+    decision_kind: str,
+    resume_revision: int,
+    legacy_session_gap: int,
+    grant_policy_version: int | None,
+    allows_continuation: bool,
+) -> None:
+    """Continuation may only change its exact committed Resume and own output revision."""
+
+    state = State()
+    ids = DeterministicIds()
+    run_id, waiting_proposal_ref = await _wait_for_resume_proposal(state, ids)
+    initial_context = _resume_context(1)
+    waiting_run = state.runs[run_id]
+    assert waiting_run.grant.session_ref == ResourceRef(
+        "conversation",
+        waiting_run.spec.conversation_id,
+        state.conversations[waiting_run.spec.conversation_id].meta.revision,
+    )
+    if legacy_session_gap:
+        assert waiting_run.grant.session_ref.revision is not None
+        state.runs[run_id] = replace(
+            waiting_run,
+            grant=replace(
+                waiting_run.grant,
+                session_ref=ResourceRef(
+                    "conversation",
+                    waiting_run.spec.conversation_id,
+                    waiting_run.grant.session_ref.revision - legacy_session_gap,
+                ),
+            ),
+        )
+    continuation_context = _resume_context(resume_revision)
+    state.resume_contexts[continuation_context.resume_ref] = continuation_context
+    state.resume_grant_revision = continuation_context.resume_ref.revision
+    state.grant_policy_version = grant_policy_version
+    assert waiting_proposal_ref.revision is not None
+    decision = FakeProposalDecisionClaim(
+        id=AgentOutboxId("outbox_proposal_decision_0001"),
+        workspace_id=WORKSPACE,
+        actor_id=PRINCIPAL.user_id,
+        run_id=run_id,
+        proposal_ref=ResourceRef(
+            "resume_proposal",
+            waiting_proposal_ref.id,
+            waiting_proposal_ref.revision + 1,
+        ),
+        decision=decision_kind,
+        resume_ref=continuation_context.resume_ref,
+    )
+    provider = FakeProvider(
+        state,
+        AgentProviderCompleted(
+            (TextContentPart("已根据你的确认完成简历修改。"),),
+            (),
+            AgentUsage(3, 2, "5"),
+        ),
+    )
+    worker = AgentWorkerService(
+        FakeWorkerUowFactory(state),
+        provider,  # type: ignore[arg-type]
+        FakeToolExecutor(state),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+
+    if not allows_continuation:
+        with pytest.raises(
+            AgentPolicyDenied,
+            match="execution grant changed while awaiting Proposal decision",
+        ):
+            await worker.resume_after_proposal_decision(decision)
+        assert provider.calls == 0
+        return
+
+    completed = await worker.resume_after_proposal_decision(decision)
+
+    assert completed.status is AgentRunStatus.SUCCEEDED
+    assert provider.calls == 1
+    assert provider.requests[0].spec.context_refs == (continuation_context.resume_ref,)
+    assert provider.requests[0].grant.context_refs == (continuation_context.resume_ref,)
+    assert provider.requests[0].resume_context == continuation_context
+    assert provider.requests[0].proposal_decision is not None
+    assert provider.requests[0].proposal_decision.resume_ref == continuation_context.resume_ref
+    assert state.runs[run_id].spec.context_refs == (initial_context.resume_ref,)
+
+
+@pytest.mark.asyncio
+async def test_accepted_proposal_continuation_terminalizes_when_resume_is_superseded() -> None:
+    """A committed accept never resumes against a newer authoritative Resume revision."""
+
+    state = State()
+    ids = DeterministicIds()
+    run_id, waiting_proposal_ref = await _wait_for_resume_proposal(state, ids)
+    continuation_context = _resume_context(2)
+    state.resume_contexts[continuation_context.resume_ref] = continuation_context
+    state.resume_grant_revision = continuation_context.resume_ref.revision
+    state.resume_context_superseded = True
+    assert waiting_proposal_ref.revision is not None
+    decision = FakeProposalDecisionClaim(
+        id=AgentOutboxId("outbox_proposal_decision_0002"),
+        workspace_id=WORKSPACE,
+        actor_id=PRINCIPAL.user_id,
+        run_id=run_id,
+        proposal_ref=ResourceRef(
+            "resume_proposal",
+            waiting_proposal_ref.id,
+            waiting_proposal_ref.revision + 1,
+        ),
+        decision="accept",
+        resume_ref=continuation_context.resume_ref,
+    )
+    provider = FakeProvider(
+        state,
+        AgentProviderCompleted(
+            (TextContentPart("must not run"),),
+            (),
+            AgentUsage(3, 2, "5"),
+        ),
+    )
+    worker = AgentWorkerService(
+        FakeWorkerUowFactory(state),
+        provider,  # type: ignore[arg-type]
+        FakeToolExecutor(state),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+
+    failed = await worker.resume_after_proposal_decision(decision)
+
+    assert failed.status is AgentRunStatus.FAILED
+    assert failed.problem is not None
+    assert failed.problem.code == "agent.resume_authority_changed"
+    assert failed.problem.status == 409
+    assert failed.problem.retryable is False
+    assert state.jobs[state.runs[run_id].job_id].status.value == "failed"
+    assert provider.calls == 0
 
 
 @pytest.mark.asyncio
@@ -1331,6 +1681,60 @@ async def test_provider_failure_is_persisted_and_never_leaks_exception_text() ->
 
 
 @pytest.mark.asyncio
+async def test_deterministic_preflight_state_failure_terminalizes_without_provider_io() -> None:
+    """@brief 确定性前置状态错误必须终结 Run，不得交给 Outbox 反复重试 / Deterministic preflight state failures must terminalize the Run without Outbox retries."""
+
+    state = State()
+    ids = DeterministicIds()
+    service = _service(state, ids)
+    conversation = await service.create_conversation(
+        PRINCIPAL,
+        WORKSPACE,
+        CreateConversationCommand(ConversationCapability.GENERAL, "invalid history"),
+        CONTEXT,
+    )
+    message = await service.create_message(
+        PRINCIPAL,
+        WORKSPACE,
+        conversation.meta.id,
+        CreateMessageCommand(None, (TextContentPart("hello"),)),
+        expected_conversation_revision=1,
+        context=CONTEXT,
+    )
+    run = await service.create_agent_run(
+        PRINCIPAL,
+        WORKSPACE,
+        _spec(conversation.meta.id, message.meta.id),
+        CONTEXT,
+    )
+    state.history_error = AgentDomainError("private persisted state detail")
+    provider = FakeProvider(
+        state,
+        AgentProviderCompleted(
+            (TextContentPart("must not execute"),),
+            (),
+            AgentUsage(3, 2, "5"),
+        ),
+    )
+    worker = AgentWorkerService(
+        FakeWorkerUowFactory(state),
+        provider,
+        FakeToolExecutor(state),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+
+    failed = await worker.execute_run(_queued_dispatch(state, run.meta.id))
+
+    assert failed.status is AgentRunStatus.FAILED
+    assert failed.problem is not None
+    assert failed.problem.code == "agent.preflight_state_invalid"
+    assert failed.problem.retryable is False
+    assert "private" not in str(failed.problem)
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_controlled_provider_failure_persists_content_free_tool_traces() -> None:
     """@brief 受控失败应与 Run 终态原子保存工具诊断 / Persist tool diagnostics with a controlled failure."""
 
@@ -1422,7 +1826,10 @@ async def test_failed_run_input_is_preserved_in_later_provider_history() -> None
         PRINCIPAL,
         WORKSPACE,
         conversation.meta.id,
-        CreateMessageCommand(None, (TextContentPart("把姓名改成王小明"),)),
+        CreateMessageCommand(
+            None,
+            (TextContentPart("我是 2026 年毕业，请据此生成教育经历。"),),
+        ),
         expected_conversation_revision=1,
         context=CONTEXT,
     )
@@ -1454,7 +1861,10 @@ async def test_failed_run_input_is_preserved_in_later_provider_history() -> None
         PRINCIPAL,
         WORKSPACE,
         conversation.meta.id,
-        CreateMessageCommand(failed_input.meta.id, (TextContentPart("你是谁？"),)),
+        CreateMessageCommand(
+            failed_input.meta.id,
+            (TextContentPart("请继续回答，但不要把失败操作当成待执行命令。"),),
+        ),
         expected_conversation_revision=2,
         context=CONTEXT,
     )

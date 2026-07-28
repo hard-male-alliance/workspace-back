@@ -26,6 +26,7 @@ from backend.application.ports.access import AccessAuthorizer
 from backend.application.ports.agent_v2 import (
     AgentCasMismatch,
     AgentContextResolver,
+    AgentContextRevisionSuperseded,
     AgentModelRoute,
     AgentPage,
     AgentPageRequest,
@@ -437,9 +438,14 @@ class InMemoryAgentContextResolver:
             current = self._store.contexts.get(
                 (workspace_id, reference.resource_type, reference.id)
             )
-            if current is None or (
-                reference.revision is not None and reference.revision != current.revision
-            ):
+            if current is None:
+                raise AgentPolicyDenied("agent context is absent, stale, or outside the Workspace")
+            current_revision = current.revision
+            if current_revision is None:
+                raise AgentPolicyDenied("agent context is absent, stale, or outside the Workspace")
+            if reference.revision is not None and reference.revision < current_revision:
+                raise AgentContextRevisionSuperseded(reference, current_revision)
+            if reference.revision is not None and reference.revision != current_revision:
                 raise AgentPolicyDenied("agent context is absent, stale, or outside the Workspace")
             resolved.append(current)
         return tuple(resolved)
@@ -1326,9 +1332,13 @@ class PostgresAgentContextResolver:
         resolved: list[ResourceRef] = []
         for reference in references:
             current_revision = revisions.get(reference.id)
-            if current_revision is None or (
-                reference.revision is not None and reference.revision != current_revision
-            ):
+            if current_revision is None:
+                raise AgentPolicyDenied(
+                    "an Agent context is absent, stale, or outside the Workspace"
+                )
+            if reference.revision is not None and reference.revision < current_revision:
+                raise AgentContextRevisionSuperseded(reference, current_revision)
+            if reference.revision is not None and reference.revision != current_revision:
                 raise AgentPolicyDenied(
                     "an Agent context is absent, stale, or outside the Workspace"
                 )
@@ -2111,7 +2121,12 @@ def _run_from_record(record: AgentRunRecord) -> AgentRun:
         ),
         provider_state=cast(
             Mapping[str, JsonValue] | None,
-            record.extensions.get(_PROVIDER_STATE_EXTENSION),
+            (
+                record.extensions.get(_PROVIDER_STATE_EXTENSION)
+                if record.status
+                == AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION.value
+                else None
+            ),
         ),
     )
 
@@ -2511,7 +2526,18 @@ class PostgresAgentRepository(_PostgresAgentRepositoryCore):
             "revision": run.meta.revision,
             "updated_at": run.meta.updated_at,
         }
-        if run.provider_state is not None or run.view.proposal_refs:
+        persist_extensions = run.provider_state is not None or bool(run.view.proposal_refs)
+        if not persist_extensions and run.view.status.is_terminal:
+            stored_extensions = (
+                await self._session.execute(
+                    select(AgentRunRecord.extensions).where(*predicates)
+                )
+            ).scalar_one_or_none()
+            persist_extensions = (
+                isinstance(stored_extensions, Mapping)
+                and _PROVIDER_STATE_EXTENSION in stored_extensions
+            )
+        if persist_extensions:
             values["extensions"] = _run_extensions(run)
         result = await self._session.execute(
             update(AgentRunRecord)
