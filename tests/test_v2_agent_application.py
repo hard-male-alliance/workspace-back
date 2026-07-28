@@ -1406,8 +1406,8 @@ async def test_controlled_provider_failure_persists_content_free_tool_traces() -
 
 
 @pytest.mark.asyncio
-async def test_failed_run_input_is_excluded_from_later_provider_history() -> None:
-    """失败编辑输入不能在后续普通对话中被当成仍待执行的指令。"""
+async def test_failed_run_input_remains_available_as_later_provider_context() -> None:
+    """失败编辑输入中的用户事实仍须进入后续 Provider 上下文。"""
 
     state = State()
     ids = DeterministicIds()
@@ -1422,7 +1422,10 @@ async def test_failed_run_input_is_excluded_from_later_provider_history() -> Non
         PRINCIPAL,
         WORKSPACE,
         conversation.meta.id,
-        CreateMessageCommand(None, (TextContentPart("把姓名改成王小明"),)),
+        CreateMessageCommand(
+            None,
+            (TextContentPart("我是 2026 年毕业，请据此生成教育经历。"),),
+        ),
         expected_conversation_revision=1,
         context=CONTEXT,
     )
@@ -1454,7 +1457,10 @@ async def test_failed_run_input_is_excluded_from_later_provider_history() -> Non
         PRINCIPAL,
         WORKSPACE,
         conversation.meta.id,
-        CreateMessageCommand(failed_input.meta.id, (TextContentPart("你是谁？"),)),
+        CreateMessageCommand(
+            failed_input.meta.id,
+            (TextContentPart("请继续回答，但不要把失败操作当成待执行命令。"),),
+        ),
         expected_conversation_revision=2,
         context=CONTEXT,
     )
@@ -1483,7 +1489,7 @@ async def test_failed_run_input_is_excluded_from_later_provider_history() -> Non
     await worker.execute_run(_queued_dispatch(state, current_run.meta.id))
 
     assert provider.requests[0].input_message == current_input
-    assert provider.requests[0].conversation_history == ()
+    assert provider.requests[0].conversation_history == (failed_input,)
 
 
 @pytest.mark.asyncio

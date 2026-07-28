@@ -2581,6 +2581,7 @@ async def _load_provider_conversation_history(
         AgentRunStatus.SUCCEEDED,
         AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
     }
+    user_context_statuses = eligible_statuses | {AgentRunStatus.FAILED}
     runs_by_input: dict[MessageId, list[AgentRun]] = {}
     for run in runs:
         if (
@@ -2597,7 +2598,7 @@ async def _load_provider_conversation_history(
         if message.role is MessageRole.USER:
             linked_runs = runs_by_input.get(message.meta.id)
             return linked_runs is None or any(
-                run.view.status in eligible_statuses for run in linked_runs
+                run.view.status in user_context_statuses for run in linked_runs
             )
         if message.source_run_id is None:
             return False

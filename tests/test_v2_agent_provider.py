@@ -107,6 +107,7 @@ class SequenceModel(Model):
     def __init__(self, responses: list[ModelResponse]) -> None:
         self.responses = responses
         self.calls: list[tuple[Any, list[Any], Any]] = []
+        self.instructions: list[str | None] = []
 
     async def get_response(
         self,
@@ -123,7 +124,6 @@ class SequenceModel(Model):
         prompt: Any,
     ) -> ModelResponse:
         del (
-            system_instructions,
             model_settings,
             handoffs,
             tracing,
@@ -131,6 +131,7 @@ class SequenceModel(Model):
             conversation_id,
             prompt,
         )
+        self.instructions.append(system_instructions)
         self.calls.append((input, tools, output_schema))
         return self.responses.pop(0)
 
@@ -339,6 +340,43 @@ def _resume_request() -> AgentProviderRequest:
         ),
         resume_context=AgentResumeContext(resume_ref, document),
     )
+
+
+@pytest.mark.asyncio
+async def test_resume_provider_preserves_explicit_date_facts_in_model_input() -> None:
+    """@brief 显式年份进入模型输入且提示禁止替换 / Preserve an explicit year and forbid replacing it."""
+
+    model = SequenceModel([_text_response("已记住。", "response_explicit_year")])
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+    request = _resume_request()
+    history = Message(
+        ResourceMeta(MessageId("message_explicit_year_0001"), 1, NOW, NOW),
+        WORKSPACE_ID,
+        request.spec.conversation_id,
+        1,
+        MessageRole.USER,
+        None,
+        (TextContentPart("我于 2026 年毕业。"),),
+    )
+
+    await provider.execute(
+        replace(
+            request,
+            input_message=replace(request.input_message, sequence=2),
+            conversation_history=(history,),
+        )
+    )
+
+    model_input = repr(model.calls[0][0])
+    assert "2026" in model_input
+    assert "2025" not in model_input
+    instructions = model.instructions[0] or ""
+    assert "explicit dates" in instructions
+    assert "Never replace" in instructions
 
 
 @pytest.mark.asyncio
