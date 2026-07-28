@@ -39,6 +39,7 @@ from backend.domain.interview_v2 import (
     CreateRealtimeConnectionSpec,
     EndInterviewReason,
     EndSessionJobSpec,
+    InterviewDomainError,
     InterviewerUtteranceInput,
     InterviewJobQueuedRecord,
     InterviewKnowledgeContext,
@@ -850,16 +851,21 @@ class InterviewApplicationService:
                     "interview_report.rubric_mismatch",
                     "the requested Rubric version does not match the frozen Session Rubric",
                 )
-            if await uow.repository.has_live_report_job(workspace_id, session_id):
-                raise InterviewConflict(
-                    "interview_report.job_exists",
-                    "the Session already has a live Report Job",
-                )
+            live_job = await uow.repository.get_live_report_job(workspace_id, session_id)
+            if live_job is not None:
+                await uow.commit()
+                return live_job
             job = Job(
                 meta=ResourceMeta(JobId(self._ids("job")), 1, now, now),
                 workspace_id=workspace_id,
                 kind=INTERVIEW_REPORT_JOB_KIND,
                 subject=_session_ref(session),
+                progress=JobProgress(
+                    phase="preparing_input",
+                    completed=0,
+                    total=None,
+                    unit=JobProgressUnit.STEPS,
+                ),
             )
             await uow.jobs.add(
                 job,
@@ -1232,13 +1238,30 @@ class InterviewWorkerService:
         clock: Clock | None = None,
         id_factory: OpaqueIdFactory | None = None,
         maximum_report_segments: int = 20_000,
+        report_job_timeout_ms: int = 300_000,
+        report_maximum_attempts: int = 3,
     ) -> None:
         """@brief 注入 Ports、真实 service actor 与有界 Transcript / Inject ports, a real service actor, and a bounded Transcript.
 
         @param service_actor 与 persistence scope 完全一致的服务身份 / Service identity exactly matching the persistence scope.
+        @param report_job_timeout_ms 整个 Report Job 的持久 wall-time 上限 / Durable
+            wall-time limit for the whole Report Job.
+        @param report_maximum_attempts Report 专用尝试上限 / Report-specific attempt cap.
         """
         if not 1 <= maximum_report_segments <= 100_000:
             raise ValueError("maximum report segments must be 1 to 100000")
+        if (
+            isinstance(report_job_timeout_ms, bool)
+            or not isinstance(report_job_timeout_ms, int)
+            or not 1 <= report_job_timeout_ms <= 300_000
+        ):
+            raise ValueError("report job timeout must be 1 to 300000 milliseconds")
+        if (
+            isinstance(report_maximum_attempts, bool)
+            or not isinstance(report_maximum_attempts, int)
+            or not 1 <= report_maximum_attempts <= 12
+        ):
+            raise ValueError("report maximum attempts must be 1 to 12")
         if service_actor.resource_type != "service" or service_actor.revision is not None:
             raise ValueError("Interview worker actor must be an unversioned service ref")
         self._uow_factory = uow_factory
@@ -1249,6 +1272,8 @@ class InterviewWorkerService:
         self._ids = id_factory or NewOpaqueIdFactory()
         self._service_actor = service_actor
         self._maximum_report_segments = maximum_report_segments
+        self._report_job_timeout_ms = report_job_timeout_ms
+        self._report_maximum_attempts = report_maximum_attempts
 
     async def execute_queued_job(
         self,
@@ -1289,11 +1314,39 @@ class InterviewWorkerService:
 
         if job.status.is_terminal and job.status is not JobStatus.SUCCEEDED:
             return
+        effective_maximum_attempts = maximum_attempts
+        if job.kind == INTERVIEW_REPORT_JOB_KIND:
+            effective_maximum_attempts = min(
+                maximum_attempts,
+                self._report_maximum_attempts,
+            )
+            if self._report_deadline_exhausted(job):
+                await self._fail_exhausted_job(
+                    workspace_id,
+                    session_id,
+                    job_id,
+                    failure_code="interview.report_job_timeout",
+                )
+                return
+            if attempt_count > effective_maximum_attempts:
+                await self._fail_exhausted_job(
+                    workspace_id,
+                    session_id,
+                    job_id,
+                    failure_code="interview.report_attempts_exhausted",
+                )
+                return
         try:
             if job.kind == INTERVIEW_END_JOB_KIND:
                 await self.execute_end_job(workspace_id, session_id, job_id)
             elif job.kind == INTERVIEW_REPORT_JOB_KIND:
-                await self.execute_report_job(workspace_id, session_id, job_id)
+                await self.execute_report_job(
+                    workspace_id,
+                    session_id,
+                    job_id,
+                    attempt_count=attempt_count,
+                    maximum_attempts=effective_maximum_attempts,
+                )
             else:
                 raise InterviewPortProtocolError(
                     "interview.job_kind_unsupported",
@@ -1303,15 +1356,41 @@ class InterviewWorkerService:
             # The concrete executor already committed a terminal Job/domain failure. Completing the
             # outbox row is the idempotent acknowledgement; retrying cannot turn that Job successful.
             return
-        except InterviewWorkerRetry:
-            if attempt_count < maximum_attempts:
+        except InterviewWorkerRetry as error:
+            exhausted_by_time = (
+                job.kind == INTERVIEW_REPORT_JOB_KIND
+                and await self._report_job_deadline_exhausted(workspace_id, job_id)
+            )
+            if attempt_count < effective_maximum_attempts and not exhausted_by_time:
                 raise
-            await self._fail_exhausted_job(workspace_id, session_id, job_id)
+            await self._fail_exhausted_job(
+                workspace_id,
+                session_id,
+                job_id,
+                failure_code=(
+                    "interview.report_job_timeout"
+                    if exhausted_by_time
+                    else (
+                        error.code
+                        if job.kind == INTERVIEW_REPORT_JOB_KIND
+                        else "interview.worker_attempts_exhausted"
+                    )
+                ),
+            )
         except InterviewConflict as error:
             if await self._job_is_terminal(workspace_id, job_id):
                 return
-            if attempt_count >= maximum_attempts:
-                await self._fail_exhausted_job(workspace_id, session_id, job_id)
+            if attempt_count >= effective_maximum_attempts:
+                await self._fail_exhausted_job(
+                    workspace_id,
+                    session_id,
+                    job_id,
+                    failure_code=(
+                        "interview.report_attempts_exhausted"
+                        if job.kind == INTERVIEW_REPORT_JOB_KIND
+                        else "interview.worker_attempts_exhausted"
+                    ),
+                )
                 return
             raise InterviewWorkerRetry(
                 "interview.worker_race",
@@ -1650,8 +1729,21 @@ class InterviewWorkerService:
         workspace_id: WorkspaceId,
         session_id: InterviewSessionId,
         job_id: JobId,
+        *,
+        attempt_count: int = 1,
+        maximum_attempts: int = 1,
     ) -> InterviewReport:
-        """@brief 用冻结 Rubric 和一致 Transcript 生成 immutable Report / Generate an immutable Report from a frozen Rubric and consistent Transcript."""
+        """@brief 用冻结 Rubric 和一致 Transcript 生成 immutable Report / Generate an immutable Report from a frozen Rubric and consistent Transcript.
+
+        @param workspace_id 精确 Workspace / Exact Workspace.
+        @param session_id 报告所属 Session / Session owning the Report.
+        @param job_id 持久化统一 Job / Durable unified Job.
+        @param attempt_count 当前报告尝试序号 / Current Report attempt number.
+        @param maximum_attempts 报告专用尝试上限 / Report-specific attempt cap.
+        @return 已持久化的 immutable Report / Persisted immutable Report.
+        """
+        if not 1 <= attempt_count <= maximum_attempts <= 12:
+            raise ValueError("Report attempt bounds are invalid")
         started_at = self._clock.now()
         try:
             async with self._uow_factory() as first:
@@ -1707,9 +1799,9 @@ class InterviewWorkerService:
                     started_job = job.start(
                         at=started_at,
                         progress=JobProgress(
-                            phase="report_generation",
-                            completed=0,
-                            total=None,
+                            phase="waiting_provider",
+                            completed=attempt_count - 1,
+                            total=maximum_attempts,
                             unit=JobProgressUnit.STEPS,
                         ),
                     )
@@ -1718,13 +1810,26 @@ class InterviewWorkerService:
                         expected_revision=job.meta.revision,
                     )
                 else:
-                    started_job = job
+                    started_job = job.report_progress(
+                        JobProgress(
+                            phase="waiting_provider",
+                            completed=attempt_count - 1,
+                            total=maximum_attempts,
+                            unit=JobProgressUnit.STEPS,
+                        ),
+                        at=started_at,
+                    )
+                    await first.jobs.save(
+                        started_job,
+                        expected_revision=job.meta.revision,
+                    )
                 request = ReportGenerationRequest(
                     session_id=session_id,
                     locale=session.spec.locale,
                     job_target=session.spec.job_target,
                     rubric=session.spec.rubric_snapshot,
                     transcript=transcript,
+                    compact_output=attempt_count > 1,
                 )
                 await first.commit()
         except InterviewCasMismatch as error:
@@ -1738,6 +1843,13 @@ class InterviewWorkerService:
                 request,
                 operation_id=_worker_operation_id(started_job),
             )
+            started_job = await self._update_report_job_progress(
+                workspace_id,
+                started_job,
+                phase="validating",
+                completed=attempt_count,
+                total=maximum_attempts,
+            )
             draft.validate_against(
                 request.rubric,
                 request.transcript,
@@ -1745,6 +1857,29 @@ class InterviewWorkerService:
             )
         except InterviewWorkerPortFailure as error:
             if error.retryable:
+                corrective_failure = error.code in {
+                    "interview.report_provider_domain_invalid",
+                    "interview.report_provider_output_truncated",
+                    "interview.report_provider_json_invalid",
+                    "interview.report_provider_schema_invalid",
+                }
+                if corrective_failure and attempt_count >= 2:
+                    await self._fail_report_job(
+                        workspace_id,
+                        started_job,
+                        failure_code=error.code,
+                    )
+                    raise InterviewWorkerError(
+                        error.code,
+                        "Interview Report corrective retry failed",
+                    ) from error
+                await self._update_report_job_progress(
+                    workspace_id,
+                    started_job,
+                    phase="retry_scheduled",
+                    completed=attempt_count,
+                    total=maximum_attempts,
+                )
                 raise InterviewWorkerRetry(
                     error.code,
                     "Interview Report generation is temporarily unavailable",
@@ -1757,6 +1892,16 @@ class InterviewWorkerService:
             raise InterviewWorkerError(
                 error.code,
                 "Interview Report generation failed",
+            ) from error
+        except InterviewDomainError as error:
+            await self._fail_report_job(
+                workspace_id,
+                started_job,
+                failure_code="interview.report_provider_domain_invalid",
+            )
+            raise InterviewWorkerError(
+                "interview.report_provider_domain_invalid",
+                "Interview Report violated the frozen Session evidence constraints",
             ) from error
         except Exception as error:
             await self._fail_report_job(workspace_id, started_job)
@@ -1805,6 +1950,12 @@ class InterviewWorkerService:
                 completed_job = current_job.succeed(
                     [ResourceRef("interview_report", report.meta.id, report.meta.revision)],
                     at=generated_at,
+                    progress=JobProgress(
+                        phase="publishing",
+                        completed=maximum_attempts,
+                        total=maximum_attempts,
+                        unit=JobProgressUnit.STEPS,
+                    ),
                 )
                 await second.repository.add_report(report)
                 await second.repository.save_session(
@@ -1835,6 +1986,89 @@ class InterviewWorkerService:
                 "the Session or Job changed while the Report was committed",
             ) from error
 
+    def _report_deadline_exhausted(self, job: Job) -> bool:
+        """@brief 判断 Report Job 的持久 wall-time 是否耗尽 / Test the durable Report Job wall-time deadline.
+
+        @param job 当前统一 Job 快照 / Current unified Job snapshot.
+        @return 已开始且 elapsed 达到配置上限时为真 / True when a started Job reached its
+            configured elapsed-time cap.
+        """
+
+        if job.started_at is None:
+            return False
+        elapsed_ms = (self._clock.now() - job.started_at).total_seconds() * 1_000
+        return elapsed_ms >= self._report_job_timeout_ms
+
+    async def _report_job_deadline_exhausted(
+        self,
+        workspace_id: WorkspaceId,
+        job_id: JobId,
+    ) -> bool:
+        """@brief 重新读取 Report Job 后判断 deadline / Re-read a Report Job and test its deadline.
+
+        @param workspace_id 精确 Workspace / Exact Workspace.
+        @param job_id 待检查的统一 Job / Unified Job to inspect.
+        @return 当前持久快照是否已超时 / Whether the current durable snapshot timed out.
+        """
+
+        async with self._uow_factory() as uow:
+            job = await _worker_job(uow, workspace_id, job_id, for_update=False)
+            exhausted = self._report_deadline_exhausted(job)
+            await uow.commit()
+            return exhausted
+
+    async def _update_report_job_progress(
+        self,
+        workspace_id: WorkspaceId,
+        expected_job: Job,
+        *,
+        phase: str,
+        completed: int,
+        total: int,
+    ) -> Job:
+        """@brief CAS 持久化不含内容的 Report 阶段 / CAS-persist a content-free Report phase.
+
+        @param workspace_id 精确 Workspace / Exact Workspace.
+        @param expected_job 调用方持有的 Job revision / Job revision held by the caller.
+        @param phase 稳定阶段标识 / Stable phase identifier.
+        @param completed 已完成步骤数 / Completed step count.
+        @param total 尝试预算总数 / Total attempt budget.
+        @return 更新后的 running Job / Updated running Job.
+        @raise InterviewConflict revision 竞争时抛出 / Raised on a revision race.
+        """
+
+        updated_at = self._clock.now()
+        try:
+            async with self._uow_factory() as uow:
+                current = await _worker_job(
+                    uow,
+                    workspace_id,
+                    expected_job.meta.id,
+                    for_update=True,
+                )
+                if current.meta.revision != expected_job.meta.revision:
+                    raise InterviewConflict(
+                        "interview_report.worker_race",
+                        "the Report Job changed while progress was recorded",
+                    )
+                updated = current.report_progress(
+                    JobProgress(
+                        phase=phase,
+                        completed=completed,
+                        total=total,
+                        unit=JobProgressUnit.STEPS,
+                    ),
+                    at=updated_at,
+                )
+                await uow.jobs.save(updated, expected_revision=current.meta.revision)
+                await uow.commit()
+                return updated
+        except InterviewCasMismatch as error:
+            raise InterviewConflict(
+                "interview_report.worker_race",
+                "the Report Job changed while progress was recorded",
+            ) from error
+
     async def _job_is_terminal(
         self,
         workspace_id: WorkspaceId,
@@ -1856,12 +2090,15 @@ class InterviewWorkerService:
         workspace_id: WorkspaceId,
         session_id: InterviewSessionId,
         job_id: JobId,
+        *,
+        failure_code: str = "interview.worker_attempts_exhausted",
     ) -> None:
         """@brief 最后一次重试原子终结 Session/Job / Atomically terminate Session/Job on the final retry.
 
         @param workspace_id 精确 Workspace / Exact Workspace.
         @param session_id claim 绑定的 Session / Session bound by the claim.
         @param job_id 已耗尽重试的统一 Job / Unified Job whose retries are exhausted.
+        @param failure_code 不含敏感信息的稳定失败码 / Stable non-sensitive failure code.
         """
         failed_at = self._clock.now()
         try:
@@ -1897,7 +2134,7 @@ class InterviewWorkerService:
                     )
                 problem = _worker_problem(
                     job.meta.id,
-                    "interview.worker_attempts_exhausted",
+                    failure_code,
                     "Interview worker retries exhausted",
                     "The Interview operation could not be completed after bounded retries.",
                 )

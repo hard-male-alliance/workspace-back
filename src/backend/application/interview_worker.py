@@ -103,6 +103,8 @@ class InterviewJobOutboxHandler:
                         "operation": "interview_job",
                         "outcome": "retry",
                         "error_code": error.code,
+                        "attempt_count": claim.attempt_count,
+                        "maximum_attempts": self._maximum_attempts,
                     },
                 },
             )

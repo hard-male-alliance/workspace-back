@@ -397,12 +397,24 @@ class FakeRepository:
         workspace_id: WorkspaceId,
         session_id: InterviewSessionId,
     ) -> bool:
-        return any(
-            job.workspace_id == workspace_id
-            and job.kind == INTERVIEW_REPORT_JOB_KIND
-            and job.subject.id == session_id
-            and not job.is_terminal
-            for job in self.state.jobs.values()
+        return await self.get_live_report_job(workspace_id, session_id) is not None
+
+    async def get_live_report_job(
+        self,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+    ) -> Job | None:
+        """@brief 读取测试状态中的 live Report Job / Read a live Report Job from test state."""
+        return next(
+            (
+                job
+                for job in self.state.jobs.values()
+                if job.workspace_id == workspace_id
+                and job.kind == INTERVIEW_REPORT_JOB_KIND
+                and job.subject.id == session_id
+                and not job.is_terminal
+            ),
+            None,
         )
 
 
@@ -529,6 +541,7 @@ class FakeRealtimeGateway:
     def __init__(self, state: State) -> None:
         self.state = state
         self.revoked: list[RealtimeConnectionId] = []
+        self.issued: list[RealtimeConnectionId] = []
         self.mutate_after_issue = False
 
     async def issue(
@@ -557,6 +570,7 @@ class FakeRealtimeGateway:
         if self.mutate_after_issue:
             current = self.state.sessions[session.meta.id]
             self.state.sessions[session.meta.id] = current.mark_connecting(at=issued_at)
+        self.issued.append(connection.id)
         return connection
 
     async def revoke(self, connection_id: RealtimeConnectionId) -> None:
@@ -1154,6 +1168,14 @@ async def test_all_twelve_routes_and_workers_form_one_strict_lifecycle() -> None
         CreateInterviewReportJobCommand("1"),
         CONTEXT,
     )
+    duplicate_report_job = await service.create_report_job(
+        PRINCIPAL,
+        WORKSPACE,
+        session_id,
+        CreateInterviewReportJobCommand("1"),
+        CONTEXT,
+    )
+    assert duplicate_report_job.meta.id == report_job.meta.id
     await worker.execute_queued_job(
         WORKSPACE,
         session_id,
@@ -1167,6 +1189,8 @@ async def test_all_twelve_routes_and_workers_form_one_strict_lifecycle() -> None
     assert await service.get_report(PRINCIPAL, WORKSPACE, report.meta.id) == report
     assert state.sessions[session_id].view.report_id == report.meta.id
     assert state.jobs[report_job.meta.id].status is JobStatus.SUCCEEDED
+    assert state.jobs[report_job.meta.id].progress is not None
+    assert state.jobs[report_job.meta.id].progress.phase == "publishing"
     await worker.execute_queued_job(
         WORKSPACE,
         session_id,
@@ -1349,6 +1373,59 @@ async def test_repository_cross_workspace_rows_are_rejected() -> None:
 
     with pytest.raises(InterviewPortProtocolError):
         await service.list_scenarios(PRINCIPAL, WORKSPACE, InterviewPageRequest())
+
+
+@pytest.mark.asyncio
+async def test_connecting_session_can_issue_a_replacement_realtime_connection() -> None:
+    """@brief 验证握手前可为 connecting Session 重签连接 / Verify a connecting Session can reissue a connection before handshake.
+
+    @return 无 / None.
+    """
+    state = State()
+    service, _worker, gateway = _services(state)
+    scenario = await service.create_scenario(
+        PRINCIPAL,
+        WORKSPACE,
+        CreateInterviewScenarioCommand(_scenario_spec()),
+        CONTEXT,
+    )
+    active = await service.update_scenario(
+        PRINCIPAL,
+        WORKSPACE,
+        scenario.meta.id,
+        InterviewScenarioPatch({"status": InterviewScenarioStatus.ACTIVE}),
+        expected_revision=1,
+        context=CONTEXT,
+    )
+    session = await service.create_session(
+        PRINCIPAL,
+        WORKSPACE,
+        _session_command(active.meta.id),
+        CONTEXT,
+    )
+    spec = CreateRealtimeConnectionSpec((RealtimeTransport.WEBRTC,), (), ())
+
+    first = await service.create_realtime_connection(
+        PRINCIPAL,
+        WORKSPACE,
+        session.meta.id,
+        spec,
+        CONTEXT,
+    )
+    replacement = await service.create_realtime_connection(
+        PRINCIPAL,
+        WORKSPACE,
+        session.meta.id,
+        spec,
+        CONTEXT,
+    )
+
+    assert replacement.id == first.id
+    assert gateway.issued == [
+        RealtimeConnectionId("connection_0001"),
+        RealtimeConnectionId("connection_0001"),
+    ]
+    assert state.sessions[session.meta.id].view.status is InterviewSessionStatus.CONNECTING
 
 
 @pytest.mark.asyncio

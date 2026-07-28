@@ -223,11 +223,13 @@ async def test_openai_compatible_provider_wires_exact_native_strict_schema_with_
             "output_modes": ["text", "citations", "resume_operations"],
             "response_format": "agent.output.strict_json.v1",
             "response_schema": schema,
+            "max_output_tokens": 4_096,
             "inference": _external_inference(),
         }
         assert [chunk async for chunk in provider.stream_text("test", request)] == ["{}"]
 
     assert observed_payload["stream"] is True
+    assert observed_payload["max_tokens"] == 4_096
     assert observed_payload["response_format"] == {
         "type": "json_schema",
         "json_schema": {
@@ -236,9 +238,51 @@ async def test_openai_compatible_provider_wires_exact_native_strict_schema_with_
             "schema": schema,
         },
     }
+    assert observed_payload["provider"] == {"require_parameters": True}
     assert all(
         descriptor.supports_structured_output for descriptor in provider.capabilities()
     )
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_provider_classifies_length_finish_as_truncation() -> None:
+    """@brief ``finish_reason=length`` 必须成为可重试截断而非成功 / ``finish_reason=length`` must be retryable truncation, not success."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """@brief 返回 token 预算耗尽的 SSE / Return an SSE stream that exhausted its token budget.
+
+        @param request MockTransport 请求 / MockTransport request.
+        @return 截断完成帧 / Truncated terminal frame.
+        """
+        del request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'data: {"choices":[{"delta":{"content":"{\\"partial\\":"},'
+                b'"finish_reason":"length"}]}\n\n'
+            ),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = OpenAICompatibleModelProvider(
+            provider="openrouter",
+            model="server-side-model",
+            base_url="https://provider.example/v1",
+            api_key="test-only-secret",
+            client=client,
+        )
+        with pytest.raises(ModelProviderStreamError) as captured:
+            _ = [
+                chunk
+                async for chunk in provider.stream_text(
+                    "test",
+                    {"capability": "general", "inference": _external_inference()},
+                )
+            ]
+
+    assert captured.value.problem.code == "agent.provider_output_truncated"
+    assert captured.value.problem.retryable is True
 
 
 @pytest.mark.asyncio

@@ -263,6 +263,7 @@ def test_invalid_request_id_early_return_is_finalized_exactly_once(
         "http.request.method": "GET",
         "http.response.status_code": 400,
         "http.route": "pre_auth",
+        "error_code": "http.invalid_request_id",
         "outcome": "client_error",
         "url.scheme": "http",
     }

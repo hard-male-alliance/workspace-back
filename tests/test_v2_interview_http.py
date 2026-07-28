@@ -257,6 +257,7 @@ class _Service:
         self.session_calls = 0
         self.last_after: str | None = None
         self.reject_session = False
+        self.invalid_connection_response = False
 
     async def list_scenarios(
         self, _principal: object, _workspace: object, page: InterviewPageRequest
@@ -304,7 +305,11 @@ class _Service:
             SESSION_ID,
             ResourceRef("user", "user_http_0001"),
             RealtimeTransport.WEBRTC,
-            "wss://realtime.example.com/interview",
+            (
+                "ws://localhost:8000/realtime/v2/interview"
+                if self.invalid_connection_response
+                else "wss://realtime.example.com/interview"
+            ),
             EphemeralToken("ephemeral-secret-http-0001"),
             (IceServer(("turn:turn.example.com",), "turn-user", "turn-secret-http"),),
             NOW,
@@ -644,6 +649,25 @@ def test_sensitive_receipts_replay_byte_exactly_without_plaintext_at_rest() -> N
     assert "ephemeral-secret-http-0001" not in records
     assert "turn-secret-http" not in records
     assert "consent-http-1" not in records
+
+
+def test_server_authored_realtime_contract_failure_is_not_reported_as_user_input() -> None:
+    """@brief 服务端连接描述符违约返回稳定 500，而不是误导性的用户 422 / A server-authored connection violation returns a stable 500 instead of a misleading user 422."""
+
+    harness = _harness()
+    harness.service.invalid_connection_response = True
+    response = harness.client.post(
+        f"/api/v2/workspaces/{WORKSPACE}/interview-sessions/{SESSION_ID}/connections",
+        json={"supported_transports": ["webrtc"], "audio_codecs": [], "video_codecs": []},
+        headers=_headers(key="connection-invalid-response-0001"),
+    )
+
+    assert response.status_code == 500
+    assert response.json()["code"] == "interview.realtime_connection_response_invalid"
+    assert response.json()["retryable"] is True
+    assert response.json()["request_id"] == response.headers["x-request-id"]
+    assert "localhost" not in response.text
+    assert "ephemeral-secret-http-0001" not in response.text
 
 
 def test_sensitive_failure_keeps_bearer_challenge_and_no_store_policy() -> None:

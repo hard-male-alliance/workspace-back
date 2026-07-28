@@ -1155,30 +1155,7 @@ def _agent_runtime_for(
             openai_client=sdk_client,
             buffer_streamed_tool_calls=True,
         )
-    model_adapter = OpenAIAgentsSDKProvider(
-        sdk_model,
-        input_cost_microusd_per_million_tokens=(
-            settings.ai.metering.input_cost_microusd_per_million_tokens
-        ),
-        output_cost_microusd_per_million_tokens=(
-            settings.ai.metering.output_cost_microusd_per_million_tokens
-        ),
-        telemetry=telemetry,
-        client=sdk_client,
-    )
-    tool_executor = UnavailableAgentToolExecutor()
-    tool_registry = EmptyAgentToolRegistry()
     if database is not None:
-        if memory_access_store is not None:
-            raise RuntimeError("PostgreSQL Agent runtime cannot use an in-memory Access store")
-        postgres_public_uow = PostgresAgentUnitOfWorkFactory(
-            database,
-            model_routes=model_routes,
-        )
-        postgres_worker_uow = PostgresAgentWorkerUnitOfWorkFactory(
-            database,
-            model_routes=model_routes,
-        )
         embedding_space = EmbeddingSpaceSelection(
             settings.ai.embedding_provider,
             settings.ai.embedding_model,
@@ -1197,12 +1174,38 @@ def _agent_runtime_for(
                 candidate_multiplier=settings.knowledge.search.candidate_multiplier,
             )
         )
+    else:
+        retriever = GrantedAgentKnowledgeRetriever(MemoryHybridKnowledgeSearch(()))
+    model_adapter = OpenAIAgentsSDKProvider(
+        sdk_model,
+        input_cost_microusd_per_million_tokens=(
+            settings.ai.metering.input_cost_microusd_per_million_tokens
+        ),
+        output_cost_microusd_per_million_tokens=(
+            settings.ai.metering.output_cost_microusd_per_million_tokens
+        ),
+        telemetry=telemetry,
+        client=sdk_client,
+        knowledge_retriever=retriever,
+    )
+    tool_executor = UnavailableAgentToolExecutor()
+    tool_registry = EmptyAgentToolRegistry()
+    if database is not None:
+        if memory_access_store is not None:
+            raise RuntimeError("PostgreSQL Agent runtime cannot use an in-memory Access store")
+        postgres_public_uow = PostgresAgentUnitOfWorkFactory(
+            database,
+            model_routes=model_routes,
+        )
+        postgres_worker_uow = PostgresAgentWorkerUnitOfWorkFactory(
+            database,
+            model_routes=model_routes,
+        )
         application = V2AgentApplicationService(cast(AgentUnitOfWorkFactory, postgres_public_uow))
         worker = AgentWorkerService(
             cast(AgentWorkerUnitOfWorkFactory, postgres_worker_uow),
             model_adapter,
             tool_executor,
-            knowledge_retriever=retriever,
             tool_registry=tool_registry,
         )
         handler = AgentRunOutboxHandler(worker)
@@ -1238,7 +1241,6 @@ def _agent_runtime_for(
         cast(AgentWorkerUnitOfWorkFactory, memory_worker_uow),
         model_adapter,
         tool_executor,
-        knowledge_retriever=GrantedAgentKnowledgeRetriever(MemoryHybridKnowledgeSearch(())),
         tool_registry=tool_registry,
     )
     dispatcher = InMemoryAgentDispatchService(store, worker)
@@ -1396,6 +1398,8 @@ def _interview_runtime_for(
         _interview_report_provider(settings, provider, primary_model_route),
         media_analyzer,
         service_actor=service_actor,
+        report_job_timeout_ms=settings.interview.report_job_timeout_ms,
+        report_maximum_attempts=settings.interview.report_maximum_attempts,
     )
     handler = InterviewJobOutboxHandler(
         worker,
@@ -1436,10 +1440,10 @@ def _interview_report_provider(
     @param route 与 Session policy 相同的 primary route / Primary route shared with Session policy.
     @return production 严格 JSON adapter、开发 mock 或 fail-closed adapter / Production strict
         JSON adapter, development mock, or fail-closed adapter.
-    @note Report request 尚未携带用户冻结的 fallback 授权，因此此边界固定禁止 provider
-        fallback；不能把全局配置当成用户同意。/ Report requests do not yet carry frozen user
-        fallback consent, so this boundary disables provider fallback rather than treating global
-        configuration as user authorization.
+    @note 只有与冻结 route 同地域、同外部处理语义的候选才属于该 route group；跨地域候选
+        仍会被 provider policy 拒绝。/ Only candidates sharing the frozen route's region and
+        external-processing semantics belong to that route group; cross-region candidates remain
+        rejected by provider policy.
     """
     if settings.interview.report_provider_mode == "deterministic":
         return DeterministicInterviewReportProvider(
@@ -1452,8 +1456,14 @@ def _interview_report_provider(
         engine_version=f"model-route:{route.model_ref.id}",
         model_data_region=route.data_region.value,
         allow_external_model_processing=route.external_processing,
-        allow_provider_fallback=False,
+        allow_provider_fallback=any(
+            endpoint.data_region == route.data_region.value
+            for endpoint in settings.ai.fallback_providers
+        ),
         timeout_ms=settings.interview.report_timeout_ms,
+        first_chunk_timeout_ms=settings.interview.report_first_chunk_timeout_ms,
+        stream_idle_timeout_ms=settings.interview.report_stream_idle_timeout_ms,
+        maximum_output_tokens=settings.interview.report_max_output_tokens,
     )
 
 

@@ -70,6 +70,11 @@ def test_prompt_is_a_resource_and_assigns_orchestration_to_the_agent() -> None:
     assert "`resume_draft_set_fields`" in prompt
     assert "`resume_draft_upsert_sections`" in prompt
     assert "`resume_draft_upsert_items`" in prompt
+    assert "`resume_draft_add_skill_section`" in prompt
+    assert "`resume_draft_add_experience_section`" in prompt
+    assert "`resume_draft_add_project_section`" in prompt
+    assert "`resume_draft_add_education_section`" in prompt
+    assert "`resume_draft_add_bullet_section`" in prompt
     assert "`resume_draft_operations`" not in prompt
     assert "`resume_request_proposal_decision`" in prompt
     assert "tmp_section_projects_01" in prompt
@@ -94,7 +99,7 @@ async def test_tools_hide_run_metadata_and_stage_small_operations() -> None:
     tools = {tool.name: tool for tool in resume_agent_tools(session)}
     catalog = tool_catalog(tuple(tools.values()))
 
-    assert len(tools) == 19
+    assert len(tools) == 24
     assert all(
         "workspace_id" not in str(item)
         and "resume_id" not in str(item)
@@ -103,9 +108,7 @@ async def test_tools_hide_run_metadata_and_stage_small_operations() -> None:
         for item in catalog
     )
     batch_schema = next(
-        item["input_schema"]
-        for item in catalog
-        if item["name"] == "resume_draft_set_fields"
+        item["input_schema"] for item in catalog if item["name"] == "resume_draft_set_fields"
     )
     assert "updates" in batch_schema["properties"]
     assert "discriminator" not in str(batch_schema)
@@ -207,6 +210,122 @@ async def test_tools_hide_run_metadata_and_stage_small_operations() -> None:
     )
     assert decision == '{"kind":"proposal_decision_required","operation_count":3}'
     assert session.proposal_title == "Improve the Resume title"
+
+
+@pytest.mark.asyncio
+async def test_domain_add_tools_complete_sections_without_model_generated_shape() -> None:
+    """@brief 窄工具在服务端补全模块且拒绝覆盖 / Narrow tools complete sections and refuse replacement."""
+
+    session = ResumeToolSession(_context())
+    tools = {tool.name: tool for tool in resume_agent_tools(session)}
+
+    skills = await tools["resume_draft_add_skill_section"].ainvoke(
+        {
+            "title": "专业技能",
+            "groups": [
+                {"name": "前端框架", "skills": ["Vue 3", "TypeScript"]},
+                {"name": "工程化", "skills": ["Vite", "pnpm"]},
+            ],
+            "after_section_id": None,
+        }
+    )
+    experience = await tools["resume_draft_add_experience_section"].ainvoke(
+        {
+            "title": "工作经历",
+            "items": [
+                {
+                    "title": "高级前端工程师",
+                    "organization": "示例科技",
+                    "location": "杭州",
+                    "date_range": {"start": "2022.03", "end": "至今"},
+                    "summary": None,
+                    "highlights": ["负责中后台前端架构。"],
+                    "skills": ["Vue 3", "TypeScript"],
+                }
+            ],
+            "after_section_id": "tmp_section_skills_01",
+        }
+    )
+    projects = await tools["resume_draft_add_project_section"].ainvoke(
+        {
+            "title": "项目经历",
+            "items": [
+                {
+                    "title": "低代码平台",
+                    "organization": "示例科技",
+                    "subtitle": "核心开发",
+                    "date_range": {"start": "2023-01", "end": "present"},
+                    "summary": "负责编辑器核心能力。",
+                    "highlights": ["建设可复用物料体系。"],
+                    "skills": ["React", "TypeScript"],
+                    "url": None,
+                }
+            ],
+            "after_section_id": "tmp_section_experience_01",
+        }
+    )
+    education = await tools["resume_draft_add_education_section"].ainvoke(
+        {
+            "title": "教育经历",
+            "items": [
+                {
+                    "organization": "示例大学",
+                    "title": "本科",
+                    "subtitle": "计算机科学与技术",
+                    "location": None,
+                    "date_range": {"start": "2018", "end": "2022"},
+                    "highlights": [],
+                }
+            ],
+            "after_section_id": "tmp_section_projects_01",
+        }
+    )
+    evaluation = await tools["resume_draft_add_bullet_section"].ainvoke(
+        {
+            "title": "自我评价",
+            "section_kind": "custom",
+            "bullets": ["重视代码质量与团队协作。"],
+            "after_section_id": "tmp_section_education_01",
+        }
+    )
+    duplicate = await tools["resume_draft_add_skill_section"].ainvoke(
+        {
+            "title": "专业技能",
+            "groups": [{"name": "基础", "skills": ["JavaScript"]}],
+            "after_section_id": None,
+        }
+    )
+
+    assert all(
+        json.loads(result)["kind"] == "resume_change_staged"
+        for result in (skills, experience, projects, education, evaluation)
+    )
+    assert len(session.drafts) == 5
+    skill_section = session.drafts[0].payload["section"]
+    assert skill_section["items"][0] == {
+        "id": "tmp_skill_01",
+        "kind": "skill_group",
+        "title": "前端框架",
+        "subtitle": None,
+        "organization": None,
+        "location": None,
+        "date_range": None,
+        "summary": None,
+        "highlights": (),
+        "skills": ("Vue 3", "TypeScript"),
+        "tags": (),
+        "visible": True,
+        "url": None,
+    }
+    experience_item = session.drafts[1].payload["section"]["items"][0]
+    assert experience_item["date_range"] == {
+        "start": "2022-03",
+        "end": "present",
+    }
+    assert experience_item["highlights"] == ({"text": "负责中后台前端架构。", "marks": ()},)
+    duplicate_result = json.loads(duplicate)
+    assert duplicate_result["code"] == "resume.section_already_exists"
+    assert duplicate_result["existing_section_id"] == "tmp_section_skills_01"
 
 
 @pytest.mark.asyncio

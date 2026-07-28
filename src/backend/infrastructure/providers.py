@@ -320,9 +320,24 @@ class OpenAICompatibleModelProvider:
             "messages": messages,
             "stream": True,
         }
+        maximum_output_tokens = request.get("max_output_tokens")
+        if maximum_output_tokens is not None:
+            if (
+                isinstance(maximum_output_tokens, bool)
+                or not isinstance(maximum_output_tokens, int)
+                or not 1 <= maximum_output_tokens <= 32_768
+            ):
+                raise ModelProviderStreamError(
+                    "agent.provider_invalid_request",
+                    "Model provider output-token budget is invalid",
+                    retryable=False,
+                )
+            payload["max_tokens"] = maximum_output_tokens
         structured_response = _structured_response_format(request)
         if structured_response is not None:
             payload["response_format"] = structured_response
+            if self._provider.casefold() == "openrouter":
+                payload["provider"] = {"require_parameters": True}
         return payload
 
     async def stream_text(self, prompt: str, request: dict[str, Any]) -> AsyncIterator[str]:
@@ -1105,7 +1120,44 @@ def _delta_text(event: Mapping[str, Any]) -> tuple[str, bool]:
             "Model provider returned an invalid stream event",
             retryable=True,
         )
-    finished = choice.get("finish_reason") is not None
+    finish_reason = choice.get("finish_reason")
+    if finish_reason is not None and not isinstance(finish_reason, str):
+        raise ModelProviderStreamError(
+            "agent.provider_protocol_error",
+            "Model provider returned an invalid finish reason",
+            retryable=True,
+        )
+    if finish_reason in {"length", "max_tokens"}:
+        raise ModelProviderStreamError(
+            "agent.provider_output_truncated",
+            "Model provider exhausted the output-token budget",
+            retryable=True,
+        )
+    if finish_reason == "content_filter":
+        raise ModelProviderStreamError(
+            "agent.provider_output_filtered",
+            "Model provider filtered the generated output",
+            retryable=False,
+        )
+    if finish_reason == "error":
+        raise ModelProviderStreamError(
+            "agent.provider_generation_failed",
+            "Model provider failed while generating output",
+            retryable=True,
+        )
+    if finish_reason == "tool_calls":
+        raise ModelProviderStreamError(
+            "agent.provider_protocol_error",
+            "Model provider returned unsupported tool calls",
+            retryable=False,
+        )
+    if finish_reason not in {None, "stop"}:
+        raise ModelProviderStreamError(
+            "agent.provider_protocol_error",
+            "Model provider returned an unsupported finish reason",
+            retryable=True,
+        )
+    finished = finish_reason == "stop"
     delta = choice.get("delta")
     if delta is None:
         if finished:

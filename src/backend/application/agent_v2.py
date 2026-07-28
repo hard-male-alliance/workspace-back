@@ -16,8 +16,6 @@ from typing import Protocol
 from backend.application.ports.agent_v2 import (
     AgentCasMismatch,
     AgentContextRevisionSuperseded,
-    AgentKnowledgeRetrievalRequest,
-    AgentKnowledgeRetriever,
     AgentModelProvider,
     AgentPage,
     AgentPageRequest,
@@ -45,7 +43,6 @@ from backend.domain.agent_v2 import (
     AGENT_RUN_JOB_KIND,
     AgentDomainError,
     AgentExecutionGrant,
-    AgentKnowledgeEvidence,
     AgentOutboxId,
     AgentOutputMode,
     AgentProposalDecisionContext,
@@ -1263,7 +1260,6 @@ class AgentWorkerService:
         model_provider: AgentModelProvider,
         tool_executor: AgentToolExecutor,
         *,
-        knowledge_retriever: AgentKnowledgeRetriever | None = None,
         tool_registry: AgentToolRegistry | None = None,
         clock: Clock | None = None,
         id_factory: OpaqueIdFactory | None = None,
@@ -1273,8 +1269,6 @@ class AgentWorkerService:
         @param uow_factory durable dispatch 作用域的 UoW 工厂 / UoW factory scoped by a durable dispatch.
         @param model_provider 严格结构化模型边界 / Strict structured model boundary.
         @param tool_executor 已批准调用的执行边界 / Execution boundary for approved calls.
-        @param knowledge_retriever 事务外、grant 约束的检索器 / Out-of-transaction retriever
-            constrained by a grant.
         @param tool_registry 服务端工具 allowlist；缺省即空 allowlist / Server-side tool
             allowlist; omission means an empty allowlist.
         @param clock 可替换时钟 / Replaceable clock.
@@ -1283,7 +1277,6 @@ class AgentWorkerService:
         self._uow_factory = uow_factory
         self._model_provider = model_provider
         self._tool_executor = tool_executor
-        self._knowledge_retriever = knowledge_retriever
         self._tool_registry = tool_registry
         self._clock = clock or UtcClock()
         self._ids = id_factory or NewOpaqueIdFactory()
@@ -1292,7 +1285,7 @@ class AgentWorkerService:
         self,
         dispatch: AgentRunExecutionClaim,
     ) -> AgentRunView:
-        """@brief 重新授权、检索并提交一次 durable Run / Reauthorize, retrieve, and commit one durable Run.
+        """@brief 重新授权并提交一次 durable Run / Reauthorize and commit one durable Run.
 
         @param dispatch 已提交且交叉验证的工作 claim / Committed, cross-validated work claim.
         @return 当前或新终态 Run view / Current or newly terminal Run view.
@@ -1778,36 +1771,13 @@ class AgentWorkerService:
         *,
         proposal_decision: AgentProposalDecisionContext | None = None,
     ) -> AgentProviderRequest:
-        """@brief 在事务外取得授权证据并构造模型请求 / Retrieve authorized evidence and build a model request outside transactions."""
-        evidence: tuple[AgentKnowledgeEvidence, ...] = ()
-        if prepared.grant.knowledge_contexts:
-            if self._knowledge_retriever is None:
-                raise AgentProviderFailure(
-                    _knowledge_retrieval_problem(prepared.run.meta.id)
-                )
-            try:
-                evidence = await self._knowledge_retriever.retrieve(
-                    AgentKnowledgeRetrievalRequest(
-                        workspace_id=dispatch.workspace_id,
-                        actor_id=dispatch.actor_id,
-                        grant=prepared.grant,
-                        query=_message_text(prepared.input_message),
-                        top_k=20,
-                    )
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                raise AgentProviderFailure(
-                    _knowledge_retrieval_problem(prepared.run.meta.id)
-                ) from error
+        """@brief 构造由 Provider 原生工具按需检索的请求 / Build a request whose Provider retrieves on demand via a native tool."""
         return AgentProviderRequest(
             run_id=prepared.run.meta.id,
             spec=prepared.execution_spec,
             grant=prepared.grant,
             input_message=prepared.input_message,
             actor_id=prepared.run.created_by,
-            knowledge_evidence=evidence,
             resume_context=prepared.resume_context,
             conversation_history=prepared.conversation_history,
             proposal_decision=proposal_decision,
@@ -1998,6 +1968,10 @@ class AgentWorkerService:
 
         if request.resume_context is None:
             raise AgentProviderFailure(_provider_protocol_problem(run.meta.id))
+        try:
+            outcome.validate_for(request)
+        except AgentDomainError as error:
+            raise AgentProviderFailure(_provider_protocol_problem(run.meta.id)) from error
         proposal_ref = await uow.resume_proposals.create(
             AgentResumeProposalCommand(
                 workspace_id=run.workspace_id,
@@ -2006,7 +1980,7 @@ class AgentWorkerService:
                 base=request.resume_context,
                 title=outcome.proposal_title,
                 operations=outcome.resume_operations,
-                evidence=request.knowledge_evidence,
+                evidence=outcome.knowledge_evidence,
                 created_at=finished_at,
             )
         )
@@ -3337,25 +3311,6 @@ def _resume_authority_changed_problem(run_id: AgentRunId) -> ProblemDetails:
             "Reload it before continuing."
         ),
     )
-
-
-def _knowledge_retrieval_problem(run_id: AgentRunId) -> ProblemDetails:
-    """@brief 构造授权 Knowledge 检索不可用问题 / Build an authorized-Knowledge retrieval problem.
-
-    @param run_id 稳定关联 Run / Stable correlated Run.
-    @return 可安全持久化的问题 / Safely persistable problem.
-    """
-    return ProblemDetails(
-        type_uri="https://api.hmalliances.org/problems/agent/knowledge-unavailable",
-        title="Authorized Knowledge retrieval is unavailable",
-        status=503,
-        code="agent.knowledge_retrieval_failed",
-        request_id=str(run_id),
-        retryable=True,
-        detail="The Agent could not retrieve the authorized evidence for this run.",
-    )
-
-
 def _tool_unavailable_problem(run_id: AgentRunId) -> ProblemDetails:
     """@brief 构造未注册工具建议的失败 / Build a failure for an unregistered tool suggestion.
 

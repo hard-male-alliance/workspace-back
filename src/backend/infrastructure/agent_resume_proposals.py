@@ -49,9 +49,7 @@ from backend.infrastructure.resumes import (
     normalize_resume_operation_wire,
 )
 
-_RESOURCE_REFS_ADAPTER: TypeAdapter[tuple[ResourceRef, ...]] = TypeAdapter(
-    tuple[ResourceRef, ...]
-)
+_RESOURCE_REFS_ADAPTER: TypeAdapter[tuple[ResourceRef, ...]] = TypeAdapter(tuple[ResourceRef, ...])
 """@brief Proposal evidence refs codec / Proposal evidence-reference codec."""
 
 
@@ -109,15 +107,9 @@ class PostgresAgentResumeProposalBoundary:
             select(ResumeDocumentRecord, ResumeRevisionRecord)
             .join(
                 ResumeRevisionRecord,
-                (
-                    ResumeRevisionRecord.workspace_id
-                    == ResumeDocumentRecord.workspace_id
-                )
+                (ResumeRevisionRecord.workspace_id == ResumeDocumentRecord.workspace_id)
                 & (ResumeRevisionRecord.resume_id == ResumeDocumentRecord.id)
-                & (
-                    ResumeRevisionRecord.revision_no
-                    == ResumeDocumentRecord.current_revision_no
-                ),
+                & (ResumeRevisionRecord.revision_no == ResumeDocumentRecord.current_revision_no),
             )
             .where(
                 ResumeDocumentRecord.workspace_id == str(workspace_id),
@@ -309,8 +301,7 @@ class PostgresAgentResumeProposalBoundary:
             await self._session.scalars(
                 select(ResumeProposalOperationRecord)
                 .where(
-                    ResumeProposalOperationRecord.workspace_id
-                    == str(command.workspace_id),
+                    ResumeProposalOperationRecord.workspace_id == str(command.workspace_id),
                     ResumeProposalOperationRecord.proposal_id == existing.id,
                 )
                 .order_by(ResumeProposalOperationRecord.ordinal)
@@ -331,9 +322,7 @@ class PostgresAgentResumeProposalBoundary:
             and row.operation_type == operation.op
             and row.payload == encode_resume_operation(operation)
             and row.fingerprint == resume_operation_fingerprint(operation)
-            for ordinal, (row, operation) in enumerate(
-                zip(operation_rows, operations, strict=True)
-            )
+            for ordinal, (row, operation) in enumerate(zip(operation_rows, operations, strict=True))
         )
         if not identity_matches or not operations_match:
             raise _proposal_failure(
@@ -353,9 +342,7 @@ class PostgresAgentResumeProposalBoundary:
         actor_id = self._scope.require_actor()
         if actor_id != command.actor_id:
             raise PermissionError("Agent tool diagnostic actor does not match worker scope")
-        proposal_id = (
-            command.proposal_ref.id if command.proposal_ref is not None else None
-        )
+        proposal_id = command.proposal_ref.id if command.proposal_ref is not None else None
         for invocation in command.invocations:
             persisted_status = _persisted_invocation_status(invocation.status)
             invocation_id = _stable_id(
@@ -364,8 +351,7 @@ class PostgresAgentResumeProposalBoundary:
             )
             existing = await self._session.scalar(
                 select(AgentToolInvocationRecord).where(
-                    AgentToolInvocationRecord.workspace_id
-                    == str(command.workspace_id),
+                    AgentToolInvocationRecord.workspace_id == str(command.workspace_id),
                     AgentToolInvocationRecord.id == invocation_id,
                 )
             )
@@ -378,11 +364,12 @@ class PostgresAgentResumeProposalBoundary:
                 "validation_phase": invocation.validation_phase,
                 "argument_signature": invocation.argument_signature,
                 "consecutive_invalid_count": invocation.consecutive_invalid_count,
+                "validation_issues": [
+                    {"path": path, "issue": issue} for path, issue in invocation.validation_issues
+                ],
             }
             bound_proposal_id = (
-                proposal_id
-                if invocation.tool_name == "resume_request_proposal_decision"
-                else None
+                proposal_id if invocation.tool_name == "resume_request_proposal_decision" else None
             )
             if existing is not None:
                 if (
@@ -545,24 +532,17 @@ def _materialize_operations(
 
     operations: list[ResumeOperation] = []
     for ordinal, payload in enumerate(payloads):
-        normalized = normalize_resume_operation_wire(
-            _remap_operation_payload(payload, remapped)
-        )
+        normalized = normalize_resume_operation_wire(_remap_operation_payload(payload, remapped))
         normalized["operation_id"] = _stable_id(
             "operation",
             f"{run_id}:{ordinal}",
         )
         operation = decode_resume_operation_wire(normalized)
-        if (
-            normalized.get("op") != operation.op
-            or not _matches_canonical_subset(
-                normalized,
-                encode_resume_operation_wire(operation),
-            )
+        if normalized.get("op") != operation.op or not _matches_canonical_subset(
+            normalized,
+            encode_resume_operation_wire(operation),
         ):
-            raise ValueError(
-                "Resume operation contains unknown, coerced, or mismatched fields"
-            )
+            raise ValueError("Resume operation contains unknown, coerced, or mismatched fields")
         operations.append(operation)
     return tuple(operations)
 
@@ -826,10 +806,7 @@ def _durable_runtime_failure(request_id: str) -> AgentProposalFailure:
 
     return AgentProposalFailure(
         ProblemDetails(
-            type_uri=(
-                "https://api.hmalliances.org/problems/"
-                "service/durable_runtime_required"
-            ),
+            type_uri=("https://api.hmalliances.org/problems/service/durable_runtime_required"),
             title="This operation requires the durable service runtime",
             status=503,
             code="service.durable_runtime_required",
