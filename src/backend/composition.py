@@ -1091,9 +1091,7 @@ async def build_container(
                 database,
                 telemetry_database,
                 interview_media_analyzer,
-                agent_provider=(
-                    None if agent_runtime is None else agent_runtime.provider
-                ),
+                agent_provider=(None if agent_runtime is None else agent_runtime.provider),
             )
         except BaseException as error:
             shutdown_failures.append(error)
@@ -1391,6 +1389,9 @@ def _interview_runtime_for(
         lexical_weight=settings.knowledge.search.lexical_weight,
         semantic_weight=settings.knowledge.search.semantic_weight,
         candidate_multiplier=settings.knowledge.search.candidate_multiplier,
+        semantic_timeout_seconds=0.8,
+        allow_lexical_fallback=True,
+        substring_lexical_fallback=True,
     )
     worker = InterviewWorkerService(
         postgres_uow,

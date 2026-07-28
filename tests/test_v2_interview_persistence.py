@@ -112,6 +112,7 @@ from backend.infrastructure.interview import (
     InterviewRealtimeSigningKey,
     InterviewRealtimeSigningKeyring,
     PostgresInterviewUnitOfWorkFactory,
+    _knowledge_grant_scopes,
 )
 from backend.infrastructure.outbox_dispatch import PostgresOutboxClaimRepository
 from backend.infrastructure.persistence.database import AsyncDatabase, AsyncDatabaseOptions
@@ -127,6 +128,20 @@ MIGRATION = (
 
 NOW = datetime(2026, 7, 23, 12, tzinfo=UTC)
 """@brief 固定 persistence 测试时刻 / Fixed persistence-test instant."""
+
+
+def test_interview_knowledge_scope_preserves_legacy_read_compatibility() -> None:
+    """@brief 当前与旧版面试 scope 共享检索授权读取 / Current and legacy Interview scopes share retrieval authorization reads."""
+
+    assert _knowledge_grant_scopes("interview_coach") == (
+        "interview_coach",
+        "interview_agent",
+    )
+    assert _knowledge_grant_scopes("interview_agent") == (
+        "interview_coach",
+        "interview_agent",
+    )
+    assert _knowledge_grant_scopes("resume_assistant") == ("resume_assistant",)
 
 
 @dataclass(frozen=True, slots=True)
