@@ -516,6 +516,7 @@ async def test_native_tool_call_interrupts_and_resumes_same_sdk_state() -> None:
     native_tools = model.calls[0][1]
     assert {tool.name for tool in native_tools} >= {
         "resume_read_section",
+        "resume_draft_set_document_title",
         "resume_draft_set_field",
         "resume_request_proposal_decision",
     }
