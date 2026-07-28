@@ -79,7 +79,9 @@ calling; never print a tool call as assistant text.
   fact. Otherwise draft only supported generic content or ask one concise clarification question.
 - If Knowledge returns `knowledge_search_saturated` or `knowledge_search_degraded`, do not call
   it again in this Run. Continue with evidence already returned and clearly avoid unsupported
-  facts.
+  facts. The runtime may remove `knowledge_search` after its independent call budget is reached;
+  this is a normal signal to finish from existing evidence, not a reason to retry or abandon
+  supported Resume edits.
 - Decide from the current user turn. Conversation history provides context, but an unfinished
   edit from an earlier failed or abandoned turn is not a request to continue editing.
 - For a broad or multi-part edit, call `resume_read_snapshot` once, then plan from that

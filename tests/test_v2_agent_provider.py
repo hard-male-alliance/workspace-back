@@ -72,6 +72,9 @@ from backend.domain.resumes import (
 from backend.infrastructure.agents_sdk_provider import (
     OpenAIAgentsSDKProvider,
     _checkpoint_tool_call_count,
+    _classify_provider_exception,
+    _ToolExecutionState,
+    _TotalToolCallBudgetExhausted,
 )
 
 NOW = datetime(2026, 7, 23, 8, 0, tzinfo=UTC)
@@ -90,6 +93,24 @@ def test_persisted_checkpoint_preserves_tool_ordinal_offset() -> None:
             ]
         }
     ) == 2
+
+
+@pytest.mark.asyncio
+async def test_global_tool_budget_has_distinct_failure_classification() -> None:
+    """@brief 全局预算保留独立稳定错误码 / Keep a distinct stable code for the global tool budget."""
+
+    state = _ToolExecutionState(
+        next_ordinal=24,
+        total_call_count=24,
+        resume_tool_call_count=0,
+    )
+
+    with pytest.raises(_TotalToolCallBudgetExhausted) as raised:
+        await state.reserve(resume_tool=False)
+
+    failure = _classify_provider_exception(raised.value)
+    assert failure.code == "agent.total_tool_call_budget_exhausted"
+    assert failure.failure_class == "total_tool_call_budget_exhausted"
 
 
 def _text_response(text: str, response_id: str) -> ModelResponse:
@@ -720,6 +741,65 @@ async def test_native_knowledge_tool_returns_untrusted_evidence_and_preserves_pr
 
 
 @pytest.mark.asyncio
+async def test_native_knowledge_caps_accumulated_evidence() -> None:
+    """@brief 即使检索器超量返回也限制 Run 证据规模 / Cap Run evidence even when retrieval over-returns."""
+
+    source_id = KnowledgeSourceId("knowledge_source_provider_cap_0001")
+    version_id = KnowledgeSourceVersionId("knowledge_version_provider_cap_0001")
+    base = _resume_request()
+    request = replace(
+        base,
+        grant=replace(
+            base.grant,
+            knowledge_contexts=(AuthorizedKnowledgeContext(source_id, version_id, 1),),
+        ),
+        actor_id=UserId("user_provider_knowledge_cap_0001"),
+    )
+    evidence = tuple(
+        AgentKnowledgeEvidence(
+            index,
+            f"knowledge_chunk_provider_cap_{index:04d}",
+            KnowledgeCitation(
+                source_id,
+                version_id,
+                f"candidate.md#fact-{index}",
+                f"候选人事实 {index}",
+                0.99 - index / 100,
+            ),
+        )
+        for index in range(30)
+    )
+    model = SequenceModel(
+        [
+            _tool_response(
+                "knowledge_search",
+                '{"query":"候选人完整资料","top_k":10}',
+                "call_knowledge_cap_0001",
+            ),
+            _text_response("已使用有界证据。", "response_knowledge_cap"),
+        ]
+    )
+    telemetry = RecordingTelemetry()
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        telemetry=telemetry,  # type: ignore[arg-type]
+        knowledge_retriever=StaticKnowledgeRetriever(evidence),
+    )
+
+    outcome = await provider.execute(request)
+
+    assert isinstance(outcome, AgentProviderCompleted)
+    assert len(outcome.knowledge_evidence) == 24
+    attributes = next(
+        attributes for name, attributes in telemetry.metrics if name == "aiws.agent.run.duration"
+    )
+    assert attributes["knowledge_evidence_attached_count"] == 24
+    assert attributes["knowledge_evidence_limit"] == 24
+
+
+@pytest.mark.asyncio
 async def test_native_knowledge_failure_keeps_specific_public_error_and_diagnostics() -> None:
     """@brief 检索故障保留明确公共语义和诊断 / Retrieval failure keeps specific public semantics and diagnostics."""
 
@@ -814,6 +894,99 @@ async def test_native_knowledge_reuses_identical_query_without_duplicate_io() ->
     assert attributes["knowledge_tool_call_count"] == 2
     assert attributes["knowledge_retrieval_count"] == 1
     assert attributes["knowledge_cache_hit_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_knowledge_budget_isolated_and_tool_disabled_before_resume_budget() -> None:
+    """@brief 知识检索不得挤占简历工具预算且饱和后必须关闭 / Isolate Knowledge budget and disable saturated search."""
+
+    source_id = KnowledgeSourceId("knowledge_source_provider_budget_0001")
+    version_id = KnowledgeSourceVersionId("knowledge_version_provider_budget_0001")
+    base = _resume_request()
+    request = replace(
+        base,
+        spec=replace(
+            base.spec,
+            knowledge=KnowledgeSelection(
+                KnowledgeSelectionMode.EXPLICIT,
+                (source_id,),
+                (),
+                (),
+                "resume_assistant",
+            ),
+        ),
+        grant=replace(
+            base.grant,
+            knowledge_contexts=(AuthorizedKnowledgeContext(source_id, version_id, 1),),
+        ),
+        actor_id=UserId("user_provider_knowledge_budget_0001"),
+    )
+    model = SequenceModel(
+        [
+            *[
+                _tool_response(
+                    "knowledge_search",
+                    json.dumps(
+                        {"query": f"候选人资料维度 {index}", "top_k": 10},
+                        ensure_ascii=False,
+                    ),
+                    f"call_knowledge_budget_{index:02d}",
+                )
+                for index in range(4)
+            ],
+            *[
+                _tool_response(
+                    "resume_read_snapshot",
+                    "{}",
+                    f"call_snapshot_after_knowledge_{index:02d}",
+                )
+                for index in range(15)
+            ],
+            _tool_response(
+                "resume_draft_set_field",
+                '{"entity_id":"resume_provider_0001","field_path":["title"],'
+                '"value":"Knowledge-backed title"}',
+                "call_draft_after_knowledge_0001",
+            ),
+            _tool_response(
+                "resume_request_proposal_decision",
+                '{"title":"Apply the Knowledge-backed Resume changes"}',
+                "call_proposal_after_knowledge_0001",
+            ),
+        ]
+    )
+    retriever = EmptyKnowledgeRetriever()
+    telemetry = RecordingTelemetry()
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        telemetry=telemetry,  # type: ignore[arg-type]
+        knowledge_retriever=retriever,
+    )
+
+    outcome = await provider.execute(request)
+
+    assert isinstance(outcome, AgentProviderProposalDecisionRequired)
+    assert len(retriever.requests) == 3
+    assert "knowledge_search_saturated" in json.dumps(
+        model.calls[4][0],
+        ensure_ascii=False,
+        default=str,
+    )
+    assert "knowledge_search" not in {tool.name for tool in model.calls[4][1]}
+    assert sum(
+        trace.tool_name == "knowledge_search" for trace in outcome.tool_invocations
+    ) == 4
+    assert outcome.tool_invocations[-1].tool_name == "resume_request_proposal_decision"
+    attributes = next(
+        attributes for name, attributes in telemetry.metrics if name == "aiws.agent.run.duration"
+    )
+    assert attributes["knowledge_tool_call_count"] == 4
+    assert attributes["resume_tool_call_count"] == 16
+    assert attributes["remaining_resume_tool_calls"] == 0
+    assert attributes["total_tool_call_count"] == 20
+    assert attributes["remaining_total_tool_calls"] == 4
 
 
 @pytest.mark.asyncio
