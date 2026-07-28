@@ -22,7 +22,7 @@ from types import TracebackType
 from typing import Any, Protocol, Self, cast
 
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import and_, func, literal, or_, select, update
+from sqlalchemy import and_, literal, or_, select, update
 from sqlalchemy.engine import CursorResult, Result
 from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction
 
@@ -1161,12 +1161,29 @@ class InMemoryInterviewRepository:
         self, workspace_id: WorkspaceId, session_id: InterviewSessionId
     ) -> bool:
         """@brief 判断是否存在 live Report Job / Test whether a live Report Job exists."""
-        return any(
-            job.kind == INTERVIEW_REPORT_JOB_KIND
-            and job.subject.id == session_id
-            and not job.is_terminal
-            for (candidate_workspace, _), job in self._store.jobs.items()
-            if candidate_workspace == workspace_id
+        return await self.get_live_report_job(workspace_id, session_id) is not None
+
+    async def get_live_report_job(
+        self,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+    ) -> Job | None:
+        """@brief 读取唯一 live Report Job / Read the unique live Report Job.
+
+        @param workspace_id 精确 Workspace / Exact Workspace.
+        @param session_id 目标 Session / Target Session.
+        @return live Job 或 ``None`` / Live Job or ``None``.
+        """
+        return next(
+            (
+                job
+                for (candidate_workspace, _), job in self._store.jobs.items()
+                if candidate_workspace == workspace_id
+                and job.kind == INTERVIEW_REPORT_JOB_KIND
+                and job.subject.id == session_id
+                and not job.is_terminal
+            ),
+            None,
         )
 
 
@@ -2390,10 +2407,22 @@ class PostgresInterviewRepository:
         self, workspace_id: WorkspaceId, session_id: InterviewSessionId
     ) -> bool:
         """@brief 查询统一 Job truth 的 live report job / Query the unified Job truth for a live Report Job."""
+        return await self.get_live_report_job(workspace_id, session_id) is not None
+
+    async def get_live_report_job(
+        self,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+    ) -> Job | None:
+        """@brief 查询并读取唯一 live Report Job / Query and read the unique live Report Job.
+
+        @param workspace_id 精确 Workspace / Exact Workspace.
+        @param session_id 目标 Session / Target Session.
+        @return live Job 或 ``None`` / Live Job or ``None``.
+        """
         await self._scope.ensure_workspace(workspace_id)
-        count = await self._session.scalar(
-            select(func.count())
-            .select_from(JobRecord)
+        record = await self._session.scalar(
+            select(JobRecord)
             .where(
                 JobRecord.workspace_id == str(workspace_id),
                 JobRecord.job_type == INTERVIEW_REPORT_JOB_KIND,
@@ -2401,8 +2430,10 @@ class PostgresInterviewRepository:
                 JobRecord.target_resource_id == str(session_id),
                 JobRecord.status.in_(("queued", "running")),
             )
+            .order_by(JobRecord.created_at.asc(), JobRecord.id.asc())
+            .limit(1)
         )
-        return bool(count)
+        return None if record is None else _job_from_record(record)
 
 
 class _PostgresInterviewJobs:

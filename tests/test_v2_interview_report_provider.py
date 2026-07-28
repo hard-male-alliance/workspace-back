@@ -17,7 +17,6 @@ from backend.application.ports.interview_v2 import (
     ReportGenerationRequest,
 )
 from backend.domain.interview_v2 import (
-    InterviewDomainError,
     InterviewRubric,
     JobTarget,
     RubricDimension,
@@ -64,6 +63,9 @@ class RecordingModelProvider:
     delay_seconds: float = 0.0
     """@brief 首 chunk 前延迟 / Delay before the first chunk."""
 
+    chunk_delay_seconds: float = 0.0
+    """@brief 相邻 chunk 间延迟 / Delay between chunks."""
+
     prompts: list[str] = field(default_factory=list)
     """@brief 已收到 prompt / Received prompts."""
 
@@ -88,8 +90,8 @@ class RecordingModelProvider:
             await asyncio.sleep(self.delay_seconds)
         if self.failure is not None:
             raise self.failure
-        for chunk in self.chunks:
-            await asyncio.sleep(0)
+        for index, chunk in enumerate(self.chunks):
+            await asyncio.sleep(self.chunk_delay_seconds if index > 0 else 0)
             yield cast(str, chunk)
 
 
@@ -359,10 +361,26 @@ async def test_streaming_report_provider_builds_grounded_draft_and_stable_reques
     assert len(provider.requests) == 2
     assert {item["operation_id"] for item in provider.requests} == {str(OPERATION_ID)}
     assert provider.requests[0]["response_format"] == "interview_report.strict_json.v1"
+    assert provider.requests[0]["max_output_tokens"] == 32_768
     response_schema = provider.requests[0]["response_schema"]
     assert response_schema["type"] == "object"
     assert response_schema["additionalProperties"] is False
     assert set(response_schema["required"]) == set(response_schema["properties"])
+    response_properties = cast(dict[str, Any], response_schema["properties"])
+    score_array = cast(dict[str, Any], response_properties["rubric_scores"])
+    assert score_array["minItems"] == 1
+    assert score_array["maxItems"] == 1
+    score_variants = cast(dict[str, Any], score_array["items"])["anyOf"]
+    score_properties = score_variants[0]["properties"]
+    assert score_properties["dimension_id"]["enum"] == ["dimension_report01"]
+    assert score_properties["score"] == {
+        "type": "number",
+        "minimum": 0.0,
+        "maximum": 100.0,
+    }
+    assert score_properties["evidence"]["items"]["properties"]["segment_id"]["enum"] == [
+        SEGMENT_ID
+    ]
     inference = provider.requests[0]["inference"]
     assert inference == {
         "data_region": "global",
@@ -375,6 +393,25 @@ async def test_streaming_report_provider_builds_grounded_draft_and_stable_reques
     assert "workspace_report0001" not in prompt
     assert "input_report000001" not in prompt
     assert str(OPERATION_ID) not in prompt
+
+
+@pytest.mark.asyncio
+async def test_streaming_report_provider_uses_compact_constraints_only_for_corrective_retry() -> None:
+    """@brief 第二次纠错生成必须压缩内容且不携带上次输出 / A corrective retry must constrain size without carrying prior output."""
+
+    payload = json.dumps(_valid_output(), ensure_ascii=False)
+    provider = RecordingModelProvider((payload,))
+    request = replace(_request(), compact_output=True)
+
+    await _adapter(provider).generate(request, operation_id=OPERATION_ID)
+
+    prompt = provider.prompts[0]
+    assert "CORRECTIVE_RETRY (trusted)" in prompt
+    assert "at most two evidence items" in prompt
+    assert prompt.index("CORRECTIVE_RETRY (trusted)") < prompt.index(
+        "BEGIN_UNTRUSTED_REPORT_DATA"
+    )
+    assert payload not in prompt
 
 
 @pytest.mark.asyncio
@@ -433,13 +470,74 @@ async def test_six_dimension_report_rejects_non_exact_dimension_set(mutation: st
         scores.append({**scores[-1], "dimension_id": "rubric_dimension_untrusted_extra"})
     provider = RecordingModelProvider((json.dumps(output, ensure_ascii=False),))
 
+    with pytest.raises(InterviewWorkerPortFailure) as captured:
+        await _adapter(provider).generate(request, operation_id=OPERATION_ID)
+
+    assert captured.value.code == "interview.report_provider_domain_invalid"
+    assert captured.value.retryable
+
+
+@pytest.mark.asyncio
+async def test_streaming_report_provider_safely_sanitizes_unverifiable_evidence() -> None:
+    """@brief 不可验证 evidence 不得阻止报告发布或伪装成原文 / Unverifiable evidence must neither block publication nor masquerade as transcript text."""
+
+    output = _valid_output()
+    score = cast(list[dict[str, Any]], output["rubric_scores"])[0]
+    evidence = cast(list[dict[str, Any]], score["evidence"])
+    evidence[0]["quote"] = "This sentence was never spoken."
+    evidence.append(
+        {
+            "segment_id": "segment_report_unknown",
+            "start_ms": 1_000,
+            "end_ms": 3_000,
+            "quote": None,
+        }
+    )
+    provider = RecordingModelProvider((json.dumps(output, ensure_ascii=False),))
+    request = _request()
+
     draft = await _adapter(provider).generate(request, operation_id=OPERATION_ID)
 
-    with pytest.raises(
-        InterviewDomainError,
-        match="score every frozen rubric dimension exactly once",
-    ):
-        draft.validate_against(rubric, request.transcript, request.session_id)
+    draft.validate_against(request.rubric, request.transcript, request.session_id)
+    assert len(draft.rubric_scores[0].evidence) == 1
+    assert draft.rubric_scores[0].evidence[0].quote is None
+    assert draft.limitations[-1] == (
+        "Some evidence references that could not be verified against the transcript were omitted."
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_report_provider_retries_out_of_range_rubric_score() -> None:
+    """@brief 动态评分尺度违规必须成为一次可纠错领域失败 / A dynamic score-scale violation must become one correctable domain failure."""
+
+    rubric = InterviewRubric(
+        "rubric_report0001",
+        "v1",
+        "Five point scale",
+        (
+            RubricDimension(
+                "dimension_report01",
+                "Evidence",
+                "Uses concrete evidence.",
+                1.0,
+                ("Names a measurable result",),
+                ScoreScale(1.0, 5.0),
+            ),
+        ),
+        ScoreScale(1.0, 5.0),
+    )
+    output = _valid_output()
+    output["overall_score"] = 4.0
+    provider = RecordingModelProvider((json.dumps(output, ensure_ascii=False),))
+
+    with pytest.raises(InterviewWorkerPortFailure) as captured:
+        await _adapter(provider).generate(
+            _request(rubric=rubric),
+            operation_id=OPERATION_ID,
+        )
+
+    assert captured.value.code == "interview.report_provider_domain_invalid"
+    assert captured.value.retryable
 
 
 @pytest.mark.asyncio
@@ -448,10 +546,10 @@ async def test_six_dimension_report_rejects_non_exact_dimension_set(mutation: st
     _invalid_outputs(),
     ids=("markdown", "extra", "missing", "nested-extra", "nan", "duplicate", "deep"),
 )
-async def test_streaming_report_provider_rejects_every_non_closed_json_shape(
+async def test_streaming_report_provider_classifies_every_non_closed_json_shape(
     output: str,
 ) -> None:
-    """@brief Markdown、未知/缺失字段、重复 key 与非有限数均终态失败 / Non-closed JSON variants fail terminally.
+    """@brief JSON 语法与封闭 Schema 失败必须可诊断且可纠错一次 / JSON syntax and closed-Schema failures are diagnosable and correctable once.
 
     @param output 无效 provider 输出 / Invalid provider output.
     """
@@ -461,8 +559,13 @@ async def test_streaming_report_provider_rejects_every_non_closed_json_shape(
     with pytest.raises(InterviewWorkerPortFailure) as captured:
         await _adapter(provider).generate(_request(), operation_id=OPERATION_ID)
 
-    assert captured.value.code == "interview.report_provider_output_invalid"
-    assert not captured.value.retryable
+    expected_code = (
+        "interview.report_provider_json_invalid"
+        if output in {_invalid_outputs()[0], _invalid_outputs()[4], _invalid_outputs()[5]}
+        else "interview.report_provider_schema_invalid"
+    )
+    assert captured.value.code == expected_code
+    assert captured.value.retryable
     assert output not in str(captured.value)
     assert output not in "".join(traceback.format_exception(captured.value))
     assert captured.value.__context__ is None
@@ -503,6 +606,33 @@ async def test_streaming_report_provider_bounds_input_output_and_wall_time() -> 
     assert timeout_failure.value.code == "interview.report_provider_timeout"
     assert timeout_failure.value.retryable
 
+    first_chunk_provider = RecordingModelProvider(
+        (json.dumps(_valid_output()),),
+        delay_seconds=0.05,
+    )
+    with pytest.raises(InterviewWorkerPortFailure) as first_chunk_failure:
+        await _adapter(
+            first_chunk_provider,
+            timeout_ms=100,
+            first_chunk_timeout_ms=1,
+        ).generate(_request(), operation_id=OPERATION_ID)
+    assert first_chunk_failure.value.code == "interview.report_provider_first_chunk_timeout"
+    assert first_chunk_failure.value.retryable
+
+    payload = json.dumps(_valid_output())
+    idle_provider = RecordingModelProvider(
+        (payload[:100], payload[100:]),
+        chunk_delay_seconds=0.05,
+    )
+    with pytest.raises(InterviewWorkerPortFailure) as idle_failure:
+        await _adapter(
+            idle_provider,
+            timeout_ms=100,
+            stream_idle_timeout_ms=1,
+        ).generate(_request(), operation_id=OPERATION_ID)
+    assert idle_failure.value.code == "interview.report_provider_stream_idle_timeout"
+    assert idle_failure.value.retryable
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retryable", (False, True))
@@ -532,6 +662,26 @@ async def test_streaming_report_provider_preserves_controlled_failure_classifica
     )
     assert captured.value.retryable is retryable
     assert "private" not in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_streaming_report_provider_preserves_truncation_for_corrective_retry() -> None:
+    """@brief 通用模型截断必须映射为报告专用可重试码 / Generic model truncation must map to the report-specific retryable code."""
+
+    provider = RecordingModelProvider(
+        chunks=('{"partial":',),
+        failure=ModelProviderStreamError(
+            "agent.provider_output_truncated",
+            "Provider output exhausted its budget",
+            retryable=True,
+        ),
+    )
+
+    with pytest.raises(InterviewWorkerPortFailure) as captured:
+        await _adapter(provider).generate(_request(), operation_id=OPERATION_ID)
+
+    assert captured.value.code == "interview.report_provider_output_truncated"
+    assert captured.value.retryable
 
 
 @pytest.mark.asyncio

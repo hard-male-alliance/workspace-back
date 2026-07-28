@@ -220,11 +220,10 @@ async def test_domain_add_tools_complete_sections_without_model_generated_shape(
             "title": "工作经历",
             "items": [
                 {
-                    "role": "高级前端工程师",
-                    "company": "示例科技",
+                    "title": "高级前端工程师",
+                    "organization": "示例科技",
                     "location": "杭州",
-                    "start": "2022.03",
-                    "end": "至今",
+                    "date_range": {"start": "2022.03", "end": "至今"},
                     "summary": None,
                     "highlights": ["负责中后台前端架构。"],
                     "skills": ["Vue 3", "TypeScript"],
@@ -238,11 +237,10 @@ async def test_domain_add_tools_complete_sections_without_model_generated_shape(
             "title": "项目经历",
             "items": [
                 {
-                    "name": "低代码平台",
+                    "title": "低代码平台",
                     "organization": "示例科技",
-                    "role": "核心开发",
-                    "start": "2023-01",
-                    "end": "present",
+                    "subtitle": "核心开发",
+                    "date_range": {"start": "2023-01", "end": "present"},
                     "summary": "负责编辑器核心能力。",
                     "highlights": ["建设可复用物料体系。"],
                     "skills": ["React", "TypeScript"],
@@ -257,12 +255,11 @@ async def test_domain_add_tools_complete_sections_without_model_generated_shape(
             "title": "教育经历",
             "items": [
                 {
-                    "school": "示例大学",
-                    "degree": "本科",
-                    "field": "计算机科学与技术",
+                    "organization": "示例大学",
+                    "title": "本科",
+                    "subtitle": "计算机科学与技术",
                     "location": None,
-                    "start": "2018",
-                    "end": "2022",
+                    "date_range": {"start": "2018", "end": "2022"},
                     "highlights": [],
                 }
             ],

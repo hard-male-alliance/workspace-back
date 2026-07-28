@@ -26,6 +26,7 @@ from backend.api.v2 import (
     PUBLIC_ORIGIN,
     TEST_RESOURCE_SERVER_ORIGIN,
 )
+from backend.domain.common import DomainError
 from backend.infrastructure.contracts import ContractValidator, load_jsonc_document
 from backend.package_resources import read_contract_schema_text
 from conftest import PROJECT_ROOT
@@ -86,6 +87,57 @@ def test_every_json_schema_named_by_the_v2_route_table_exists() -> None:
 def test_packaged_v2_contract_is_the_published_jsonc_source() -> None:
     packaged = load_jsonc_document(read_contract_schema_text("v2"))
     assert packaged == _v2_schema()
+
+
+@pytest.mark.parametrize(
+    "signaling_url",
+    (
+        "ws://localhost:8000/realtime/v2/interview",
+        "ws://127.0.0.1:8000/realtime/v2/interview",
+    ),
+)
+def test_realtime_connection_contract_rejects_unpublished_loopback_origins(
+    signaling_url: str,
+) -> None:
+    """@brief 验证 main 契约拒绝未发布 loopback origin / Verify the main contract rejects unpublished loopback origins.
+
+    @param signaling_url 不属于公开契约的 loopback 地址 / Loopback URL outside the public contract.
+    @return 无 / None.
+    """
+    with pytest.raises(DomainError) as captured:
+        ContractValidator.from_jsonc(read_contract_schema_text("v2")).validate_definition(
+            "RealtimeConnection",
+            {
+                "id": "connection_local_test",
+                "session_id": "interview_session_local_test",
+                "transport": "websocket",
+                "signaling_url": signaling_url,
+                "ephemeral_token": "header.payload.signature",
+                "ice_servers": [],
+                "expires_at": "2026-07-28T05:30:00Z",
+                "heartbeat_interval_ms": 5_000,
+            },
+        )
+
+    assert captured.value.problem.code == "contract.validation_failed"
+
+
+def test_realtime_connection_contract_accepts_the_published_development_origin() -> None:
+    """@brief 验证 main 契约唯一开发 origin / Verify the main contract's sole development origin."""
+
+    ContractValidator.from_jsonc(read_contract_schema_text("v2")).validate_definition(
+        "RealtimeConnection",
+        {
+            "id": "connection_development_test",
+            "session_id": "interview_session_development_test",
+            "transport": "websocket",
+            "signaling_url": "ws://dev.hmalliances.org:9000/realtime/v2/interview",
+            "ephemeral_token": "header.payload.signature",
+            "ice_servers": [],
+            "expires_at": "2026-07-28T05:30:00Z",
+            "heartbeat_interval_ms": 5_000,
+        },
+    )
 
 
 def test_public_v2_template_routes_use_the_canonical_shape(backend_client: TestClient) -> None:

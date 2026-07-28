@@ -637,6 +637,7 @@ class AgentToolInvocationTrace:
                     "entity_resolution",
                     "draft_conflict",
                     "provider_protocol",
+                    "knowledge_retrieval",
                 }
             )
             or (
@@ -1199,6 +1200,7 @@ class AgentProviderCompleted:
     resume_operations: tuple[AgentResumeOperationDraft, ...] = ()
     proposal_title: str | None = None
     tool_invocations: tuple[AgentToolInvocationTrace, ...] = ()
+    knowledge_evidence: tuple[AgentKnowledgeEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         """@brief 校验最终内容和 Proposal-only 写入 / Validate final content and Proposal-only writes."""
@@ -1277,7 +1279,19 @@ class AgentProviderCompleted:
             raise AgentDomainError("provider returned unrequested citations")
         if len(set(citations)) != len(citations):
             raise AgentDomainError("provider citation selections must be unique")
-        evidence = {item.citation for item in request.knowledge_evidence}
+        selected_evidence = self.knowledge_evidence or request.knowledge_evidence
+        labels = tuple(item.label for item in selected_evidence)
+        if labels != tuple(range(len(labels))):
+            raise AgentDomainError("provider evidence labels must be contiguous from zero")
+        allowed_knowledge = {
+            (item.source_id, item.version_id) for item in request.grant.knowledge_contexts
+        }
+        if any(
+            (item.citation.source_id, item.citation.version_id) not in allowed_knowledge
+            for item in selected_evidence
+        ):
+            raise AgentDomainError("provider evidence exceeds the execution grant")
+        evidence = {item.citation for item in selected_evidence}
         if not set(citations) <= evidence:
             raise AgentDomainError("provider returned a citation outside server evidence")
         has_resume = bool(self.resume_operations)
@@ -1324,6 +1338,7 @@ class AgentProviderProposalDecisionRequired:
     provider_state: Mapping[str, JsonValue] = field(repr=False)
     tool_call_id: ToolCallId
     tool_invocations: tuple[AgentToolInvocationTrace, ...] = ()
+    knowledge_evidence: tuple[AgentKnowledgeEvidence, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.resume_operations:
@@ -1334,6 +1349,25 @@ class AgentProviderProposalDecisionRequired:
         if not isinstance(frozen, Mapping):
             raise AgentDomainError("provider state must be a JSON object")
         object.__setattr__(self, "provider_state", frozen)
+
+    def validate_for(self, request: AgentProviderRequest) -> None:
+        """@brief 验证 Proposal 证据未越出执行授权 / Validate Proposal evidence against the execution grant.
+
+        @param request 当前精确 Provider 请求 / Current exact Provider request.
+        @raise AgentDomainError 证据标签或 provenance 越权 / Raised for invalid labels or provenance.
+        """
+
+        labels = tuple(item.label for item in self.knowledge_evidence)
+        if labels != tuple(range(len(labels))):
+            raise AgentDomainError("provider evidence labels must be contiguous from zero")
+        allowed_knowledge = {
+            (item.source_id, item.version_id) for item in request.grant.knowledge_contexts
+        }
+        if any(
+            (item.citation.source_id, item.citation.version_id) not in allowed_knowledge
+            for item in self.knowledge_evidence
+        ):
+            raise AgentDomainError("provider evidence exceeds the execution grant")
 
 
 type AgentProviderOutcome = (

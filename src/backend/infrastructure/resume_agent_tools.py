@@ -265,14 +265,13 @@ class _AddSkillSectionInput(_ClosedInput):
 class _ExperienceDraftInput(_ClosedInput):
     """@brief 由后端补全的工作经历 / Backend-completed work experience."""
 
-    role: str = Field(min_length=1, max_length=300)
-    company: str = Field(min_length=1, max_length=300)
+    title: str = Field(min_length=1, max_length=300)
+    organization: str = Field(min_length=1, max_length=300)
     location: str | None = Field(default=None, max_length=300)
-    start: str | None = Field(default=None, max_length=10)
-    end: str | None = Field(default=None, max_length=10)
+    date_range: _DateRangeInput | None = None
     summary: str | None = Field(default=None, max_length=20_000)
-    highlights: list[str] = Field(max_length=100)
-    skills: list[str] = Field(max_length=200)
+    highlights: list[str] = Field(default_factory=list, max_length=100)
+    skills: list[str] = Field(default_factory=list, max_length=200)
 
 
 class _AddExperienceSectionInput(_ClosedInput):
@@ -286,14 +285,13 @@ class _AddExperienceSectionInput(_ClosedInput):
 class _ProjectDraftInput(_ClosedInput):
     """@brief 由后端补全的项目经历 / Backend-completed project."""
 
-    name: str = Field(min_length=1, max_length=300)
+    title: str = Field(min_length=1, max_length=300)
     organization: str | None = Field(default=None, max_length=300)
-    role: str | None = Field(default=None, max_length=300)
-    start: str | None = Field(default=None, max_length=10)
-    end: str | None = Field(default=None, max_length=10)
+    subtitle: str | None = Field(default=None, max_length=300)
+    date_range: _DateRangeInput | None = None
     summary: str | None = Field(default=None, max_length=20_000)
-    highlights: list[str] = Field(max_length=100)
-    skills: list[str] = Field(max_length=200)
+    highlights: list[str] = Field(default_factory=list, max_length=100)
+    skills: list[str] = Field(default_factory=list, max_length=200)
     url: str | None = Field(default=None, max_length=2_000)
 
 
@@ -308,13 +306,12 @@ class _AddProjectSectionInput(_ClosedInput):
 class _EducationDraftInput(_ClosedInput):
     """@brief 由后端补全的教育经历 / Backend-completed education item."""
 
-    school: str = Field(min_length=1, max_length=300)
-    degree: str | None = Field(default=None, max_length=300)
-    field: str | None = Field(default=None, max_length=300)
+    organization: str = Field(min_length=1, max_length=300)
+    title: str | None = Field(default=None, max_length=300)
+    subtitle: str | None = Field(default=None, max_length=300)
     location: str | None = Field(default=None, max_length=300)
-    start: str | None = Field(default=None, max_length=10)
-    end: str | None = Field(default=None, max_length=10)
-    highlights: list[str] = Field(max_length=100)
+    date_range: _DateRangeInput | None = None
+    highlights: list[str] = Field(default_factory=list, max_length=100)
 
 
 class _AddEducationSectionInput(_ClosedInput):
@@ -813,11 +810,11 @@ def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]
                 _complete_item(
                     item_id=_generated_entity_id(session, "experience", index),
                     kind="experience",
-                    title=item.role,
-                    organization=item.company,
+                    title=item.title,
+                    organization=item.organization,
                     location=item.location,
-                    start=item.start,
-                    end=item.end,
+                    start=None if item.date_range is None else item.date_range.start,
+                    end=None if item.date_range is None else item.date_range.end,
                     summary=item.summary,
                     highlights=item.highlights,
                     skills=item.skills,
@@ -848,11 +845,11 @@ def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]
                 _complete_item(
                     item_id=_generated_entity_id(session, "project", index),
                     kind="project",
-                    title=item.name,
-                    subtitle=item.role,
+                    title=item.title,
+                    subtitle=item.subtitle,
                     organization=item.organization,
-                    start=item.start,
-                    end=item.end,
+                    start=None if item.date_range is None else item.date_range.start,
+                    end=None if item.date_range is None else item.date_range.end,
                     summary=item.summary,
                     highlights=item.highlights,
                     skills=item.skills,
@@ -884,12 +881,12 @@ def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]
                 _complete_item(
                     item_id=_generated_entity_id(session, "education", index),
                     kind="education",
-                    title=item.degree,
-                    subtitle=item.field,
-                    organization=item.school,
+                    title=item.title,
+                    subtitle=item.subtitle,
+                    organization=item.organization,
                     location=item.location,
-                    start=item.start,
-                    end=item.end,
+                    start=None if item.date_range is None else item.date_range.start,
+                    end=None if item.date_range is None else item.date_range.end,
                     highlights=item.highlights,
                 )
                 for index, item in enumerate(items, start=1)
@@ -1157,11 +1154,12 @@ def _stage_generated_section(
                 "draft_state": session._draft_state(),
             }
         )
-    return session.stage(
+    section_id = _generated_entity_id(session, f"section_{section_kind}", 1)
+    result = session.stage(
         {
             "op": "upsert_section",
             "section": {
-                "id": _generated_entity_id(session, f"section_{section_kind}", 1),
+                "id": section_id,
                 "kind": section_kind,
                 "title": title,
                 "visible": True,
@@ -1171,6 +1169,15 @@ def _stage_generated_section(
             "after_section_id": after_section_id,
         }
     )
+    decoded = json.loads(result)
+    if isinstance(decoded, dict) and decoded.get("kind") == "resume_change_staged":
+        decoded["entity"] = {
+            "resource_type": "resume_section",
+            "id": section_id,
+            "kind": section_kind,
+        }
+        return _json_result(decoded)
+    return result
 
 
 def _complete_item(

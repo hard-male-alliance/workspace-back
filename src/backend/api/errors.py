@@ -118,6 +118,7 @@ def _problem_response(request: Request, problem: Problem) -> JSONResponse:
 def api_problem_response(request: Request, problem: Problem) -> JSONResponse:
     """Build the version-specific public Problem Details representation."""
 
+    request.state.problem_code = problem.code
     if request.url.path.startswith("/api/v2/"):
         errors = []
         for violation in problem.violations:

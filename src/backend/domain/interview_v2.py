@@ -641,8 +641,11 @@ class InterviewSession:
         return self.view.workspace_id
 
     def mark_connecting(self, *, at: datetime) -> InterviewSession:
-        """@brief created → connecting；active 可签发替换 connection 而不改状态 / Mark connecting; active sessions may replace a connection without state change."""
-        if self.view.status is InterviewSessionStatus.ACTIVE:
+        """@brief created → connecting；connecting/active 可幂等签发替换连接 / Mark connecting; connecting/active sessions may idempotently replace a connection."""
+        if self.view.status in {
+            InterviewSessionStatus.CONNECTING,
+            InterviewSessionStatus.ACTIVE,
+        }:
             return self
         self._require_state({InterviewSessionStatus.CREATED}, "connect")
         return replace(
