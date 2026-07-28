@@ -39,6 +39,7 @@ from backend.application.ports.agent_v2 import (
     ToolExecutionReceipt,
 )
 from backend.domain.agent_v2 import (
+    AgentDomainError,
     AgentExecutionGrant,
     AgentOutboxId,
     AgentOutputMode,
@@ -158,6 +159,7 @@ class State:
     resume_context_superseded: bool = False
     resume_grant_revision: int | None = None
     grant_policy_version: int | None = None
+    history_error: Exception | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +354,8 @@ class FakeRepository:
         conversation_id: ConversationId,
         page: AgentPageRequest,
     ) -> AgentPage[AgentRun]:
+        if self.state.history_error is not None:
+            raise self.state.history_error
         items = [
             item
             for item in self.state.runs.values()
@@ -1674,6 +1678,60 @@ async def test_provider_failure_is_persisted_and_never_leaks_exception_text() ->
     assert failed.problem.code == "agent.provider_failed"
     assert "secret" not in str(failed.problem)
     assert state.jobs[state.runs[run.meta.id].job_id].status.value == "failed"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_preflight_state_failure_terminalizes_without_provider_io() -> None:
+    """@brief 确定性前置状态错误必须终结 Run，不得交给 Outbox 反复重试 / Deterministic preflight state failures must terminalize the Run without Outbox retries."""
+
+    state = State()
+    ids = DeterministicIds()
+    service = _service(state, ids)
+    conversation = await service.create_conversation(
+        PRINCIPAL,
+        WORKSPACE,
+        CreateConversationCommand(ConversationCapability.GENERAL, "invalid history"),
+        CONTEXT,
+    )
+    message = await service.create_message(
+        PRINCIPAL,
+        WORKSPACE,
+        conversation.meta.id,
+        CreateMessageCommand(None, (TextContentPart("hello"),)),
+        expected_conversation_revision=1,
+        context=CONTEXT,
+    )
+    run = await service.create_agent_run(
+        PRINCIPAL,
+        WORKSPACE,
+        _spec(conversation.meta.id, message.meta.id),
+        CONTEXT,
+    )
+    state.history_error = AgentDomainError("private persisted state detail")
+    provider = FakeProvider(
+        state,
+        AgentProviderCompleted(
+            (TextContentPart("must not execute"),),
+            (),
+            AgentUsage(3, 2, "5"),
+        ),
+    )
+    worker = AgentWorkerService(
+        FakeWorkerUowFactory(state),
+        provider,
+        FakeToolExecutor(state),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+
+    failed = await worker.execute_run(_queued_dispatch(state, run.meta.id))
+
+    assert failed.status is AgentRunStatus.FAILED
+    assert failed.problem is not None
+    assert failed.problem.code == "agent.preflight_state_invalid"
+    assert failed.problem.retryable is False
+    assert "private" not in str(failed.problem)
+    assert provider.calls == 0
 
 
 @pytest.mark.asyncio

@@ -1311,6 +1311,11 @@ class AgentWorkerService:
             )
         except AgentProposalFailure as error:
             return await self._record_preflight_failure(dispatch, error.problem)
+        except (AgentDomainError, AgentPortProtocolError):
+            return await self._record_preflight_failure(
+                dispatch,
+                _preflight_state_problem(run_id),
+            )
         if isinstance(prepared, AgentRunView):
             return prepared
         try:
@@ -3274,6 +3279,23 @@ def _provider_protocol_problem(run_id: AgentRunId) -> ProblemDetails:
         request_id=str(run_id),
         retryable=False,
         detail="The model response did not satisfy the requested output contract.",
+    )
+
+
+def _preflight_state_problem(run_id: AgentRunId) -> ProblemDetails:
+    """@brief 构造不泄漏持久化细节的确定性前置状态错误 / Build a deterministic preflight-state problem without leaking persistence details.
+
+    @param run_id 稳定关联 Run / Stable correlated Run.
+    @return 不可重试且不包含内部异常正文的问题 / Non-retryable problem without internal exception text.
+    """
+    return ProblemDetails(
+        type_uri="https://api.hmalliances.org/problems/agent/preflight-state-invalid",
+        title="Agent execution state is invalid",
+        status=500,
+        code="agent.preflight_state_invalid",
+        request_id=str(run_id),
+        retryable=False,
+        detail="The saved Agent state cannot be executed safely.",
     )
 
 
