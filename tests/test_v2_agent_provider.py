@@ -770,13 +770,22 @@ async def test_proposal_decision_remains_resumable_at_tool_call_budget() -> None
     interrupted = await provider.execute(request)
     assert isinstance(interrupted, AgentProviderProposalDecisionRequired)
 
+    assert request.resume_context is not None
+    accepted_ref = ResourceRef("resume", "resume_provider_0001", 2)
+    accepted_document = replace(
+        request.resume_context.document,
+        meta=request.resume_context.document.meta.advance(NOW),
+    )
     resumed = await provider.execute(
         replace(
             request,
+            spec=replace(request.spec, context_refs=(accepted_ref,)),
+            grant=replace(request.grant, context_refs=(accepted_ref,)),
+            resume_context=AgentResumeContext(accepted_ref, accepted_document),
             proposal_decision=AgentProposalDecisionContext(
                 ResourceRef("resume_proposal", "proposal_provider_budget_0001", 2),
                 "accept",
-                ResourceRef("resume", "resume_provider_0001", 2),
+                accepted_ref,
             ),
             provider_state=interrupted.provider_state,
         )
