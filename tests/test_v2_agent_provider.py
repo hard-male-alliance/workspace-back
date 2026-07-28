@@ -31,6 +31,7 @@ from backend.domain.agent_v2 import (
     AgentResumeContext,
     AgentRunId,
     AgentRunSpec,
+    AuthorizedKnowledgeContext,
     ConversationCapability,
     ConversationId,
     Message,
@@ -45,7 +46,11 @@ from backend.domain.knowledge_retrieval import (
     KnowledgeSelection,
     KnowledgeSelectionMode,
 )
-from backend.domain.knowledge_sources import ModelRegion
+from backend.domain.knowledge_sources import (
+    KnowledgeSourceId,
+    KnowledgeSourceVersionId,
+    ModelRegion,
+)
 from backend.domain.principals import ResourceMeta, WorkspaceId
 from backend.domain.resources import ResourceRef
 from backend.domain.resumes import (
@@ -358,6 +363,51 @@ async def test_runner_returns_plain_assistant_output_without_structured_output()
     assert outcome.usage.output_tokens == 7
     assert model.calls[0][1] == []
     assert model.calls[0][2] is None
+
+
+@pytest.mark.asyncio
+async def test_run_telemetry_distinguishes_empty_authorized_knowledge_retrieval() -> None:
+    """@brief Run 遥测区分已授权零命中检索 / Run telemetry distinguishes authorized zero-hit retrieval."""
+
+    source_id = KnowledgeSourceId("knowledge_source_provider_0001")
+    version_id = KnowledgeSourceVersionId("knowledge_version_provider_0001")
+    base = _resume_request()
+    request = replace(
+        base,
+        spec=replace(
+            base.spec,
+            knowledge=KnowledgeSelection(
+                KnowledgeSelectionMode.EXPLICIT,
+                (source_id,),
+                (),
+                (),
+                "resume_assistant",
+            ),
+        ),
+        grant=replace(
+            base.grant,
+            knowledge_contexts=(AuthorizedKnowledgeContext(source_id, version_id, 1),),
+        ),
+    )
+    model = SequenceModel([_text_response("未找到可引用内容。", "response_empty_knowledge")])
+    telemetry = RecordingTelemetry()
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        telemetry=telemetry,  # type: ignore[arg-type]
+    )
+
+    outcome = await provider.execute(request)
+
+    assert isinstance(outcome, AgentProviderCompleted)
+    attributes = next(
+        attributes for name, attributes in telemetry.metrics if name == "aiws.agent.run.duration"
+    )
+    assert attributes["knowledge_context_count"] == 1
+    assert attributes["knowledge_source_count"] == 1
+    assert attributes["knowledge_evidence_attached_count"] == 0
+    assert attributes["knowledge_retrieval_status"] == "completed_empty"
 
 
 @pytest.mark.asyncio
@@ -716,6 +766,7 @@ async def test_repeated_identical_invalid_call_stops_with_recovery_error() -> No
     assert captured.value.problem.retryable is True
     assert len(captured.value.invocations) == 2
     assert captured.value.invocations[-1].consecutive_invalid_count == 2
+    assert captured.value.invocations[-1].validation_issues == (("updates", "too_short"),)
     assert (
         captured.value.invocations[0].argument_signature
         == captured.value.invocations[1].argument_signature

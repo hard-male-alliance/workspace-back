@@ -247,6 +247,93 @@ class _UpsertItemsInput(_ClosedInput):
     updates: list[_UpsertItemUpdateInput] = Field(min_length=1, max_length=100)
 
 
+class _SkillGroupDraftInput(_ClosedInput):
+    """@brief 由后端补全的技能分组 / Backend-completed skill group."""
+
+    name: str = Field(min_length=1, max_length=120)
+    skills: list[str] = Field(min_length=1, max_length=100)
+
+
+class _AddSkillSectionInput(_ClosedInput):
+    """@brief 新增技能模块的窄输入 / Narrow input for adding a skills section."""
+
+    title: str = Field(min_length=1, max_length=120)
+    groups: list[_SkillGroupDraftInput] = Field(min_length=1, max_length=50)
+    after_section_id: str | None = Field(default=None, max_length=160)
+
+
+class _ExperienceDraftInput(_ClosedInput):
+    """@brief 由后端补全的工作经历 / Backend-completed work experience."""
+
+    role: str = Field(min_length=1, max_length=300)
+    company: str = Field(min_length=1, max_length=300)
+    location: str | None = Field(default=None, max_length=300)
+    start: str | None = Field(default=None, max_length=10)
+    end: str | None = Field(default=None, max_length=10)
+    summary: str | None = Field(default=None, max_length=20_000)
+    highlights: list[str] = Field(max_length=100)
+    skills: list[str] = Field(max_length=200)
+
+
+class _AddExperienceSectionInput(_ClosedInput):
+    """@brief 新增工作经历模块的窄输入 / Narrow input for adding experience."""
+
+    title: str = Field(min_length=1, max_length=120)
+    items: list[_ExperienceDraftInput] = Field(min_length=1, max_length=50)
+    after_section_id: str | None = Field(default=None, max_length=160)
+
+
+class _ProjectDraftInput(_ClosedInput):
+    """@brief 由后端补全的项目经历 / Backend-completed project."""
+
+    name: str = Field(min_length=1, max_length=300)
+    organization: str | None = Field(default=None, max_length=300)
+    role: str | None = Field(default=None, max_length=300)
+    start: str | None = Field(default=None, max_length=10)
+    end: str | None = Field(default=None, max_length=10)
+    summary: str | None = Field(default=None, max_length=20_000)
+    highlights: list[str] = Field(max_length=100)
+    skills: list[str] = Field(max_length=200)
+    url: str | None = Field(default=None, max_length=2_000)
+
+
+class _AddProjectSectionInput(_ClosedInput):
+    """@brief 新增项目经历模块的窄输入 / Narrow input for adding projects."""
+
+    title: str = Field(min_length=1, max_length=120)
+    items: list[_ProjectDraftInput] = Field(min_length=1, max_length=100)
+    after_section_id: str | None = Field(default=None, max_length=160)
+
+
+class _EducationDraftInput(_ClosedInput):
+    """@brief 由后端补全的教育经历 / Backend-completed education item."""
+
+    school: str = Field(min_length=1, max_length=300)
+    degree: str | None = Field(default=None, max_length=300)
+    field: str | None = Field(default=None, max_length=300)
+    location: str | None = Field(default=None, max_length=300)
+    start: str | None = Field(default=None, max_length=10)
+    end: str | None = Field(default=None, max_length=10)
+    highlights: list[str] = Field(max_length=100)
+
+
+class _AddEducationSectionInput(_ClosedInput):
+    """@brief 新增教育经历模块的窄输入 / Narrow input for adding education."""
+
+    title: str = Field(min_length=1, max_length=120)
+    items: list[_EducationDraftInput] = Field(min_length=1, max_length=50)
+    after_section_id: str | None = Field(default=None, max_length=160)
+
+
+class _AddBulletSectionInput(_ClosedInput):
+    """@brief 新增简单要点模块的窄输入 / Narrow input for adding a bullet section."""
+
+    title: str = Field(min_length=1, max_length=120)
+    section_kind: Literal["awards", "certifications", "custom"]
+    bullets: list[str] = Field(min_length=1, max_length=100)
+    after_section_id: str | None = Field(default=None, max_length=160)
+
+
 @dataclass(slots=True)
 class ResumeToolSession:
     """One Run-bound Resume tool session with hidden authority and staged writes."""
@@ -438,11 +525,7 @@ class ResumeToolSession:
                             "suggested_tool": _suggested_tool(payload),
                         },
                         **(
-                            {
-                                "diagnostics": {
-                                    "date_rejection_reason": date_rejection_reason
-                                }
-                            }
+                            {"diagnostics": {"date_rejection_reason": date_rejection_reason}}
                             if isinstance(date_rejection_reason, str)
                             else {}
                         ),
@@ -524,9 +607,7 @@ def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]
                 "op": "set_field",
                 "entity_id": str(session.context.document.meta.id),
                 "field_path": ("profile", "contacts"),
-                "value": _json_value(
-                    [contact.model_dump(mode="json") for contact in contacts]
-                ),
+                "value": _json_value([contact.model_dump(mode="json") for contact in contacts]),
             }
         )
 
@@ -681,6 +762,175 @@ def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]
             )
         )
 
+    def add_skill_section(
+        title: str,
+        groups: list[_SkillGroupDraftInput],
+        after_section_id: str | None = None,
+    ) -> str:
+        """@brief 新增由服务端补全的技能模块 / Add a server-completed skills section.
+
+        @param title 模块标题 / Section title.
+        @param groups 技能分组 / Skill groups.
+        @param after_section_id 前置模块锚点 / Previous-section anchor.
+        @return 结构化草稿结果 / Structured draft result.
+        """
+
+        return _stage_generated_section(
+            session,
+            section_kind="skills",
+            title=title,
+            after_section_id=after_section_id,
+            items=tuple(
+                _complete_item(
+                    item_id=_generated_entity_id(session, "skill", index),
+                    kind="skill_group",
+                    title=group.name,
+                    skills=group.skills,
+                )
+                for index, group in enumerate(groups, start=1)
+            ),
+        )
+
+    def add_experience_section(
+        title: str,
+        items: list[_ExperienceDraftInput],
+        after_section_id: str | None = None,
+    ) -> str:
+        """@brief 新增由服务端补全的工作经历 / Add server-completed experience.
+
+        @param title 模块标题 / Section title.
+        @param items 工作经历 / Experience items.
+        @param after_section_id 前置模块锚点 / Previous-section anchor.
+        @return 结构化草稿结果 / Structured draft result.
+        """
+
+        return _stage_generated_section(
+            session,
+            section_kind="experience",
+            title=title,
+            after_section_id=after_section_id,
+            items=tuple(
+                _complete_item(
+                    item_id=_generated_entity_id(session, "experience", index),
+                    kind="experience",
+                    title=item.role,
+                    organization=item.company,
+                    location=item.location,
+                    start=item.start,
+                    end=item.end,
+                    summary=item.summary,
+                    highlights=item.highlights,
+                    skills=item.skills,
+                )
+                for index, item in enumerate(items, start=1)
+            ),
+        )
+
+    def add_project_section(
+        title: str,
+        items: list[_ProjectDraftInput],
+        after_section_id: str | None = None,
+    ) -> str:
+        """@brief 新增由服务端补全的项目经历 / Add server-completed projects.
+
+        @param title 模块标题 / Section title.
+        @param items 项目经历 / Project items.
+        @param after_section_id 前置模块锚点 / Previous-section anchor.
+        @return 结构化草稿结果 / Structured draft result.
+        """
+
+        return _stage_generated_section(
+            session,
+            section_kind="projects",
+            title=title,
+            after_section_id=after_section_id,
+            items=tuple(
+                _complete_item(
+                    item_id=_generated_entity_id(session, "project", index),
+                    kind="project",
+                    title=item.name,
+                    subtitle=item.role,
+                    organization=item.organization,
+                    start=item.start,
+                    end=item.end,
+                    summary=item.summary,
+                    highlights=item.highlights,
+                    skills=item.skills,
+                    url=item.url,
+                )
+                for index, item in enumerate(items, start=1)
+            ),
+        )
+
+    def add_education_section(
+        title: str,
+        items: list[_EducationDraftInput],
+        after_section_id: str | None = None,
+    ) -> str:
+        """@brief 新增由服务端补全的教育经历 / Add server-completed education.
+
+        @param title 模块标题 / Section title.
+        @param items 教育经历 / Education items.
+        @param after_section_id 前置模块锚点 / Previous-section anchor.
+        @return 结构化草稿结果 / Structured draft result.
+        """
+
+        return _stage_generated_section(
+            session,
+            section_kind="education",
+            title=title,
+            after_section_id=after_section_id,
+            items=tuple(
+                _complete_item(
+                    item_id=_generated_entity_id(session, "education", index),
+                    kind="education",
+                    title=item.degree,
+                    subtitle=item.field,
+                    organization=item.school,
+                    location=item.location,
+                    start=item.start,
+                    end=item.end,
+                    highlights=item.highlights,
+                )
+                for index, item in enumerate(items, start=1)
+            ),
+        )
+
+    def add_bullet_section(
+        title: str,
+        section_kind: Literal["awards", "certifications", "custom"],
+        bullets: list[str],
+        after_section_id: str | None = None,
+    ) -> str:
+        """@brief 新增由服务端补全的要点模块 / Add a server-completed bullet section.
+
+        @param title 模块标题 / Section title.
+        @param section_kind 模块类型 / Section kind.
+        @param bullets 简短要点 / Concise bullets.
+        @param after_section_id 前置模块锚点 / Previous-section anchor.
+        @return 结构化草稿结果 / Structured draft result.
+        """
+
+        item_kind = {
+            "awards": "award",
+            "certifications": "certification",
+            "custom": "custom",
+        }[section_kind]
+        return _stage_generated_section(
+            session,
+            section_kind=section_kind,
+            title=title,
+            after_section_id=after_section_id,
+            items=tuple(
+                _complete_item(
+                    item_id=_generated_entity_id(session, item_kind, index),
+                    kind=item_kind,
+                    title=bullet,
+                )
+                for index, bullet in enumerate(bullets, start=1)
+            ),
+        )
+
     return (
         StructuredTool.from_function(
             func=session.read_snapshot,
@@ -806,6 +1056,56 @@ def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]
             args_schema=_UpsertItemsInput,
         ),
         StructuredTool.from_function(
+            func=add_skill_section,
+            name="resume_draft_add_skill_section",
+            description=(
+                "Add a new skills section from simple named groups. The server generates IDs "
+                "and all complete Resume fields. Fails instead of replacing an existing skills "
+                "section."
+            ),
+            args_schema=_AddSkillSectionInput,
+        ),
+        StructuredTool.from_function(
+            func=add_experience_section,
+            name="resume_draft_add_experience_section",
+            description=(
+                "Add a new experience section from simple work records. The server generates "
+                "IDs, rich-text wrappers, defaults, and complete Resume fields. Fails instead "
+                "of replacing an existing experience section."
+            ),
+            args_schema=_AddExperienceSectionInput,
+        ),
+        StructuredTool.from_function(
+            func=add_project_section,
+            name="resume_draft_add_project_section",
+            description=(
+                "Add a new projects section from simple project records. The server generates "
+                "IDs, rich-text wrappers, defaults, and complete Resume fields. Fails instead "
+                "of replacing an existing projects section."
+            ),
+            args_schema=_AddProjectSectionInput,
+        ),
+        StructuredTool.from_function(
+            func=add_education_section,
+            name="resume_draft_add_education_section",
+            description=(
+                "Add a new education section from simple education records. The server "
+                "generates IDs, rich-text wrappers, defaults, and complete Resume fields. "
+                "Fails instead of replacing an existing education section."
+            ),
+            args_schema=_AddEducationSectionInput,
+        ),
+        StructuredTool.from_function(
+            func=add_bullet_section,
+            name="resume_draft_add_bullet_section",
+            description=(
+                "Add a new awards, certifications, or custom bullet section. The server "
+                "generates complete items. Use custom for self-evaluation or other concise "
+                "bullet modules. Fails instead of replacing a section with the same identity."
+            ),
+            args_schema=_AddBulletSectionInput,
+        ),
+        StructuredTool.from_function(
             func=session.request_decision,
             name="resume_request_proposal_decision",
             description=(
@@ -815,6 +1115,188 @@ def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]
             args_schema=_RequestDecisionInput,
         ),
     )
+
+
+def _stage_generated_section(
+    session: ResumeToolSession,
+    *,
+    section_kind: str,
+    title: str,
+    after_section_id: str | None,
+    items: Sequence[Mapping[str, JsonValue]],
+) -> str:
+    """@brief 暂存一个由服务端补全的新模块 / Stage one server-completed new section.
+
+    @param session 当前工具会话 / Current tool session.
+    @param section_kind 规范模块类型 / Canonical section kind.
+    @param title 模块标题 / Section title.
+    @param after_section_id 前置模块锚点 / Previous-section anchor.
+    @param items 已补全条目 / Completed items.
+    @return 结构化草稿结果 / Structured draft result.
+    @note 已存在相同语义模块时拒绝覆盖 / Refuses to replace an existing semantic section.
+    """
+
+    existing_id = _existing_section_id(session, section_kind, title)
+    if existing_id is not None:
+        return _json_result(
+            {
+                "kind": "invalid_draft",
+                "code": "resume.section_already_exists",
+                "recoverable": True,
+                "issues": (
+                    {
+                        "path": "section",
+                        "issue": "existing_section_requires_explicit_merge",
+                    },
+                ),
+                "existing_section_id": existing_id,
+                "retry": {
+                    "strategy": "read_then_merge",
+                    "suggested_tool": "resume_read_section",
+                },
+                "draft_state": session._draft_state(),
+            }
+        )
+    return session.stage(
+        {
+            "op": "upsert_section",
+            "section": {
+                "id": _generated_entity_id(session, f"section_{section_kind}", 1),
+                "kind": section_kind,
+                "title": title,
+                "visible": True,
+                "content": None,
+                "items": tuple(items),
+            },
+            "after_section_id": after_section_id,
+        }
+    )
+
+
+def _complete_item(
+    *,
+    item_id: str,
+    kind: str,
+    title: str | None = None,
+    subtitle: str | None = None,
+    organization: str | None = None,
+    location: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    summary: str | None = None,
+    highlights: Sequence[str] = (),
+    skills: Sequence[str] = (),
+    url: str | None = None,
+) -> Mapping[str, JsonValue]:
+    """@brief 补全一个规范简历条目 / Complete one canonical Resume item.
+
+    @param item_id 服务端生成的条目标识 / Server-generated item ID.
+    @param kind 规范条目类型 / Canonical item kind.
+    @param title 主标题 / Primary title.
+    @param subtitle 副标题 / Subtitle.
+    @param organization 组织名称 / Organization name.
+    @param location 地点 / Location.
+    @param start 开始日期 / Start date.
+    @param end 结束日期 / End date.
+    @param summary 摘要 / Summary.
+    @param highlights 亮点列表 / Highlight list.
+    @param skills 技能列表 / Skill list.
+    @param url 可选链接 / Optional URL.
+    @return 不含缺失字段的完整条目 / Complete item with no missing fields.
+    """
+
+    return {
+        "id": item_id,
+        "kind": kind,
+        "title": title,
+        "subtitle": subtitle,
+        "organization": organization,
+        "location": location,
+        "date_range": (
+            None
+            if start is None and end is None
+            else {
+                "start": start,
+                "end": end,
+            }
+        ),
+        "summary": None if summary is None else _rich_text(summary),
+        "highlights": tuple(_rich_text(text) for text in highlights),
+        "skills": tuple(skills),
+        "tags": (),
+        "visible": True,
+        "url": url,
+    }
+
+
+def _rich_text(text: str) -> Mapping[str, JsonValue]:
+    """@brief 将纯文本包装成规范富文本 / Wrap plain text as canonical rich text.
+
+    @param text 用户可见文本 / User-visible text.
+    @return 无标记富文本 / Rich text without marks.
+    """
+
+    return {"text": text, "marks": ()}
+
+
+def _existing_section_id(
+    session: ResumeToolSession,
+    section_kind: str,
+    title: str,
+) -> str | None:
+    """@brief 查找已有或已暂存的同语义模块 / Find an existing or staged semantic section.
+
+    @param session 当前工具会话 / Current tool session.
+    @param section_kind 规范模块类型 / Canonical section kind.
+    @param title 模块标题 / Section title.
+    @return 已有模块 ID；不存在则为空 / Existing section ID, or null.
+    """
+
+    for section in session.context.document.sections:
+        if section.kind.value == section_kind and (
+            section_kind != "custom" or section.title.casefold() == title.casefold()
+        ):
+            return section.id
+    for draft in session.drafts:
+        draft_section = draft.payload.get("section")
+        if not isinstance(draft_section, Mapping):
+            continue
+        draft_kind = draft_section.get("kind")
+        draft_title = draft_section.get("title")
+        if draft_kind == section_kind and (
+            section_kind != "custom"
+            or (isinstance(draft_title, str) and draft_title.casefold() == title.casefold())
+        ):
+            section_id = draft_section.get("id")
+            return section_id if isinstance(section_id, str) else None
+    return None
+
+
+def _generated_entity_id(
+    session: ResumeToolSession,
+    stem: str,
+    ordinal: int,
+) -> str:
+    """@brief 生成不与当前文档冲突的稳定临时 ID / Generate a stable non-conflicting temporary ID.
+
+    @param session 当前工具会话 / Current tool session.
+    @param stem 语义 ID 主干 / Semantic ID stem.
+    @param ordinal 同类实体序号 / Same-kind entity ordinal.
+    @return 可用于 Proposal 的临时实体 ID / Temporary entity ID suitable for a Proposal.
+    """
+
+    base = f"tmp_{stem}_{ordinal:02d}"
+    occupied = {
+        entity_id
+        for section in session.context.document.sections
+        for entity_id in (section.id, *(item.id for item in section.items))
+    }
+    if base not in occupied:
+        return base
+    suffix = 2
+    while f"{base}_{suffix}" in occupied:
+        suffix += 1
+    return f"{base}_{suffix}"
 
 
 def tool_catalog(tools: Sequence[StructuredTool]) -> tuple[dict[str, JsonValue], ...]:
@@ -893,11 +1375,7 @@ def _operation_slot(payload: Mapping[str, JsonValue]) -> tuple[str, ...]:
     operation = str(payload.get("op", "unknown"))
     if operation == "set_field":
         raw_path = payload.get("field_path")
-        path = (
-            tuple(str(item) for item in raw_path)
-            if isinstance(raw_path, (list, tuple))
-            else ()
-        )
+        path = tuple(str(item) for item in raw_path) if isinstance(raw_path, (list, tuple)) else ()
         return (operation, str(payload.get("entity_id", "")), *path)
     if operation == "upsert_section":
         section = payload.get("section")
@@ -935,10 +1413,7 @@ def _date_normalization_count(
 
     before_ranges = _operation_date_ranges(before)
     after_ranges = _operation_date_ranges(after)
-    return sum(
-        left != right
-        for left, right in zip(before_ranges, after_ranges, strict=True)
-    )
+    return sum(left != right for left, right in zip(before_ranges, after_ranges, strict=True))
 
 
 def _operation_date_ranges(
@@ -953,22 +1428,14 @@ def _operation_date_ranges(
     operation = payload.get("op")
     if operation == "upsert_item":
         item = payload.get("item")
-        return (
-            (item.get("date_range"),)
-            if isinstance(item, Mapping)
-            else ()
-        )
+        return (item.get("date_range"),) if isinstance(item, Mapping) else ()
     if operation != "upsert_section":
         return ()
     section = payload.get("section")
     items = section.get("items") if isinstance(section, Mapping) else None
     if not isinstance(items, (list, tuple)):
         return ()
-    return tuple(
-        item.get("date_range")
-        for item in items
-        if isinstance(item, Mapping)
-    )
+    return tuple(item.get("date_range") for item in items if isinstance(item, Mapping))
 
 
 __all__ = ["ResumeToolSession", "resume_agent_tools", "tool_catalog"]

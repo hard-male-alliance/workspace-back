@@ -385,7 +385,9 @@ class AgentRunSpec:
         _require_opaque_id(self.input_message_id, "agent run input message id")
         if len(self.context_refs) > 100:
             raise AgentDomainError("agent run context references cannot exceed 100")
-        context_keys = tuple((item.resource_type, item.id, item.revision) for item in self.context_refs)
+        context_keys = tuple(
+            (item.resource_type, item.id, item.revision) for item in self.context_refs
+        )
         if len(set(context_keys)) != len(context_keys):
             raise AgentDomainError("agent run context references must be unique")
         if not 1 <= len(self.output_modes) <= 3 or len(set(self.output_modes)) != len(
@@ -398,18 +400,18 @@ class AgentRunSpec:
         ):
             raise AgentDomainError("resume operations require the resume_edit capability")
         if AgentOutputMode.RESUME_OPERATIONS in self.output_modes and (
-            len(self.context_refs) != 1
-            or self.context_refs[0].resource_type != "resume"
+            len(self.context_refs) != 1 or self.context_refs[0].resource_type != "resume"
         ):
-            raise AgentDomainError(
-                "resume operations require exactly one Resume context"
-            )
+            raise AgentDomainError("resume operations require exactly one Resume context")
         if (
             AgentOutputMode.CITATIONS in self.output_modes
             and self.knowledge.mode is KnowledgeSelectionMode.NONE
         ):
             raise AgentDomainError("citation output requires a Knowledge selection")
-        if not 2 <= len(self.response_locale) <= 35 or _LOCALE.fullmatch(self.response_locale) is None:
+        if (
+            not 2 <= len(self.response_locale) <= 35
+            or _LOCALE.fullmatch(self.response_locale) is None
+        ):
             raise AgentDomainError("agent response locale is invalid")
 
 
@@ -602,6 +604,7 @@ class AgentToolInvocationTrace:
     validation_phase: str | None = None
     argument_signature: str | None = None
     consecutive_invalid_count: int = 0
+    validation_issues: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         """@brief 校验诊断字段有界且不含工具内容 / Validate bounded content-free diagnostics."""
@@ -641,13 +644,17 @@ class AgentToolInvocationTrace:
                 and (
                     len(self.argument_signature) != 64
                     or any(
-                        character not in "0123456789abcdef"
-                        for character in self.argument_signature
+                        character not in "0123456789abcdef" for character in self.argument_signature
                     )
                 )
             )
             or isinstance(self.consecutive_invalid_count, bool)
             or not 0 <= self.consecutive_invalid_count <= 1_000
+            or len(self.validation_issues) > 5
+            or any(
+                not path or len(path) > 300 or not issue or len(issue) > 100
+                for path, issue in self.validation_issues
+            )
         ):
             raise AgentDomainError("Agent tool invocation diagnostic is invalid")
 
@@ -687,11 +694,7 @@ class AgentRunView:
         elif self.pending_approval_id is not None:
             raise AgentDomainError("only a waiting run may expose a pending approval")
         if self.status is AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION:
-            if (
-                self.output_message_id is None
-                or len(self.proposal_refs) != 1
-                or self.usage is None
-            ):
+            if self.output_message_id is None or len(self.proposal_refs) != 1 or self.usage is None:
                 raise AgentDomainError(
                     "proposal-waiting run requires an output, usage, and one Proposal"
                 )
@@ -705,11 +708,7 @@ class AgentRunView:
         if (
             not self.status.is_terminal
             and self.status is not AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION
-            and (
-                self.output_message_id is not None
-                or self.proposal_refs
-                or self.usage is not None
-            )
+            and (self.output_message_id is not None or self.proposal_refs or self.usage is not None)
         ):
             raise AgentDomainError("non-terminal run cannot expose terminal results")
 
@@ -742,12 +741,10 @@ class AgentRun:
             _require_opaque_id(self.active_tool_call_id, "active tool call id")
         elif self.active_tool_call_id is not None:
             raise AgentDomainError("only a waiting run may retain an active tool call")
-        if (
-            self.view.status is AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION
-        ) != (self.provider_state is not None):
-            raise AgentDomainError(
-                "only a Proposal-waiting run may retain native provider state"
-            )
+        if (self.view.status is AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION) != (
+            self.provider_state is not None
+        ):
+            raise AgentDomainError("only a Proposal-waiting run may retain native provider state")
 
     @property
     def meta(self) -> ResourceMeta[AgentRunId]:
@@ -788,7 +785,9 @@ class AgentRun:
             grant=self.grant if grant is None else grant,
         )
 
-    def wait_for_tool(self, approval_id: ToolApprovalId, tool_call_id: ToolCallId, *, at: datetime) -> AgentRun:
+    def wait_for_tool(
+        self, approval_id: ToolApprovalId, tool_call_id: ToolCallId, *, at: datetime
+    ) -> AgentRun:
         """@brief running → waiting_for_approval 并绑定精确 tool call / Wait and bind the exact tool call."""
         self._require_state(AgentRunStatus.WAITING_FOR_APPROVAL, {AgentRunStatus.RUNNING})
         _require_opaque_id(approval_id, "approval id")
@@ -1231,16 +1230,13 @@ class AgentProviderCompleted:
                 maximum=300,
             )
         if bool(self.resume_operations) != (self.proposal_title is not None):
-            raise AgentDomainError(
-                "provider Resume drafts and proposal title must appear together"
-            )
+            raise AgentDomainError("provider Resume drafts and proposal title must appear together")
         ordinals = tuple(item.ordinal for item in self.tool_invocations)
-        if ordinals and ordinals != tuple(
-            range(ordinals[0], ordinals[0] + len(ordinals))
-        ):
+        if ordinals and ordinals != tuple(range(ordinals[0], ordinals[0] + len(ordinals))):
             raise AgentDomainError(
                 "provider tool invocation ordinals must be contiguous within an attempt"
             )
+
     def validate_for(self, request: AgentProviderRequest) -> None:
         """@brief 对精确请求验证完整模式与证据 provenance / Validate complete modes and evidence provenance.
 
@@ -1260,9 +1256,7 @@ class AgentProviderCompleted:
             )
         text_count = sum(isinstance(part, TextContentPart) for part in self.content)
         citations = tuple(
-            part.citation
-            for part in self.content
-            if isinstance(part, CitationContentPart)
+            part.citation for part in self.content if isinstance(part, CitationContentPart)
         )
         for part in self.content:
             if isinstance(part, TextContentPart) and AgentOutputMode.TEXT not in allowed:
@@ -1343,9 +1337,7 @@ class AgentProviderProposalDecisionRequired:
 
 
 type AgentProviderOutcome = (
-    AgentProviderCompleted
-    | AgentProviderApprovalRequired
-    | AgentProviderProposalDecisionRequired
+    AgentProviderCompleted | AgentProviderApprovalRequired | AgentProviderProposalDecisionRequired
 )
 """@brief 模型 provider 的封闭结果联合 / Closed model-provider outcome union."""
 

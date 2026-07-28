@@ -201,7 +201,9 @@ class OpenAIAgentsSDKProvider:
     async def execute(self, request: AgentProviderRequest) -> AgentProviderOutcome:
         prompt = _message_text(request)
         if not prompt:
-            raise AgentProviderFailure(_problem(request, "agent.provider_input_invalid", 422, False))
+            raise AgentProviderFailure(
+                _problem(request, "agent.provider_input_invalid", 422, False)
+            )
         if len(prompt) > _MAX_INPUT_CHARACTERS:
             raise AgentProviderFailure(
                 _problem(request, "agent.provider_input_too_large", 413, False)
@@ -224,9 +226,7 @@ class OpenAIAgentsSDKProvider:
             tools=list(tools),
         )
         started = perf_counter()
-        latency_budget_ms = (
-            request.spec.inference.latency_budget_ms or _DEFAULT_LATENCY_BUDGET_MS
-        )
+        latency_budget_ms = request.spec.inference.latency_budget_ms or _DEFAULT_LATENCY_BUDGET_MS
         try:
             async with asyncio.timeout(self._execution_timeout_ms / 1000):
                 if request.provider_state is None:
@@ -238,9 +238,7 @@ class OpenAIAgentsSDKProvider:
                         max_turns=_MAX_TURNS,
                         run_config=RunConfig(
                             tracing_disabled=True,
-                            workflow_name="resume_agent"
-                            if session
-                            else "workspace_agent",
+                            workflow_name="resume_agent" if session else "workspace_agent",
                         ),
                     )
                 else:
@@ -501,6 +499,16 @@ class OpenAIAgentsSDKProvider:
             "operation": "runner",
             "outcome": outcome,
             "continuation": request.provider_state is not None,
+            "knowledge_context_count": len(request.grant.knowledge_contexts),
+            "knowledge_source_count": len(
+                {context.source_id for context in request.grant.knowledge_contexts}
+            ),
+            "knowledge_evidence_attached_count": len(request.knowledge_evidence),
+            "knowledge_retrieval_status": (
+                "not_requested"
+                if not request.grant.knowledge_contexts
+                else ("completed_with_hits" if request.knowledge_evidence else "completed_empty")
+            ),
         }
         if diagnostic_attributes is not None:
             attributes.update(diagnostic_attributes)
@@ -579,10 +587,7 @@ def _sdk_tools(
             delegate: Any = tool,
             name: str = tool_name,
         ) -> str:
-            if (
-                name != _PROPOSAL_TOOL
-                and ordinal_offset + len(traces) >= _MAX_TOOL_CALLS
-            ):
+            if name != _PROPOSAL_TOOL and ordinal_offset + len(traces) >= _MAX_TOOL_CALLS:
                 raise _ToolCallBudgetExhausted
             started = perf_counter()
             arguments: object = {}
@@ -610,15 +615,11 @@ def _sdk_tools(
                 result = _invalid_tool_arguments_result(name, error)
             except json.JSONDecodeError:
                 result = _invalid_tool_arguments_result(name, None, issue="invalid_json")
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 result = _invalid_tool_arguments_result(name, None, issue="invalid_value")
             except Exception:
                 duration = (perf_counter() - started) * 1000
-                argument_keys = (
-                    tuple(sorted(arguments))
-                    if isinstance(arguments, dict)
-                    else ()
-                )
+                argument_keys = tuple(sorted(arguments)) if isinstance(arguments, dict) else ()
                 recorder(request, name, "failure", duration)
                 traces.append(
                     AgentToolInvocationTrace(
@@ -633,15 +634,12 @@ def _sdk_tools(
                 )
                 raise
             duration = (perf_counter() - started) * 1000
-            argument_keys = (
-                tuple(sorted(arguments))
-                if isinstance(arguments, dict)
-                else ()
-            )
+            argument_keys = tuple(sorted(arguments)) if isinstance(arguments, dict) else ()
             result_kind: str | None = None
             result_code: str | None = None
             date_normalization_count = 0
             date_rejection_reason: str | None = None
+            validation_issues: tuple[tuple[str, str], ...] = ()
             try:
                 decoded_result = json.loads(result)
                 if isinstance(decoded_result, dict):
@@ -651,12 +649,8 @@ def _sdk_tools(
                     result_code = raw_code if isinstance(raw_code, str) else None
                     raw_diagnostics = decoded_result.get("diagnostics")
                     if isinstance(raw_diagnostics, dict):
-                        raw_count = raw_diagnostics.get(
-                            "date_normalization_count"
-                        )
-                        raw_reason = raw_diagnostics.get(
-                            "date_rejection_reason"
-                        )
+                        raw_count = raw_diagnostics.get("date_normalization_count")
+                        raw_reason = raw_diagnostics.get("date_rejection_reason")
                         if (
                             isinstance(raw_count, int)
                             and not isinstance(raw_count, bool)
@@ -670,7 +664,24 @@ def _sdk_tools(
                             "unsupported_format",
                         }:
                             date_rejection_reason = raw_reason
-            except (TypeError, json.JSONDecodeError):
+                    raw_issues = decoded_result.get("issues")
+                    if isinstance(raw_issues, list):
+                        validation_issues = tuple(
+                            (path[:300], issue[:100])
+                            for raw_issue in raw_issues[:5]
+                            if isinstance(raw_issue, dict)
+                            and isinstance(
+                                path := raw_issue.get("path"),
+                                str,
+                            )
+                            and path
+                            and isinstance(
+                                issue := raw_issue.get("issue"),
+                                str,
+                            )
+                            and issue
+                        )
+            except TypeError, json.JSONDecodeError:
                 pass
             trace_status = (
                 "invalid"
@@ -695,21 +706,15 @@ def _sdk_tools(
                 "draft_count": len(session.drafts),
                 "invalid_tool_call_count": recovery.invalid_call_count,
                 "consecutive_invalid_count": recovery.consecutive_invalid_count,
-                "repeated_invalid_signature_count": (
-                    recovery.repeated_invalid_signature_count
-                ),
+                "repeated_invalid_signature_count": (recovery.repeated_invalid_signature_count),
             }
             if result_code is not None:
                 diagnostic_attributes["domain_code"] = result_code
             if date_normalization_count:
-                diagnostic_attributes["date_normalization_count"] = (
-                    date_normalization_count
-                )
+                diagnostic_attributes["date_normalization_count"] = date_normalization_count
                 diagnostic_attributes["date_normalization_applied"] = True
             if date_rejection_reason is not None:
-                diagnostic_attributes["date_rejection_reason"] = (
-                    date_rejection_reason
-                )
+                diagnostic_attributes["date_rejection_reason"] = date_rejection_reason
             recorder(
                 request,
                 name,
@@ -729,12 +734,12 @@ def _sdk_tools(
                     validation_phase=validation_phase,
                     argument_signature=argument_signature,
                     consecutive_invalid_count=recovery.consecutive_invalid_count,
+                    validation_issues=validation_issues,
                 )
             )
             if trace_status == "invalid" and (
                 recovery.invalid_call_count >= _MAX_INVALID_TOOL_CALLS
-                or recovery.repeated_invalid_signature_count
-                >= _MAX_REPEATED_INVALID_SIGNATURE
+                or recovery.repeated_invalid_signature_count >= _MAX_REPEATED_INVALID_SIGNATURE
             ):
                 raise _ToolRecoveryExhausted
             return result
@@ -775,29 +780,21 @@ def _proposal_interruption(
     traces: tuple[AgentToolInvocationTrace, ...],
 ) -> AgentProviderProposalDecisionRequired:
     if session is None or len(result.interruptions) != 1:
-        raise AgentProviderFailure(
-            _problem(request, "agent.provider_protocol_error", 502, False)
-        )
+        raise AgentProviderFailure(_problem(request, "agent.provider_protocol_error", 502, False))
     interruption: ToolApprovalItem = result.interruptions[0]
     if interruption.tool_name != _PROPOSAL_TOOL:
-        raise AgentProviderFailure(
-            _problem(request, "agent.provider_protocol_error", 502, False)
-        )
+        raise AgentProviderFailure(_problem(request, "agent.provider_protocol_error", 502, False))
     raw = interruption.raw_item
     arguments_json = (
         raw.get("arguments") if isinstance(raw, dict) else getattr(raw, "arguments", None)
     )
     call_id = raw.get("call_id") if isinstance(raw, dict) else getattr(raw, "call_id", None)
     if not isinstance(arguments_json, str) or not isinstance(call_id, str):
-        raise AgentProviderFailure(
-            _problem(request, "agent.provider_protocol_error", 502, False)
-        )
+        raise AgentProviderFailure(_problem(request, "agent.provider_protocol_error", 502, False))
     arguments = json.loads(arguments_json)
     title = arguments.get("title")
     if not isinstance(title, str) or not session.drafts:
-        raise AgentProviderFailure(
-            _problem(request, "agent.provider_protocol_error", 502, False)
-        )
+        raise AgentProviderFailure(_problem(request, "agent.provider_protocol_error", 502, False))
     state = result.to_state().to_json(strict_context=True)
     interruption_trace = AgentToolInvocationTrace(
         len(traces) + 1,
@@ -882,10 +879,7 @@ def _checkpoint_tool_call_count(
     items = state.get("generated_items")
     if not isinstance(items, tuple):
         return 0
-    return sum(
-        isinstance(item, Mapping) and item.get("type") == "tool_call_item"
-        for item in items
-    )
+    return sum(isinstance(item, Mapping) and item.get("type") == "tool_call_item" for item in items)
 
 
 def _plain_json(value: JsonValue) -> Any:
@@ -944,11 +938,9 @@ def _argument_signature(
             separators=(",", ":"),
             sort_keys=True,
         )
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except TypeError, ValueError, json.JSONDecodeError:
         normalized = arguments_json
-    return hashlib.sha256(
-        salt + f"{tool_name}\0{normalized}".encode()
-    ).hexdigest()
+    return hashlib.sha256(salt + f"{tool_name}\0{normalized}".encode()).hexdigest()
 
 
 def _invalid_tool_arguments_result(
@@ -979,9 +971,7 @@ def _invalid_tool_arguments_result(
                 {
                     "path": path[:300],
                     "issue": (
-                        error_type[:100]
-                        if isinstance(error_type, str)
-                        else "schema_validation"
+                        error_type[:100] if isinstance(error_type, str) else "schema_validation"
                     ),
                 }
             )
@@ -1024,13 +1014,9 @@ def _validation_phase(result_kind: str | None, result_code: str | None) -> str:
         return "arguments_schema"
     if result_kind != "invalid_draft":
         return "tool"
-    if result_code is not None and (
-        "not_found" in result_code or "missing" in result_code
-    ):
+    if result_code is not None and ("not_found" in result_code or "missing" in result_code):
         return "entity_resolution"
-    if result_code is not None and (
-        "conflict" in result_code or "duplicate" in result_code
-    ):
+    if result_code is not None and ("conflict" in result_code or "duplicate" in result_code):
         return "draft_conflict"
     return "domain_validation"
 
@@ -1066,15 +1052,9 @@ def _failure_diagnostics(
         "invalid_tool_call_count": sum(trace.status == "invalid" for trace in traces),
         "last_tool_name": last_trace.tool_name if last_trace else "none",
         "last_tool_status": last_trace.status if last_trace else "none",
-        "last_result_kind": (
-            (last_trace.result_kind if last_trace else None) or "none"
-        ),
-        "last_result_code": (
-            (last_trace.result_code if last_trace else None) or "none"
-        ),
-        "last_validation_phase": (
-            (last_trace.validation_phase if last_trace else None) or "none"
-        ),
+        "last_result_kind": ((last_trace.result_kind if last_trace else None) or "none"),
+        "last_result_code": ((last_trace.result_code if last_trace else None) or "none"),
+        "last_validation_phase": ((last_trace.validation_phase if last_trace else None) or "none"),
         "latency_budget_ms": latency_budget_ms,
         "execution_timeout_ms": execution_timeout_ms,
     }
