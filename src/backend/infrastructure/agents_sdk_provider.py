@@ -66,7 +66,8 @@ from workspace_shared.tenancy import ActorScope
 _MAX_TURNS = 20
 _MAX_TOOL_CALLS = 16
 _MAX_INVALID_TOOL_CALLS = 3
-_MAX_REPEATED_INVALID_SIGNATURE = 2
+# @brief 相同无效参数也应获得完整纠错预算 / Give repeated invalid arguments the full recovery budget.
+_MAX_REPEATED_INVALID_SIGNATURE = _MAX_INVALID_TOOL_CALLS
 _MAX_INPUT_CHARACTERS = 1_000_000
 _PROPOSAL_TOOL = "resume_request_proposal_decision"
 _DEFAULT_LATENCY_BUDGET_MS = 60_000
@@ -993,6 +994,7 @@ def _invalid_tool_arguments_result(
         "resume_draft_upsert_sections": "resume_draft_upsert_section",
         "resume_draft_upsert_items": "resume_draft_upsert_item",
     }.get(tool_name, tool_name)
+    correction = _tool_argument_correction(tool_name)
     return json.dumps(
         {
             "kind": "invalid_tool_arguments",
@@ -1004,11 +1006,32 @@ def _invalid_tool_arguments_result(
                 "strategy": "correct_arguments",
                 "suggested_tool": suggested_tool,
                 "repeat_unchanged": False,
+                **({"correction": correction} if correction is not None else {}),
             },
         },
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
+    )
+
+
+def _tool_argument_correction(tool_name: str) -> str | None:
+    """@brief 返回不含用户内容的工具参数纠正建议 / Return content-free tool argument correction guidance.
+
+    @param tool_name 参数校验失败的工具 / Tool whose arguments failed validation.
+    @return 可空纠正建议 / Optional correction guidance.
+    """
+
+    if tool_name not in {
+        "resume_draft_upsert_section",
+        "resume_draft_upsert_sections",
+    }:
+        return None
+    return (
+        "Send exactly one valid JSON object matching the runtime schema. "
+        "For a new section with items, first call resume_draft_upsert_section "
+        "with section.items=[], then call resume_draft_upsert_item or "
+        "resume_draft_upsert_items with complete items."
     )
 
 

@@ -615,6 +615,35 @@ async def test_invalid_tool_arguments_are_returned_to_model_for_recovery() -> No
 
 
 @pytest.mark.asyncio
+async def test_invalid_section_json_feedback_recommends_smaller_draft_tools() -> None:
+    """@brief 章节 JSON 错误返回可执行的拆分建议 / Return an executable decomposition hint for invalid section JSON."""
+
+    model = SequenceModel(
+        [
+            _tool_response(
+                "resume_draft_upsert_section",
+                '{"section":',
+                "call_invalid_section_json_0001",
+            ),
+            _text_response("请重试。", "response_after_invalid_section_json"),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+
+    outcome = await provider.execute(_resume_request())
+
+    assert isinstance(outcome, AgentProviderCompleted)
+    feedback = repr(model.calls[1][0])
+    assert "resume_draft_upsert_section" in feedback
+    assert "items=[]" in feedback
+    assert "resume_draft_upsert_item" in feedback
+
+
+@pytest.mark.asyncio
 async def test_date_normalization_emits_content_free_tool_telemetry() -> None:
     """@brief 日期归一化进入遥测但不泄漏原文 / Emit date telemetry without raw content."""
 
@@ -700,6 +729,11 @@ async def test_repeated_identical_invalid_call_stops_with_recovery_error() -> No
                 '{"updates":[]}',
                 "call_invalid_batch_0002",
             ),
+            _tool_response(
+                "resume_draft_set_fields",
+                '{"updates":[]}',
+                "call_invalid_batch_0003",
+            ),
         ]
     )
     provider = OpenAIAgentsSDKProvider(
@@ -714,9 +748,73 @@ async def test_repeated_identical_invalid_call_stops_with_recovery_error() -> No
     assert captured.value.problem.code == "agent.tool_recovery_exhausted"
     assert captured.value.problem.status == 502
     assert captured.value.problem.retryable is True
-    assert len(captured.value.invocations) == 2
-    assert captured.value.invocations[-1].consecutive_invalid_count == 2
+    assert len(captured.value.invocations) == 3
+    assert captured.value.invocations[-1].consecutive_invalid_count == 3
     assert (
         captured.value.invocations[0].argument_signature
-        == captured.value.invocations[1].argument_signature
+        == captured.value.invocations[2].argument_signature
     )
+
+
+@pytest.mark.asyncio
+async def test_second_identical_invalid_section_call_can_recover_on_final_attempt() -> None:
+    """@brief 第二次相同参数错误仍把纠正信息返回模型 / Return correction feedback after a second identical argument error."""
+
+    invalid_arguments = '{"section":"education","after_section_id":null}'
+    valid_arguments = json.dumps(
+        {
+            "section": {
+                "id": "tmp_section_education_01",
+                "kind": "education",
+                "title": "教育经历",
+                "visible": True,
+                "content": None,
+                "items": [],
+            },
+            "after_section_id": None,
+        },
+        ensure_ascii=False,
+    )
+    model = SequenceModel(
+        [
+            _tool_response(
+                "resume_draft_upsert_section",
+                invalid_arguments,
+                "call_invalid_section_0001",
+            ),
+            _tool_response(
+                "resume_draft_upsert_section",
+                invalid_arguments,
+                "call_invalid_section_0002",
+            ),
+            _tool_response(
+                "resume_draft_upsert_section",
+                valid_arguments,
+                "call_recovered_section_0001",
+            ),
+            _tool_response(
+                "resume_request_proposal_decision",
+                '{"title":"新增教育经历"}',
+                "call_recovered_section_proposal_0001",
+            ),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+
+    outcome = await provider.execute(_resume_request())
+
+    assert isinstance(outcome, AgentProviderProposalDecisionRequired)
+    assert [trace.status for trace in outcome.tool_invocations] == [
+        "invalid",
+        "invalid",
+        "completed",
+        "decision_required",
+    ]
+    second_feedback = repr(model.calls[2][0])
+    assert '"path":"section"' in second_feedback
+    assert '"issue":"model_type"' in second_feedback
+    assert outcome.resume_operations[0].payload["op"] == "upsert_section"
