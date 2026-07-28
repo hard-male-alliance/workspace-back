@@ -842,7 +842,12 @@ class V2ResumeHttpAdapter:
             )
             payload = _operation_outcome(outcome)
             runtime.contracts_v2.validate_definition("ResumeOperationResult", payload)
-            return replayable_json(payload, status_code=200, etag=True)
+            return replayable_json(
+                payload,
+                status_code=200,
+                etag=True,
+                etag_representation=payload["resume"],
+            )
 
         return await idempotent_response(
             request,
@@ -1055,7 +1060,12 @@ class V2ResumeHttpAdapter:
             )
             payload = _operation_outcome(outcome)
             runtime.contracts_v2.validate_definition("ResumeOperationResult", payload)
-            return replayable_json(payload, status_code=200, etag=True)
+            return replayable_json(
+                payload,
+                status_code=200,
+                etag=True,
+                etag_representation=payload["resume"],
+            )
 
         return await idempotent_response(
             request,
