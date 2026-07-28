@@ -508,11 +508,24 @@ class InterviewSettings:
         generation uses the deterministic development adapter or the real model.
     @param report_timeout_ms 一次模型报告生成的 wall-time 上限 / Whole-call wall-time limit
         for one model-backed report generation.
+    @param report_first_chunk_timeout_ms 首个模型输出分片等待上限 / First model-output chunk
+        wait limit.
+    @param report_stream_idle_timeout_ms 相邻模型输出分片空闲上限 / Idle limit between model
+        output chunks.
+    @param report_job_timeout_ms 整个报告 Job 的持久执行上限 / Durable execution limit for the
+        whole Report Job.
+    @param report_maximum_attempts 报告专用最大尝试次数 / Report-specific maximum attempts.
+    @param report_max_output_tokens 报告模型输出 token 上限 / Report model-output token limit.
     """
 
     realtime: InterviewRealtimeSettings
     report_provider_mode: InterviewReportProviderMode
     report_timeout_ms: int
+    report_first_chunk_timeout_ms: int
+    report_stream_idle_timeout_ms: int
+    report_job_timeout_ms: int
+    report_maximum_attempts: int
+    report_max_output_tokens: int
     recording_directory: Path
     media_chunk_max_bytes: int
     media_session_max_bytes: int
@@ -1451,6 +1464,11 @@ def _interview_settings(
             "realtime",
             "report_provider_mode",
             "report_timeout_ms",
+            "report_first_chunk_timeout_ms",
+            "report_stream_idle_timeout_ms",
+            "report_job_timeout_ms",
+            "report_maximum_attempts",
+            "report_max_output_tokens",
             "recording_directory",
             "media_chunk_max_bytes",
             "media_session_max_bytes",
@@ -1493,6 +1511,36 @@ def _interview_settings(
         default=60_000,
         maximum=120_000,
     )
+    report_first_chunk_timeout_ms = _optional_bounded_positive_int(
+        mapping,
+        "report_first_chunk_timeout_ms",
+        default=60_000,
+        maximum=120_000,
+    )
+    report_stream_idle_timeout_ms = _optional_bounded_positive_int(
+        mapping,
+        "report_stream_idle_timeout_ms",
+        default=30_000,
+        maximum=120_000,
+    )
+    report_job_timeout_ms = _optional_bounded_positive_int(
+        mapping,
+        "report_job_timeout_ms",
+        default=300_000,
+        maximum=300_000,
+    )
+    report_maximum_attempts = _optional_bounded_positive_int(
+        mapping,
+        "report_maximum_attempts",
+        default=3,
+        maximum=12,
+    )
+    report_max_output_tokens = _optional_bounded_positive_int(
+        mapping,
+        "report_max_output_tokens",
+        default=32_768,
+        maximum=32_768,
+    )
     chunk_max = _optional_bounded_positive_int(
         mapping, "media_chunk_max_bytes", default=1_048_576, maximum=8_388_608
     )
@@ -1516,6 +1564,11 @@ def _interview_settings(
         ),
         report_provider_mode,
         report_timeout_ms,
+        report_first_chunk_timeout_ms,
+        report_stream_idle_timeout_ms,
+        report_job_timeout_ms,
+        report_maximum_attempts,
+        report_max_output_tokens,
         Path(_optional_string(mapping.get("recording_directory")) or "data/interview-media"),
         chunk_max,
         session_max,

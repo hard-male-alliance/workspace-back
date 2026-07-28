@@ -15,9 +15,12 @@ from time import monotonic
 from typing import Any, cast
 
 import pytest
+from starlette.requests import Request
 
 from backend.api.middleware.transport import (
     TransportTelemetryMiddleware,
+    _http_problem_code,
+    _log_http_completion,
     _websocket_outcome,
 )
 from backend.application.diagnostics import (
@@ -165,6 +168,83 @@ def test_json_log_formatter_preserves_finite_request_duration() -> None:
     payload = json.loads(JsonLineFormatter().format(record))
 
     assert payload["duration_ms"] == 12.5
+
+
+def test_http_problem_code_accepts_only_stable_error_boundary_values() -> None:
+    """@brief HTTP 遥测只接受稳定 Problem code / HTTP telemetry accepts only stable Problem codes."""
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v2/workspaces/example",
+            "raw_path": b"/api/v2/workspaces/example",
+            "query_string": b"",
+            "headers": [],
+            "scheme": "https",
+            "server": ("api.example.test", 443),
+            "client": ("127.0.0.1", 1234),
+            "root_path": "",
+        }
+    )
+
+    assert _http_problem_code(request) is None
+    request.state.problem_code = "interview.state_conflict"
+    assert _http_problem_code(request) == "interview.state_conflict"
+    request.state.problem_code = "private detail with spaces"
+    assert _http_problem_code(request) is None
+
+
+def test_http_completion_log_includes_exact_status_and_safe_problem_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@brief HTTP 完成日志保留精确状态与安全错误码 / HTTP completion logs retain exact status and a safe error code.
+
+    @param monkeypatch pytest 替换工具 / Pytest patch helper.
+    """
+    observed: list[tuple[int, str, dict[str, Any]]] = []
+
+    def capture_log(
+        level: int,
+        message: str,
+        *,
+        extra: dict[str, Any],
+    ) -> None:
+        """@brief 捕获稳定日志调用 / Capture the stable log call.
+
+        @param level 日志级别 / Log level.
+        @param message 稳定事件消息 / Stable event message.
+        @param extra 结构化日志属性 / Structured log attributes.
+        """
+        observed.append((level, message, extra))
+
+    monkeypatch.setattr("backend.api.middleware.transport.logger.log", capture_log)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v2/workspaces/workspace_example/interview-sessions/session_example/connections",
+            "raw_path": b"/api/v2/workspaces/workspace_example/interview-sessions/session_example/connections",
+            "query_string": b"",
+            "headers": [],
+            "scheme": "https",
+            "server": ("api.example.test", 443),
+            "client": ("127.0.0.1", 1234),
+            "root_path": "",
+        }
+    )
+    request.state.problem_code = "interview.state_conflict"
+
+    _log_http_completion(request, 409, 12.5)
+
+    assert observed[0][0:2] == (logging.WARNING, "backend.http.request.completed")
+    assert observed[0][2]["telemetry_attributes"] == {
+        "error_code": "interview.state_conflict",
+        "method": "POST",
+        "outcome": "client_error",
+        "route": "unmatched",
+        "status_class": "4xx",
+        "status_code": 409,
+    }
 
 
 @pytest.mark.parametrize(

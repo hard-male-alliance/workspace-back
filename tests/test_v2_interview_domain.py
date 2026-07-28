@@ -363,6 +363,7 @@ def test_recording_requires_explicit_consent_and_matching_media() -> None:
 def test_session_fsm_and_unified_job_alignment_are_strict() -> None:
     session = _session()
     connecting = session.mark_connecting(at=NOW + timedelta(seconds=1))
+    assert connecting.mark_connecting(at=NOW + timedelta(seconds=2)) is connecting
     active = connecting.activate(at=NOW + timedelta(seconds=2))
     ending = active.begin_end(
         JOB_ID,

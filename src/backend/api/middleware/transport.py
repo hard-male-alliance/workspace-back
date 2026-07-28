@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from asyncio import CancelledError
 from datetime import UTC, datetime
@@ -28,6 +29,9 @@ from workspace_shared.tenancy import ActorScope
 
 logger = logging.getLogger("backend.app")
 """@brief HTTP 边界稳定事件 logger / Stable-event logger for the HTTP boundary."""
+
+_PROBLEM_CODE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
+"""@brief 可进入遥测的稳定 Problem code 语法 / Stable Problem-code grammar allowed in telemetry."""
 
 
 class TransportTelemetryMiddleware:
@@ -329,6 +333,10 @@ def _record_http_signals(
         "outcome": outcome,
         "url.scheme": request.url.scheme,
     }
+    # 仅错误边界确认的稳定码可进入遥测 / Only error-boundary-confirmed stable codes enter telemetry.
+    problem_code = _http_problem_code(request)
+    if problem_code is not None:
+        attributes["error_code"] = problem_code
     telemetry = container.telemetry
     telemetry.record_metric(
         "aiws.http.server.request.count",
@@ -443,26 +451,46 @@ def _log_http_completion(request: Request, status_code: int, latency_ms: float) 
         if status_code >= 400
         else logging.INFO
     )
+    # 日志只保留低基数 HTTP 终态，不包含 URL 或错误正文 / Keep only low-cardinality HTTP terminal data.
+    attributes = {
+        "method": request.method.upper(),
+        "outcome": (
+            "server_error"
+            if status_code >= 500
+            else "client_error"
+            if status_code >= 400
+            else "success"
+        ),
+        "route": _route_template(request),
+        "status_code": status_code,
+        "status_class": f"{status_code // 100}xx",
+    }
+    # Problem code 由统一错误边界写入 request state / The unified error boundary writes this code.
+    problem_code = _http_problem_code(request)
+    if problem_code is not None:
+        attributes["error_code"] = problem_code
     logger.log(
         level,
         "backend.http.request.completed",
         extra={
             "event_name": "backend.http.request.completed",
-            "telemetry_attributes": {
-                "method": request.method.upper(),
-                "outcome": (
-                    "server_error"
-                    if status_code >= 500
-                    else "client_error"
-                    if status_code >= 400
-                    else "success"
-                ),
-                "route": _route_template(request),
-                "status_class": f"{status_code // 100}xx",
-            },
+            "telemetry_attributes": attributes,
             "duration_ms": max(0.0, latency_ms),
         },
     )
+
+
+def _http_problem_code(request: Request) -> str | None:
+    """@brief 读取经错误边界确认的低基数 Problem code / Read a low-cardinality Problem code confirmed by the error boundary.
+
+    @param request 当前 HTTP 请求 / Current HTTP request.
+    @return 合法稳定错误码；成功响应或未知值返回 ``None`` / Valid stable error code, or ``None`` for success and unknown values.
+    @note 仅接受错误转换层写入的 request state，不解析响应正文，也不记录 title/detail。
+        / Only request state written by the error boundary is accepted; response bodies, titles,
+        and details are never parsed or recorded.
+    """
+    value = getattr(request.state, "problem_code", None)
+    return value if isinstance(value, str) and _PROBLEM_CODE.fullmatch(value) else None
 
 
 def log_http_start(request: Request, trace: ServerTraceContext) -> None:

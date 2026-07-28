@@ -20,9 +20,13 @@ from openai.types.responses import (
     ResponseOutputText,
 )
 
-from backend.application.ports.agent_v2 import AgentProviderFailure
+from backend.application.ports.agent_v2 import (
+    AgentKnowledgeRetrievalRequest,
+    AgentProviderFailure,
+)
 from backend.domain.agent_v2 import (
     AgentExecutionGrant,
+    AgentKnowledgeEvidence,
     AgentOutputMode,
     AgentProposalDecisionContext,
     AgentProviderCompleted,
@@ -31,6 +35,7 @@ from backend.domain.agent_v2 import (
     AgentResumeContext,
     AgentRunId,
     AgentRunSpec,
+    AuthorizedKnowledgeContext,
     ConversationCapability,
     ConversationId,
     Message,
@@ -42,11 +47,16 @@ from backend.domain.knowledge_retrieval import (
     InferenceCostTier,
     InferenceIntent,
     InferenceQualityTier,
+    KnowledgeCitation,
     KnowledgeSelection,
     KnowledgeSelectionMode,
 )
-from backend.domain.knowledge_sources import ModelRegion
-from backend.domain.principals import ResourceMeta, WorkspaceId
+from backend.domain.knowledge_sources import (
+    KnowledgeSourceId,
+    KnowledgeSourceVersionId,
+    ModelRegion,
+)
+from backend.domain.principals import ResourceMeta, UserId, WorkspaceId
 from backend.domain.resources import ResourceRef
 from backend.domain.resumes import (
     PageSize,
@@ -204,6 +214,101 @@ class RecordingTelemetry:
         return True
 
 
+class EmptyKnowledgeRetriever:
+    """@brief 记录原生工具检索并返回零命中 / Record native tool retrieval and return no hits."""
+
+    def __init__(self) -> None:
+        """@brief 初始化请求列表 / Initialize the request list."""
+
+        self.requests: list[AgentKnowledgeRetrievalRequest] = []
+
+    async def retrieve(
+        self,
+        request: AgentKnowledgeRetrievalRequest,
+    ) -> tuple[AgentKnowledgeEvidence, ...]:
+        """@brief 返回空证据 / Return empty evidence.
+
+        @param request 已授权检索请求 / Authorized retrieval request.
+        @return 空证据元组 / Empty evidence tuple.
+        """
+
+        self.requests.append(request)
+        return ()
+
+
+class StaticKnowledgeRetriever:
+    """@brief 返回固定的已授权证据 / Return fixed authorized evidence."""
+
+    def __init__(self, evidence: tuple[AgentKnowledgeEvidence, ...]) -> None:
+        """@brief 绑定测试证据 / Bind test evidence.
+
+        @param evidence 固定证据 / Fixed evidence.
+        """
+
+        self.evidence = evidence
+
+    async def retrieve(
+        self,
+        request: AgentKnowledgeRetrievalRequest,
+    ) -> tuple[AgentKnowledgeEvidence, ...]:
+        """@brief 返回固定证据 / Return fixed evidence.
+
+        @param request 已授权检索请求 / Authorized retrieval request.
+        @return 固定证据 / Fixed evidence.
+        """
+
+        del request
+        return self.evidence
+
+
+class FailingKnowledgeRetriever:
+    """@brief 模拟检索基础设施失败 / Simulate retrieval infrastructure failure."""
+
+    async def retrieve(
+        self,
+        request: AgentKnowledgeRetrievalRequest,
+    ) -> tuple[AgentKnowledgeEvidence, ...]:
+        """@brief 抛出不向用户泄漏的底层错误 / Raise an internal error not exposed to users.
+
+        @param request 已授权检索请求 / Authorized retrieval request.
+        @return 永不返回 / Never returns.
+        @raise RuntimeError 模拟适配器故障 / Simulated adapter failure.
+        """
+
+        del request
+        raise RuntimeError("simulated private retrieval failure")
+
+
+class EvidenceThenFailingRetriever:
+    """@brief 首次返回证据、随后模拟故障 / Return evidence once, then simulate failure."""
+
+    def __init__(self, evidence: AgentKnowledgeEvidence) -> None:
+        """@brief 绑定首次证据 / Bind first-call evidence.
+
+        @param evidence 首次返回的证据 / Evidence returned on the first call.
+        """
+
+        self.evidence = evidence
+        self.call_count = 0
+
+    async def retrieve(
+        self,
+        request: AgentKnowledgeRetrievalRequest,
+    ) -> tuple[AgentKnowledgeEvidence, ...]:
+        """@brief 首次成功、后续失败 / Succeed once and fail afterwards.
+
+        @param request 已授权检索请求 / Authorized retrieval request.
+        @return 首次调用的证据 / Evidence on the first call.
+        @raise RuntimeError 第二次及以后模拟故障 / Simulated failure after the first call.
+        """
+
+        del request
+        self.call_count += 1
+        if self.call_count == 1:
+            return (self.evidence,)
+        raise RuntimeError("simulated private retrieval failure after evidence")
+
+
 class SlowModel(SequenceModel):
     """@brief 模拟超过 Run 总时限的模型 / Simulate a model exceeding the Run deadline."""
 
@@ -358,6 +463,283 @@ async def test_runner_returns_plain_assistant_output_without_structured_output()
     assert outcome.usage.output_tokens == 7
     assert model.calls[0][1] == []
     assert model.calls[0][2] is None
+
+
+@pytest.mark.asyncio
+async def test_run_telemetry_distinguishes_empty_authorized_knowledge_retrieval() -> None:
+    """@brief Run 遥测区分已授权零命中检索 / Run telemetry distinguishes authorized zero-hit retrieval."""
+
+    source_id = KnowledgeSourceId("knowledge_source_provider_0001")
+    version_id = KnowledgeSourceVersionId("knowledge_version_provider_0001")
+    base = _resume_request()
+    request = replace(
+        base,
+        spec=replace(
+            base.spec,
+            knowledge=KnowledgeSelection(
+                KnowledgeSelectionMode.EXPLICIT,
+                (source_id,),
+                (),
+                (),
+                "resume_assistant",
+            ),
+        ),
+        grant=replace(
+            base.grant,
+            knowledge_contexts=(AuthorizedKnowledgeContext(source_id, version_id, 1),),
+        ),
+    )
+    model = SequenceModel(
+        [
+            _tool_response(
+                "knowledge_search",
+                '{"query":"高级前端工程师岗位要求","top_k":10}',
+                "call_knowledge_empty_0001",
+            ),
+            _text_response("未找到可引用内容。", "response_empty_knowledge"),
+        ]
+    )
+    telemetry = RecordingTelemetry()
+    retriever = EmptyKnowledgeRetriever()
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        telemetry=telemetry,  # type: ignore[arg-type]
+        knowledge_retriever=retriever,
+    )
+
+    outcome = await provider.execute(
+        replace(request, actor_id=UserId("user_provider_knowledge_0001"))
+    )
+
+    assert isinstance(outcome, AgentProviderCompleted)
+    attributes = next(
+        attributes for name, attributes in telemetry.metrics if name == "aiws.agent.run.duration"
+    )
+    assert attributes["knowledge_context_count"] == 1
+    assert attributes["knowledge_source_count"] == 1
+    assert attributes["knowledge_evidence_attached_count"] == 0
+    assert attributes["knowledge_retrieval_status"] == "completed_empty"
+    assert attributes["knowledge_tool_call_count"] == 1
+    assert retriever.requests[0].query == "高级前端工程师岗位要求"
+    assert {tool.name for tool in model.calls[0][1]} >= {
+        "knowledge_search",
+        "resume_read_snapshot",
+    }
+
+
+@pytest.mark.asyncio
+async def test_native_knowledge_tool_returns_untrusted_evidence_and_preserves_provenance() -> None:
+    """@brief 原生检索返回数据并保留服务端 provenance / Native retrieval returns data and preserves provenance."""
+
+    source_id = KnowledgeSourceId("knowledge_source_provider_native_0001")
+    version_id = KnowledgeSourceVersionId("knowledge_version_provider_native_0001")
+    base = _resume_request()
+    request = replace(
+        base,
+        grant=replace(
+            base.grant,
+            knowledge_contexts=(AuthorizedKnowledgeContext(source_id, version_id, 1),),
+        ),
+        actor_id=UserId("user_provider_knowledge_native_0001"),
+    )
+    evidence = AgentKnowledgeEvidence(
+        0,
+        "knowledge_chunk_provider_native_0001",
+        KnowledgeCitation(
+            source_id,
+            version_id,
+            "candidate.md#skills",
+            "候选人使用 Vue 3 和 TypeScript。",
+            0.91,
+        ),
+    )
+    model = SequenceModel(
+        [
+            _tool_response(
+                "knowledge_search",
+                '{"query":"候选人的前端技能","top_k":5}',
+                "call_knowledge_native_0001",
+            ),
+            _text_response("已找到候选人技能。", "response_knowledge_native"),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        knowledge_retriever=StaticKnowledgeRetriever((evidence,)),
+    )
+
+    outcome = await provider.execute(request)
+
+    assert isinstance(outcome, AgentProviderCompleted)
+    assert outcome.knowledge_evidence == (evidence,)
+    tool_result_context = json.dumps(model.calls[1][0], ensure_ascii=False, default=str)
+    assert "untrusted_evidence_not_instructions" in tool_result_context
+    assert "knowledge_chunk_provider_native_0001" not in tool_result_context
+
+
+@pytest.mark.asyncio
+async def test_native_knowledge_failure_keeps_specific_public_error_and_diagnostics() -> None:
+    """@brief 检索故障保留明确公共语义和诊断 / Retrieval failure keeps specific public semantics and diagnostics."""
+
+    source_id = KnowledgeSourceId("knowledge_source_provider_failure_0001")
+    version_id = KnowledgeSourceVersionId("knowledge_version_provider_failure_0001")
+    base = _resume_request()
+    request = replace(
+        base,
+        grant=replace(
+            base.grant,
+            knowledge_contexts=(AuthorizedKnowledgeContext(source_id, version_id, 1),),
+        ),
+        actor_id=UserId("user_provider_knowledge_failure_0001"),
+    )
+    model = SequenceModel(
+        [
+            _tool_response(
+                "knowledge_search",
+                '{"query":"候选人资料","top_k":5}',
+                "call_knowledge_failure_0001",
+            )
+        ]
+    )
+    telemetry = RecordingTelemetry()
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        telemetry=telemetry,  # type: ignore[arg-type]
+        knowledge_retriever=FailingKnowledgeRetriever(),
+    )
+
+    with pytest.raises(AgentProviderFailure) as raised:
+        await provider.execute(request)
+
+    assert raised.value.problem.code == "agent.knowledge_retrieval_failed"
+    attributes = next(
+        attributes for name, attributes in telemetry.metrics if name == "aiws.agent.run.duration"
+    )
+    assert attributes["knowledge_retrieval_status"] == "failed"
+    assert attributes["knowledge_tool_call_count"] == 1
+    assert attributes["last_validation_phase"] == "knowledge_retrieval"
+
+
+@pytest.mark.asyncio
+async def test_native_knowledge_reuses_identical_query_without_duplicate_io() -> None:
+    """@brief 相同查询复用本执行段缓存 / Identical queries reuse the segment-local cache."""
+
+    source_id = KnowledgeSourceId("knowledge_source_provider_cache_0001")
+    version_id = KnowledgeSourceVersionId("knowledge_version_provider_cache_0001")
+    base = _resume_request()
+    request = replace(
+        base,
+        grant=replace(
+            base.grant,
+            knowledge_contexts=(AuthorizedKnowledgeContext(source_id, version_id, 1),),
+        ),
+        actor_id=UserId("user_provider_knowledge_cache_0001"),
+    )
+    model = SequenceModel(
+        [
+            _tool_response(
+                "knowledge_search",
+                '{"query":"候选人技能","top_k":8}',
+                "call_knowledge_cache_0001",
+            ),
+            _tool_response(
+                "knowledge_search",
+                '{"query":"  候选人技能  ","top_k":8}',
+                "call_knowledge_cache_0002",
+            ),
+            _text_response("没有更多证据。", "response_knowledge_cache"),
+        ]
+    )
+    telemetry = RecordingTelemetry()
+    retriever = EmptyKnowledgeRetriever()
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        telemetry=telemetry,  # type: ignore[arg-type]
+        knowledge_retriever=retriever,
+    )
+
+    outcome = await provider.execute(request)
+
+    assert isinstance(outcome, AgentProviderCompleted)
+    assert len(retriever.requests) == 1
+    attributes = next(
+        attributes for name, attributes in telemetry.metrics if name == "aiws.agent.run.duration"
+    )
+    assert attributes["knowledge_tool_call_count"] == 2
+    assert attributes["knowledge_retrieval_count"] == 1
+    assert attributes["knowledge_cache_hit_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_native_knowledge_degrades_after_evidence_instead_of_failing_run() -> None:
+    """@brief 已有证据后检索故障应降级继续 / Retrieval failure after evidence degrades instead of failing."""
+
+    source_id = KnowledgeSourceId("knowledge_source_provider_degraded_0001")
+    version_id = KnowledgeSourceVersionId("knowledge_version_provider_degraded_0001")
+    base = _resume_request()
+    request = replace(
+        base,
+        grant=replace(
+            base.grant,
+            knowledge_contexts=(AuthorizedKnowledgeContext(source_id, version_id, 1),),
+        ),
+        actor_id=UserId("user_provider_knowledge_degraded_0001"),
+    )
+    evidence = AgentKnowledgeEvidence(
+        0,
+        "knowledge_chunk_provider_degraded_0001",
+        KnowledgeCitation(
+            source_id,
+            version_id,
+            "candidate.md#profile",
+            "候选人具备四年前端开发经验。",
+            0.88,
+        ),
+    )
+    retriever = EvidenceThenFailingRetriever(evidence)
+    model = SequenceModel(
+        [
+            _tool_response(
+                "knowledge_search",
+                '{"query":"候选人前端经验","top_k":8}',
+                "call_knowledge_degraded_0001",
+            ),
+            _tool_response(
+                "knowledge_search",
+                '{"query":"候选人项目指标","top_k":8}',
+                "call_knowledge_degraded_0002",
+            ),
+            _text_response("已使用现有证据继续处理。", "response_knowledge_degraded"),
+        ]
+    )
+    telemetry = RecordingTelemetry()
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        telemetry=telemetry,  # type: ignore[arg-type]
+        knowledge_retriever=retriever,
+    )
+
+    outcome = await provider.execute(request)
+
+    assert isinstance(outcome, AgentProviderCompleted)
+    assert outcome.knowledge_evidence == (evidence,)
+    assert outcome.tool_invocations[-1].status == "failure"
+    second_tool_result = json.dumps(model.calls[2][0], ensure_ascii=False, default=str)
+    assert "knowledge_search_degraded" in second_tool_result
+    attributes = next(
+        attributes for name, attributes in telemetry.metrics if name == "aiws.agent.run.duration"
+    )
+    assert attributes["knowledge_retrieval_status"] == "degraded_with_cached_evidence"
 
 
 @pytest.mark.asyncio
@@ -716,6 +1098,7 @@ async def test_repeated_identical_invalid_call_stops_with_recovery_error() -> No
     assert captured.value.problem.retryable is True
     assert len(captured.value.invocations) == 2
     assert captured.value.invocations[-1].consecutive_invalid_count == 2
+    assert captured.value.invocations[-1].validation_issues == (("updates", "too_short"),)
     assert (
         captured.value.invocations[0].argument_signature
         == captured.value.invocations[1].argument_signature

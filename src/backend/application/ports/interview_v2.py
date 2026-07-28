@@ -262,6 +262,16 @@ class ReportGenerationRequest:
     job_target: JobTarget
     rubric: InterviewRubric
     transcript: tuple[TranscriptSegment, ...]
+    compact_output: bool = False
+    """@brief 是否要求紧凑报告以完成一次纠错重试 / Whether to request a compact report for one corrective retry."""
+
+    def __post_init__(self) -> None:
+        """@brief 校验内部生成模式 / Validate the internal generation mode.
+
+        @raise TypeError ``compact_output`` 不是布尔值 / ``compact_output`` is not boolean.
+        """
+        if not isinstance(self.compact_output, bool):
+            raise TypeError("Report compact-output flag must be boolean")
 
 
 class InterviewPermissionAuthorizer(Protocol):
@@ -421,6 +431,18 @@ class InterviewRepository(Protocol):
         session_id: InterviewSessionId,
     ) -> bool:
         """@brief 判断 Session 是否已有非终态 Report Job / Test whether a Session already has a live Report Job."""
+
+    async def get_live_report_job(
+        self,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+    ) -> Job | None:
+        """@brief 读取 Session 已有非终态 Report Job / Read a Session's existing live Report Job.
+
+        @param workspace_id 精确 Workspace / Exact Workspace.
+        @param session_id Report Job 目标 Session / Session targeted by the Report Job.
+        @return 唯一 live Job；不存在时为 ``None`` / Unique live Job, or ``None``.
+        """
 
 
 class InterviewJobStore(Protocol):
