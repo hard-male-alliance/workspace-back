@@ -2121,7 +2121,12 @@ def _run_from_record(record: AgentRunRecord) -> AgentRun:
         ),
         provider_state=cast(
             Mapping[str, JsonValue] | None,
-            record.extensions.get(_PROVIDER_STATE_EXTENSION),
+            (
+                record.extensions.get(_PROVIDER_STATE_EXTENSION)
+                if record.status
+                == AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION.value
+                else None
+            ),
         ),
     )
 
@@ -2521,8 +2526,7 @@ class PostgresAgentRepository(_PostgresAgentRepositoryCore):
             "revision": run.meta.revision,
             "updated_at": run.meta.updated_at,
         }
-        if run.provider_state is not None or run.view.proposal_refs:
-            values["extensions"] = _run_extensions(run)
+        values["extensions"] = _run_extensions(run)
         result = await self._session.execute(
             update(AgentRunRecord)
             .where(*predicates)

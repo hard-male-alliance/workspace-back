@@ -72,6 +72,7 @@ from backend.domain.knowledge_retrieval import (
     KnowledgeSelectionMode,
 )
 from backend.domain.knowledge_sources import ModelRegion
+from backend.domain.platform import ProblemDetails
 from backend.domain.principals import ClientId, Scope, Subject, TokenPrincipal, UserId, WorkspaceId
 from backend.domain.resources import ResourceRef
 from backend.domain.resumes import (
@@ -925,6 +926,145 @@ async def test_postgres_agent_run_job_outbox_audit_and_cas_are_atomic(
             "SELECT count(*) AS count FROM identity.audit_events "
             f"WHERE resource_id = '{run.meta.id}'"
         ) == [{"count": 2}]
+    finally:
+        await database.aclose()
+
+
+@pytest.mark.asyncio
+async def test_postgres_terminal_run_checkpoint_is_cleared_and_legacy_state_is_readable(
+    agent_postgres: _PostgresHarness,
+) -> None:
+    """@brief 终态 Run 保存必须清除旧 Proposal checkpoint / Terminal Run saves clear stale Proposal checkpoints."""
+
+    database = AsyncDatabase(
+        AsyncDatabaseOptions(
+            agent_postgres.app_dsn(),
+            pool_size=2,
+            max_overflow=0,
+            statement_timeout_ms=5_000,
+            lock_timeout_ms=2_000,
+        )
+    )
+    application_factory = PostgresAgentUnitOfWorkFactory(
+        database,
+        model_routes=(_model_route(),),
+    )
+    worker_factory = PostgresAgentWorkerUnitOfWorkFactory(
+        database,
+        model_routes=(_model_route(),),
+    )
+    service = AgentApplicationService(
+        application_factory,
+        clock=_FixedClock(),
+        id_factory=_SequentialIds(),
+    )
+    principal = _principal()
+    workspace_id = WorkspaceId("workspace_agentlegacy1")
+    try:
+        with psycopg.connect(agent_postgres.super_dsn()) as connection:
+            connection.execute(
+                "GRANT UPDATE (extensions) ON TABLE agent.runs TO aiws_app"
+            )
+        conversation = await service.create_conversation(
+            principal,
+            workspace_id,
+            CreateConversationCommand(
+                ConversationCapability.GENERAL,
+                "Provider-state cleanup",
+            ),
+            AgentMutationContext("request_cleanup_conversation1"),
+        )
+        message = await service.create_message(
+            principal,
+            workspace_id,
+            conversation.meta.id,
+            CreateMessageCommand(None, (TextContentPart("persist a terminal run"),)),
+            expected_conversation_revision=1,
+            context=AgentMutationContext("request_cleanup_message01"),
+        )
+        created = await service.create_agent_run(
+            principal,
+            workspace_id,
+            _run_spec(conversation.meta.id, message.meta.id),
+            AgentMutationContext("request_cleanup_run0001"),
+        )
+        async with worker_factory(workspace_id, principal.user_id) as unit:
+            run = await unit.repository.get_run(
+                workspace_id,
+                created.meta.id,
+                for_update=False,
+            )
+        assert run is not None
+        with psycopg.connect(agent_postgres.super_dsn()) as connection:
+            connection.execute(
+                "UPDATE agent.runs SET extensions = %s::jsonb WHERE id = %s",
+                (
+                    json.dumps(
+                        {
+                            "openai_agents_run_state": {
+                                "current_turn": 1,
+                                "generated_items": [],
+                            }
+                        }
+                    ),
+                    str(run.meta.id),
+                ),
+            )
+
+        failed = run.fail(
+            ProblemDetails(
+                "https://api.hmalliances.org/problems/agent/provider_protocol",
+                "Model provider protocol failure",
+                502,
+                "agent.provider_protocol",
+                "request_cleanup_failure1",
+                False,
+            ),
+            at=NOW + timedelta(seconds=1),
+        )
+        async with worker_factory(workspace_id, principal.user_id) as unit:
+            await unit.repository.save_run(
+                failed,
+                expected_revision=run.meta.revision,
+            )
+            await unit.commit()
+
+        assert agent_postgres.rows(
+            "SELECT extensions FROM agent.runs "
+            f"WHERE id = '{run.meta.id}'"
+        ) == [{"extensions": {}}]
+        async with worker_factory(workspace_id, principal.user_id) as unit:
+            restored = await unit.repository.get_run(
+                workspace_id,
+                run.meta.id,
+                for_update=False,
+            )
+        assert restored is not None
+        assert restored.view.status.value == "failed"
+
+        with psycopg.connect(agent_postgres.super_dsn()) as connection:
+            connection.execute(
+                "UPDATE agent.runs SET extensions = %s::jsonb WHERE id = %s",
+                (
+                    json.dumps(
+                        {
+                            "openai_agents_run_state": {
+                                "current_turn": 1,
+                                "generated_items": [],
+                            }
+                        }
+                    ),
+                    str(run.meta.id),
+                ),
+            )
+        async with worker_factory(workspace_id, principal.user_id) as unit:
+            legacy_restored = await unit.repository.get_run(
+                workspace_id,
+                run.meta.id,
+                for_update=False,
+            )
+        assert legacy_restored is not None
+        assert legacy_restored.provider_state is None
     finally:
         await database.aclose()
 
