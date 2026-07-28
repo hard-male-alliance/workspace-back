@@ -158,6 +158,134 @@ def test_professional_template_ids_select_distinct_safe_tex_layouts() -> None:
     assert ats != modern
 
 
+def test_modern_template_closes_paragraphs_and_enables_cjk_line_breaking() -> None:
+    """Chinese prose and following headings remain separate breakable blocks."""
+
+    source = rendering._safe_template(
+        {
+            **_resume_document(),
+            "locale": "zh-CN",
+            "template": {
+                "template_id": "tpl_modern_professional_v1",
+                "version": "1.0",
+            },
+            "profile": {
+                "full_name": "张明",
+                "summary": {
+                    "text": "具备扎实的算法与系统设计能力，致力于将前沿技术落地到实际产品中。"
+                },
+            },
+            "sections": [
+                {
+                    "id": "section_skills",
+                    "title": "技能",
+                    "visible": True,
+                    "content": {"text": "Python、PostgreSQL、分布式系统"},
+                    "items": [],
+                },
+                {
+                    "id": "section_experience",
+                    "title": "工作经历",
+                    "visible": True,
+                    "content": {"text": "负责平台研发与稳定性交付。"},
+                    "items": [],
+                },
+            ],
+        }
+    )
+
+    assert '\\XeTeXlinebreaklocale "zh"' in source
+    assert "\\XeTeXlinebreakskip=0pt plus 1pt" in source
+    assert "\\setmainfont{Noto Sans CJK SC}" in source
+    assert "个人简介" in source
+    summary_end = source.index("实际产品中。") + len("实际产品中。")
+    skills_heading = source.index("技能", summary_end)
+    skills_end = source.index("分布式系统") + len("分布式系统")
+    experience_heading = source.index("工作经历", skills_end)
+    assert source[summary_end:skills_heading].count("\\par") >= 2
+    assert "\\endgroup" in source[skills_end:experience_heading]
+    assert source[skills_end:experience_heading].count("\\par") >= 2
+
+
+def test_template_projects_page_typography_and_section_layout_intent() -> None:
+    """Validated style intent controls geometry, typography, and pagination."""
+
+    source = rendering._safe_template(
+        {
+            **_resume_document(),
+            "template": {
+                "template_id": "tpl_modern_professional_v1",
+                "version": "1.0",
+            },
+            "style": {
+                "page": {
+                    "size": "LETTER",
+                    "orientation": "landscape",
+                    "margins": {
+                        "top": {"value": 12, "unit": "mm"},
+                        "right": {"value": 13, "unit": "mm"},
+                        "bottom": {"value": 14, "unit": "mm"},
+                        "left": {"value": 15, "unit": "mm"},
+                    },
+                    "show_page_numbers": True,
+                },
+                "typography": {
+                    "base_size_pt": 11,
+                    "line_height": 1.4,
+                    "heading_scale": 1.3,
+                    "letter_spacing_em": 0.02,
+                },
+                "palette": {
+                    "primary": {"space": "srgb_hex", "value": "#123456"},
+                    "secondary": {"space": "srgb_hex", "value": "#789ABC"},
+                    "text": {"space": "srgb_hex", "value": "#222222"},
+                },
+                "density": 0.75,
+                "section_layout": [
+                    {
+                        "section_id": "section_experience",
+                        "keep_together": True,
+                        "page_break_before": True,
+                        "compactness": 0.8,
+                    }
+                ],
+            },
+            "profile": {"full_name": "Klee"},
+            "sections": [
+                {
+                    "id": "section_experience",
+                    "title": "Experience",
+                    "visible": True,
+                    "content": {"text": "Built reliable systems."},
+                    "items": [],
+                }
+            ],
+        }
+    )
+
+    assert (
+        "\\usepackage[letterpaper,landscape,top=12mm,right=13mm,bottom=14mm,left=15mm]"
+        "{geometry}"
+    ) in source
+    assert "\\fontsize{11.00pt}{15.40pt}\\selectfont" in source
+    assert "\\setmainfont[LetterSpace=2.00]{Noto Sans CJK SC}" in source
+    assert "\\fontsize{14.30pt}{16.45pt}" in source
+    assert "\\definecolor{AIWSAccent}{HTML}{123456}" in source
+    assert "\\pagestyle{plain}" in source
+    assert "\\clearpage" in source
+    assert "\\filbreak" in source
+    assert "\\setlength{\\parskip}{2.80pt}" in source
+
+
+def test_layout_overflow_diagnostic_exposes_only_aggregates() -> None:
+    diagnostic = (
+        b"Overfull \\hbox (0.75pt too wide) in paragraph at lines 1--2\n"
+        b"Overfull \\hbox (18.25pt too wide) in paragraph at lines 3--4\n"
+    )
+
+    assert rendering._layout_overflow(diagnostic) == (2, 18.25)
+
+
 def test_renderer_factory_fails_at_startup_when_sandbox_capability_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -403,6 +531,37 @@ def _install_fake_renderer_command(
     )
 
 
+@pytest.mark.asyncio
+async def test_renderer_rejects_a_successful_pdf_with_material_horizontal_overflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compiler exit code of zero cannot publish a visibly clipped PDF."""
+
+    pdf = rendering._minimal_pdf("overflow")
+    script = (
+        "from pathlib import Path\n"
+        f"Path('resume.pdf').write_bytes({pdf!r})\n"
+        "Path('resume.log').write_text("
+        "'Overfull \\\\hbox (12.5pt too wide) in paragraph at lines 1--2',"
+        " encoding='utf-8')\n"
+    )
+    _install_fake_renderer_command(monkeypatch, script)
+    renderer = rendering.SandboxedXeLaTeXRenderer(
+        _renderer_settings(tmp_path, max_output_bytes=8_192),
+        xelatex_path=sys.executable,
+    )
+
+    with pytest.raises(DomainError) as raised:
+        await renderer.render(_resume_document())
+
+    assert raised.value.problem.code == "resume.layout_overflow"
+    assert raised.value.problem.extensions == {
+        "overflow_box_count": 1,
+        "maximum_overflow_pt": 12.5,
+    }
+
+
 async def _wait_for_file(path: Path) -> None:
     """@brief 等待测试子进程创建同步文件 / Wait for a test subprocess synchronization file.
 
@@ -621,17 +780,37 @@ def test_professional_layouts_compile_through_real_strong_boundary(
         pytest.skip("Landlock ABI >= 3 and libseccomp are unavailable")
     document = {
         **_resume_document(),
+        "locale": "zh-CN",
         "template": {"template_id": template_id, "version": "1.0"},
+        "style": {
+            "typography": {
+                "base_size_pt": 10,
+                "line_height": 1.25,
+                "heading_scale": 1.2,
+                "letter_spacing_em": 0.02,
+            }
+        },
         "profile": {
             "full_name": "张明",
             "headline": "Backend Engineer",
+            "summary": {
+                "text": (
+                    "具备扎实的算法与系统设计能力，致力于将前沿技术落地到实际产品中，"
+                    "能够在复杂业务约束下持续交付稳定、可维护并且可以验证的工程成果。"
+                )
+            },
             "contacts": [{"value": "zhang@example.com"}],
         },
         "sections": [
             {
                 "title": "项目经历",
                 "visible": True,
-                "content": {"text": "Delivered safe APIs with measurable results."},
+                "content": {
+                    "text": (
+                        "负责平台研发、性能治理与稳定性建设，通过可观测性数据定位瓶颈，"
+                        "推动跨团队协作并持续降低故障恢复时间。"
+                    )
+                },
                 "items": [],
             }
         ],
@@ -644,12 +823,13 @@ def test_professional_layouts_compile_through_real_strong_boundary(
         allowed_font_directories=(str(font_directory),),
     )
     (tmp_path / "resume.tex").write_text(
-        rendering._safe_template(
-            document,
-            main_font_preamble=rendering._configured_main_font_preamble(
-                settings.allowed_font_directories
+            rendering._safe_template(
+                document,
+                main_font_preamble=rendering._configured_main_font_preamble(
+                    settings.allowed_font_directories,
+                    letter_spacing_em=rendering._document_letter_spacing(document),
+                ),
             ),
-        ),
         encoding="utf-8",
     )
     argv = rendering._renderer_process_argv(xelatex, settings, tmp_path, plan)
@@ -668,3 +848,4 @@ def test_professional_layouts_compile_through_real_strong_boundary(
     diagnostic = (completed.stdout + completed.stderr).decode("utf-8", "replace")
     assert completed.returncode == 0, diagnostic[-4_000:]
     assert (tmp_path / "resume.pdf").read_bytes().startswith(b"%PDF-")
+    assert rendering._layout_overflow((tmp_path / "resume.log").read_bytes()) == (0, 0.0)

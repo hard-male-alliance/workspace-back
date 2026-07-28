@@ -340,8 +340,64 @@ class OutboxDispatchService:
             maximum_attempts=self._settings.maximum_attempts,
         )
         if not changed:
+            _record_retry_diagnostic(
+                claim,
+                error_code=error_code,
+                retry_at=retry_at,
+                outcome="lost",
+                maximum_attempts=self._settings.maximum_attempts,
+            )
             return "lost"
-        return "failed" if claim.attempt_count >= self._settings.maximum_attempts else "retried"
+        outcome = (
+            "failed"
+            if claim.attempt_count >= self._settings.maximum_attempts
+            else "retried"
+        )
+        _record_retry_diagnostic(
+            claim,
+            error_code=error_code,
+            retry_at=retry_at,
+            outcome=outcome,
+            maximum_attempts=self._settings.maximum_attempts,
+        )
+        return outcome
+
+
+def _record_retry_diagnostic(
+    claim: OutboxDispatchClaim,
+    *,
+    error_code: str,
+    retry_at: datetime,
+    outcome: str,
+    maximum_attempts: int,
+) -> None:
+    """@brief 记录不含 payload 的 Outbox 失败诊断 / Record an outbox failure without payload content.
+
+    @param claim 当前失败 claim / Current failed claim.
+    @param error_code 已脱敏稳定错误码 / Redacted stable error code.
+    @param retry_at 计算出的下次候选时间 / Calculated next eligible time.
+    @param outcome retried、failed 或 lost / Retried, failed, or lost.
+    @param maximum_attempts 最终失败上限 / Terminal attempt cap.
+    """
+
+    logger.warning(
+        "backend.outbox.dispatch_retry",
+        extra={
+            "event_name": "backend.outbox.dispatch_retry",
+            "telemetry_attributes": {
+                "operation": "outbox_dispatch",
+                "outcome": outcome,
+                "outbox_id": str(claim.event_id),
+                "event_type": claim.event_type,
+                "subject_type": claim.subject.resource_type,
+                "error_code": error_code,
+                "attempt": claim.attempt_count,
+                "maximum_attempts": maximum_attempts,
+                "next_attempt_at": retry_at.isoformat(),
+                "terminal": outcome == "failed",
+            },
+        },
+    )
 
 
 def _retry_delay(

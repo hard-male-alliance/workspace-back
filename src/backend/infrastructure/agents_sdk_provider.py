@@ -6,9 +6,14 @@ binds authorized domain context to tools and translates terminal SDK results int
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import logging
 import os
+import secrets
 from collections.abc import Mapping
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, cast
 
@@ -22,11 +27,20 @@ from agents import (
     Runner,
     RunState,
 )
+from agents.exceptions import (
+    MaxTurnsExceeded,
+    ModelBehaviorError,
+    ModelRefusalError,
+    ToolTimeoutError,
+    UserError,
+)
 from agents.items import ModelResponse, ToolApprovalItem, TResponseInputItem
 from agents.models.interface import Model, ModelTracing
 from agents.usage import Usage
+from httpx import TimeoutException
+from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 from openai.types.responses import ResponseOutputMessage, ResponseOutputText
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from backend.application.ports.agent_v2 import AgentProviderFailure
 from backend.domain.agent_v2 import (
@@ -49,9 +63,43 @@ from backend.infrastructure.agent_prompt import render_resume_agent_system_promp
 from backend.infrastructure.resume_agent_tools import ResumeToolSession, resume_agent_tools
 from workspace_shared.tenancy import ActorScope
 
-_MAX_TURNS = 12
+_MAX_TURNS = 20
+_MAX_TOOL_CALLS = 16
+_MAX_INVALID_TOOL_CALLS = 3
+_MAX_REPEATED_INVALID_SIGNATURE = 2
 _MAX_INPUT_CHARACTERS = 1_000_000
 _PROPOSAL_TOOL = "resume_request_proposal_decision"
+_DEFAULT_LATENCY_BUDGET_MS = 60_000
+_DEFAULT_AGENT_EXECUTION_TIMEOUT_MS = 300_000
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderFailureClassification:
+    """@brief 描述可公开且可观测的 Provider 失败分类 / Describe a public, observable provider failure."""
+
+    code: str
+    status: int
+    retryable: bool
+    failure_class: str
+
+
+@dataclass(slots=True)
+class _ToolRecoveryState:
+    """@brief 跟踪一次执行段中的无效工具恢复 / Track invalid-tool recovery in one execution segment."""
+
+    invalid_call_count: int = 0
+    consecutive_invalid_count: int = 0
+    repeated_invalid_signature_count: int = 0
+    last_invalid_signature: str | None = None
+
+
+class _ToolRecoveryExhausted(RuntimeError):
+    """@brief 无效工具调用已耗尽恢复预算 / Invalid tool calls exhausted recovery budget."""
+
+
+class _ToolCallBudgetExhausted(RuntimeError):
+    """@brief 工具调用已耗尽独立预算 / Tool calls exhausted their independent budget."""
 
 
 class DeterministicAgentModel(Model):
@@ -120,12 +168,31 @@ class OpenAIAgentsSDKProvider:
         output_cost_microusd_per_million_tokens: int,
         telemetry: ObservabilityRecorder | None = None,
         client: Any | None = None,
+        execution_timeout_ms: int = _DEFAULT_AGENT_EXECUTION_TIMEOUT_MS,
     ) -> None:
+        """@brief 创建受服务端执行时限保护的 Agent Provider / Create an Agent provider guarded by a server-owned execution deadline.
+
+        @param model Agents SDK 模型适配器 / Agents SDK model adapter.
+        @param input_cost_microusd_per_million_tokens 输入计费单价 / Input-token billing rate.
+        @param output_cost_microusd_per_million_tokens 输出计费单价 / Output-token billing rate.
+        @param telemetry 可空遥测记录器 / Optional telemetry recorder.
+        @param client 可空生命周期客户端 / Optional lifecycle-owned client.
+        @param execution_timeout_ms 单个活跃执行段的后端安全上限 / Server safety limit for one active execution segment.
+        @raise ValueError execution_timeout_ms 不是正整数 / Raised when execution_timeout_ms is not a positive integer.
+        """
+
+        if (
+            isinstance(execution_timeout_ms, bool)
+            or not isinstance(execution_timeout_ms, int)
+            or execution_timeout_ms <= 0
+        ):
+            raise ValueError("execution_timeout_ms must be a positive integer")
         self._model = model
         self._input_rate = input_cost_microusd_per_million_tokens
         self._output_rate = output_cost_microusd_per_million_tokens
         self._telemetry = telemetry
         self._client = client
+        self._execution_timeout_ms = execution_timeout_ms
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -157,77 +224,123 @@ class OpenAIAgentsSDKProvider:
             tools=list(tools),
         )
         started = perf_counter()
+        latency_budget_ms = (
+            request.spec.inference.latency_budget_ms or _DEFAULT_LATENCY_BUDGET_MS
+        )
         try:
-            if request.provider_state is None:
-                initial_context: dict[str, JsonValue] = {"proposal_decision": None}
-                result = await Runner.run(
-                    agent,
-                    cast(list[TResponseInputItem], _input_items(request, prompt)),
-                    context=initial_context,
-                    max_turns=_MAX_TURNS,
-                    run_config=RunConfig(
-                        tracing_disabled=True,
-                        workflow_name="resume_agent"
-                        if session
-                        else "workspace_agent",
-                    ),
-                )
-            else:
-                state = await RunState.from_json(
-                    agent,
-                    _plain_json_object(request.provider_state),
-                    context_override={
-                        "proposal_decision": (
-                            None
-                            if request.proposal_decision is None
-                            else request.proposal_decision.decision
-                        )
-                    },
-                    strict_context=True,
-                )
-                interruptions = state.get_interruptions()
-                if len(interruptions) != 1:
-                    raise ValueError("Proposal checkpoint must contain exactly one interruption")
-                interruption = interruptions[0]
-                if interruption.tool_name != _PROPOSAL_TOOL:
-                    raise ValueError("Proposal checkpoint targets an unexpected tool")
-                if request.proposal_decision is None:
-                    raise ValueError("Proposal checkpoint requires a committed decision")
-                self._record_proposal(
-                    request,
-                    "decided",
-                    request.proposal_decision.decision,
-                )
-                if request.proposal_decision.decision == "reject":
-                    state.reject(
-                        interruption,
-                        rejection_message="The user rejected this Resume proposal.",
+            async with asyncio.timeout(self._execution_timeout_ms / 1000):
+                if request.provider_state is None:
+                    initial_context: dict[str, JsonValue] = {"proposal_decision": None}
+                    result = await Runner.run(
+                        agent,
+                        cast(list[TResponseInputItem], _input_items(request, prompt)),
+                        context=initial_context,
+                        max_turns=_MAX_TURNS,
+                        run_config=RunConfig(
+                            tracing_disabled=True,
+                            workflow_name="resume_agent"
+                            if session
+                            else "workspace_agent",
+                        ),
                     )
                 else:
-                    state.approve(interruption)
-                result = await Runner.run(
-                    agent,
-                    state,
-                    max_turns=_MAX_TURNS,
-                    run_config=RunConfig(
-                        tracing_disabled=True,
-                        workflow_name="resume_agent",
-                    ),
-                )
-                self._record_proposal(
-                    request,
-                    "resumed",
-                    request.proposal_decision.decision,
-                )
-        except AgentProviderFailure:
-            raise
+                    state = await RunState.from_json(
+                        agent,
+                        _plain_json_object(request.provider_state),
+                        context_override={
+                            "proposal_decision": (
+                                None
+                                if request.proposal_decision is None
+                                else request.proposal_decision.decision
+                            )
+                        },
+                        strict_context=True,
+                    )
+                    interruptions = state.get_interruptions()
+                    if len(interruptions) != 1:
+                        raise ValueError(
+                            "Proposal checkpoint must contain exactly one interruption"
+                        )
+                    interruption = interruptions[0]
+                    if interruption.tool_name != _PROPOSAL_TOOL:
+                        raise ValueError("Proposal checkpoint targets an unexpected tool")
+                    if request.proposal_decision is None:
+                        raise ValueError("Proposal checkpoint requires a committed decision")
+                    self._record_proposal(
+                        request,
+                        "decided",
+                        request.proposal_decision.decision,
+                    )
+                    if request.proposal_decision.decision == "reject":
+                        state.reject(
+                            interruption,
+                            rejection_message="The user rejected this Resume proposal.",
+                        )
+                    else:
+                        state.approve(interruption)
+                    result = await Runner.run(
+                        agent,
+                        state,
+                        max_turns=_MAX_TURNS,
+                        run_config=RunConfig(
+                            tracing_disabled=True,
+                            workflow_name="resume_agent",
+                        ),
+                    )
+                    self._record_proposal(
+                        request,
+                        "resumed",
+                        request.proposal_decision.decision,
+                    )
+        except AgentProviderFailure as error:
+            diagnostic_attributes = _failure_diagnostics(
+                request,
+                traces,
+                error.problem.code,
+                type(error).__name__,
+                latency_budget_ms,
+                self._execution_timeout_ms,
+            )
+            self._record_run(
+                request,
+                "failure",
+                (perf_counter() - started) * 1000,
+                diagnostic_attributes,
+            )
+            if error.invocations:
+                raise
+            raise AgentProviderFailure(error.problem, tuple(traces)) from error
         except Exception as error:
-            self._record_run(request, "failure", (perf_counter() - started) * 1000)
+            failure = _classify_provider_exception(error)
+            diagnostic_attributes = _failure_diagnostics(
+                request,
+                traces,
+                failure.failure_class,
+                type(error).__name__,
+                latency_budget_ms,
+                self._execution_timeout_ms,
+            )
+            if failure.failure_class == "execution_timeout":
+                diagnostic_attributes["timeout_scope"] = "active_agent_execution_segment"
+            self._record_run(
+                request,
+                "failure",
+                (perf_counter() - started) * 1000,
+                diagnostic_attributes,
+            )
+            _LOGGER.error(
+                "backend.agent.provider.failed",
+                extra={
+                    "event_name": "backend.agent.provider.failed",
+                    "request_id": str(request.run_id),
+                    "telemetry_attributes": diagnostic_attributes,
+                },
+            )
             raise AgentProviderFailure(
-                _problem(request, "agent.provider_failed", 503, True)
+                _problem(request, failure.code, failure.status, failure.retryable),
+                tuple(traces),
             ) from error
 
-        self._record_run(request, "success", (perf_counter() - started) * 1000)
         usage = _usage(
             result.context_wrapper.usage.input_tokens,
             result.context_wrapper.usage.output_tokens,
@@ -235,13 +348,32 @@ class OpenAIAgentsSDKProvider:
             self._output_rate,
         )
         if result.interruptions:
-            outcome = _proposal_interruption(
-                request,
-                result,
-                session,
-                usage,
-                tuple(traces),
-            )
+            try:
+                outcome = _proposal_interruption(
+                    request,
+                    result,
+                    session,
+                    usage,
+                    tuple(traces),
+                )
+            except AgentProviderFailure as error:
+                diagnostic_attributes = _failure_diagnostics(
+                    request,
+                    traces,
+                    error.problem.code,
+                    type(error).__name__,
+                    latency_budget_ms,
+                    self._execution_timeout_ms,
+                )
+                self._record_run(
+                    request,
+                    "failure",
+                    (perf_counter() - started) * 1000,
+                    diagnostic_attributes,
+                )
+                if error.invocations:
+                    raise
+                raise AgentProviderFailure(error.problem, tuple(traces)) from error
             self._record_tool(
                 request,
                 _PROPOSAL_TOOL,
@@ -249,6 +381,7 @@ class OpenAIAgentsSDKProvider:
                 0,
             )
             self._record_proposal(request, "waiting", "decision_required")
+            self._record_run(request, "success", (perf_counter() - started) * 1000)
             return outcome
 
         final = result.final_output
@@ -264,11 +397,47 @@ class OpenAIAgentsSDKProvider:
             else ()
         )
         if AgentOutputMode.TEXT in request.spec.output_modes and not content:
+            diagnostic_attributes = _failure_diagnostics(
+                request,
+                traces,
+                "agent.provider_empty",
+                "EmptyProviderOutput",
+                latency_budget_ms,
+                self._execution_timeout_ms,
+            )
+            self._record_run(
+                request,
+                "failure",
+                (perf_counter() - started) * 1000,
+                diagnostic_attributes,
+            )
             raise AgentProviderFailure(
-                _problem(request, "agent.provider_empty", 502, True)
+                _problem(request, "agent.provider_empty", 502, True),
+                tuple(traces),
             )
         completed = AgentProviderCompleted(content, (), usage, tool_invocations=tuple(traces))
-        completed.validate_for(request)
+        try:
+            completed.validate_for(request)
+        except Exception as error:
+            diagnostic_attributes = _failure_diagnostics(
+                request,
+                traces,
+                "provider_protocol_error",
+                type(error).__name__,
+                latency_budget_ms,
+                self._execution_timeout_ms,
+            )
+            self._record_run(
+                request,
+                "failure",
+                (perf_counter() - started) * 1000,
+                diagnostic_attributes,
+            )
+            raise AgentProviderFailure(
+                _problem(request, "agent.provider_protocol_error", 502, False),
+                tuple(traces),
+            ) from error
+        self._record_run(request, "success", (perf_counter() - started) * 1000)
         return completed
 
     def _record_tool(
@@ -323,6 +492,7 @@ class OpenAIAgentsSDKProvider:
         request: AgentProviderRequest,
         outcome: str,
         duration_ms: float,
+        diagnostic_attributes: Mapping[str, str | int | float | bool] | None = None,
     ) -> None:
         if self._telemetry is None:
             return
@@ -332,6 +502,8 @@ class OpenAIAgentsSDKProvider:
             "outcome": outcome,
             "continuation": request.provider_state is not None,
         }
+        if diagnostic_attributes is not None:
+            attributes.update(diagnostic_attributes)
         self._telemetry.record_metric(
             "aiws.agent.run.duration",
             duration_ms,
@@ -394,6 +566,8 @@ def _sdk_tools(
 ) -> tuple[FunctionTool, ...]:
     if session is None:
         return ()
+    recovery = _ToolRecoveryState()
+    signature_salt = secrets.token_bytes(32)
     converted: list[FunctionTool] = []
     for tool in resume_agent_tools(session):
         tool_name = tool.name
@@ -405,8 +579,18 @@ def _sdk_tools(
             delegate: Any = tool,
             name: str = tool_name,
         ) -> str:
+            if (
+                name != _PROPOSAL_TOOL
+                and ordinal_offset + len(traces) >= _MAX_TOOL_CALLS
+            ):
+                raise _ToolCallBudgetExhausted
             started = perf_counter()
             arguments: object = {}
+            argument_signature = _argument_signature(
+                name,
+                arguments_json,
+                salt=signature_salt,
+            )
             try:
                 arguments = json.loads(arguments_json)
                 if name == _PROPOSAL_TOOL:
@@ -422,7 +606,13 @@ def _sdk_tools(
                     )
                 else:
                     result = await delegate.ainvoke(arguments)
-            except BaseException:
+            except ValidationError as error:
+                result = _invalid_tool_arguments_result(name, error)
+            except json.JSONDecodeError:
+                result = _invalid_tool_arguments_result(name, None, issue="invalid_json")
+            except (TypeError, ValueError):
+                result = _invalid_tool_arguments_result(name, None, issue="invalid_value")
+            except Exception:
                 duration = (perf_counter() - started) * 1000
                 argument_keys = (
                     tuple(sorted(arguments))
@@ -437,6 +627,8 @@ def _sdk_tools(
                         argument_keys,
                         "failure",
                         duration,
+                        validation_phase="tool",
+                        argument_signature=argument_signature,
                     )
                 )
                 raise
@@ -448,6 +640,8 @@ def _sdk_tools(
             )
             result_kind: str | None = None
             result_code: str | None = None
+            date_normalization_count = 0
+            date_rejection_reason: str | None = None
             try:
                 decoded_result = json.loads(result)
                 if isinstance(decoded_result, dict):
@@ -455,15 +649,67 @@ def _sdk_tools(
                     raw_code = decoded_result.get("code")
                     result_kind = raw_kind if isinstance(raw_kind, str) else None
                     result_code = raw_code if isinstance(raw_code, str) else None
+                    raw_diagnostics = decoded_result.get("diagnostics")
+                    if isinstance(raw_diagnostics, dict):
+                        raw_count = raw_diagnostics.get(
+                            "date_normalization_count"
+                        )
+                        raw_reason = raw_diagnostics.get(
+                            "date_rejection_reason"
+                        )
+                        if (
+                            isinstance(raw_count, int)
+                            and not isinstance(raw_count, bool)
+                            and 0 <= raw_count <= 1_000
+                        ):
+                            date_normalization_count = raw_count
+                        if raw_reason in {
+                            "ambiguous_order",
+                            "invalid_calendar_date",
+                            "invalid_present_position",
+                            "unsupported_format",
+                        }:
+                            date_rejection_reason = raw_reason
             except (TypeError, json.JSONDecodeError):
                 pass
-            trace_status = "invalid" if result_kind == "invalid_draft" else "completed"
+            trace_status = (
+                "invalid"
+                if result_kind in {"invalid_draft", "invalid_tool_arguments"}
+                else "completed"
+            )
+            validation_phase = _validation_phase(result_kind, result_code)
+            if trace_status == "invalid":
+                recovery.invalid_call_count += 1
+                recovery.consecutive_invalid_count += 1
+                if recovery.last_invalid_signature == argument_signature:
+                    recovery.repeated_invalid_signature_count += 1
+                else:
+                    recovery.repeated_invalid_signature_count = 1
+                recovery.last_invalid_signature = argument_signature
+            else:
+                recovery.consecutive_invalid_count = 0
+                recovery.repeated_invalid_signature_count = 0
+                recovery.last_invalid_signature = None
             diagnostic_attributes: dict[str, str | int | float | bool] = {
-                "validation_phase": "draft" if trace_status == "invalid" else "tool",
+                "validation_phase": validation_phase,
                 "draft_count": len(session.drafts),
+                "invalid_tool_call_count": recovery.invalid_call_count,
+                "consecutive_invalid_count": recovery.consecutive_invalid_count,
+                "repeated_invalid_signature_count": (
+                    recovery.repeated_invalid_signature_count
+                ),
             }
             if result_code is not None:
                 diagnostic_attributes["domain_code"] = result_code
+            if date_normalization_count:
+                diagnostic_attributes["date_normalization_count"] = (
+                    date_normalization_count
+                )
+                diagnostic_attributes["date_normalization_applied"] = True
+            if date_rejection_reason is not None:
+                diagnostic_attributes["date_rejection_reason"] = (
+                    date_rejection_reason
+                )
             recorder(
                 request,
                 name,
@@ -478,8 +724,19 @@ def _sdk_tools(
                     argument_keys,
                     trace_status,
                     duration,
+                    result_kind=result_kind,
+                    result_code=result_code,
+                    validation_phase=validation_phase,
+                    argument_signature=argument_signature,
+                    consecutive_invalid_count=recovery.consecutive_invalid_count,
                 )
             )
+            if trace_status == "invalid" and (
+                recovery.invalid_call_count >= _MAX_INVALID_TOOL_CALLS
+                or recovery.repeated_invalid_signature_count
+                >= _MAX_REPEATED_INVALID_SIGNATURE
+            ):
+                raise _ToolRecoveryExhausted
             return result
 
         schema = cast(
@@ -663,6 +920,255 @@ def _problem(
         request_id=str(request.run_id),
         retryable=retryable,
     )
+
+
+def _argument_signature(
+    tool_name: str,
+    arguments_json: str,
+    *,
+    salt: bytes,
+) -> str:
+    """@brief 计算不暴露参数内容的稳定调用签名 / Compute a stable signature without exposing arguments.
+
+    @param tool_name 工具名 / Tool name.
+    @param arguments_json 原始参数 JSON / Raw argument JSON.
+    @param salt 仅在本执行段内存活的随机盐 / Random salt scoped to this execution segment.
+    @return 不可跨 Run 关联的 SHA-256 摘要 / SHA-256 digest not correlatable across Runs.
+    """
+
+    try:
+        normalized = json.dumps(
+            json.loads(arguments_json),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        normalized = arguments_json
+    return hashlib.sha256(
+        salt + f"{tool_name}\0{normalized}".encode()
+    ).hexdigest()
+
+
+def _invalid_tool_arguments_result(
+    tool_name: str,
+    error: ValidationError | None,
+    *,
+    issue: str | None = None,
+) -> str:
+    """@brief 构造可纠正且不含输入值的参数错误 / Build an actionable argument error without input values.
+
+    @param tool_name 失败工具 / Failed tool.
+    @param error 可空 Pydantic 校验错误 / Optional Pydantic validation error.
+    @param issue 无校验对象时的稳定问题类型 / Stable issue type without a validation object.
+    @return 可安全反馈给模型的 JSON / JSON safe to return to the model.
+    """
+
+    issues: list[dict[str, str]] = []
+    if error is not None:
+        for item in error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )[:5]:
+            location = item.get("loc", ())
+            path = ".".join(str(part) for part in location) or "$"
+            error_type = item.get("type")
+            issues.append(
+                {
+                    "path": path[:300],
+                    "issue": (
+                        error_type[:100]
+                        if isinstance(error_type, str)
+                        else "schema_validation"
+                    ),
+                }
+            )
+    else:
+        issues.append({"path": "$", "issue": issue or "schema_validation"})
+    suggested_tool = {
+        "resume_draft_set_profile_fields": "resume_draft_set_profile_field",
+        "resume_draft_set_fields": "resume_draft_set_field",
+        "resume_draft_upsert_sections": "resume_draft_upsert_section",
+        "resume_draft_upsert_items": "resume_draft_upsert_item",
+    }.get(tool_name, tool_name)
+    return json.dumps(
+        {
+            "kind": "invalid_tool_arguments",
+            "code": "agent.tool_arguments_invalid",
+            "recoverable": True,
+            "tool": tool_name,
+            "issues": issues,
+            "retry": {
+                "strategy": "correct_arguments",
+                "suggested_tool": suggested_tool,
+                "repeat_unchanged": False,
+            },
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
+def _validation_phase(result_kind: str | None, result_code: str | None) -> str:
+    """@brief 根据稳定结果分类校验阶段 / Classify validation phase from stable result fields.
+
+    @param result_kind 工具结果种类 / Tool-result kind.
+    @param result_code 工具结果错误码 / Tool-result error code.
+    @return 有界诊断阶段 / Bounded diagnostic phase.
+    """
+
+    if result_kind == "invalid_tool_arguments":
+        return "arguments_schema"
+    if result_kind != "invalid_draft":
+        return "tool"
+    if result_code is not None and (
+        "not_found" in result_code or "missing" in result_code
+    ):
+        return "entity_resolution"
+    if result_code is not None and (
+        "conflict" in result_code or "duplicate" in result_code
+    ):
+        return "draft_conflict"
+    return "domain_validation"
+
+
+def _failure_diagnostics(
+    request: AgentProviderRequest,
+    traces: list[AgentToolInvocationTrace],
+    failure_class: str,
+    exception_type: str,
+    latency_budget_ms: int,
+    execution_timeout_ms: int,
+) -> dict[str, str | int | float | bool]:
+    """@brief 汇总不含内容的失败诊断 / Summarize content-free failure diagnostics.
+
+    @param request 当前 Provider 请求 / Current provider request.
+    @param traces 已产生的工具轨迹 / Tool traces produced so far.
+    @param failure_class 稳定失败分类 / Stable failure classification.
+    @param exception_type 异常类型名 / Exception type name.
+    @param latency_budget_ms 延迟目标 / Latency target.
+    @param execution_timeout_ms 后端执行安全上限 / Server execution safety limit.
+    @return 可写入遥测的有界属性 / Bounded attributes safe for telemetry.
+    """
+
+    last_trace = traces[-1] if traces else None
+    attributes: dict[str, str | int | float | bool] = {
+        "failure_class": failure_class,
+        "exception_type": exception_type,
+        "max_turns": _MAX_TURNS,
+        "max_tool_calls": _MAX_TOOL_CALLS,
+        "max_invalid_tool_calls": _MAX_INVALID_TOOL_CALLS,
+        "history_message_count": len(request.conversation_history),
+        "tool_call_count": len(traces),
+        "invalid_tool_call_count": sum(trace.status == "invalid" for trace in traces),
+        "last_tool_name": last_trace.tool_name if last_trace else "none",
+        "last_tool_status": last_trace.status if last_trace else "none",
+        "last_result_kind": (
+            (last_trace.result_kind if last_trace else None) or "none"
+        ),
+        "last_result_code": (
+            (last_trace.result_code if last_trace else None) or "none"
+        ),
+        "last_validation_phase": (
+            (last_trace.validation_phase if last_trace else None) or "none"
+        ),
+        "latency_budget_ms": latency_budget_ms,
+        "execution_timeout_ms": execution_timeout_ms,
+    }
+    if last_trace is not None and last_trace.argument_signature is not None:
+        attributes["last_argument_signature"] = last_trace.argument_signature
+    return attributes
+
+
+def _classify_provider_exception(error: Exception) -> _ProviderFailureClassification:
+    """@brief 将底层异常映射为稳定的公共错误 / Map internal exceptions to stable public errors.
+
+    @param error 底层异常 / The underlying exception.
+    @return 不包含敏感文本的失败分类 / A failure classification without sensitive text.
+    """
+
+    chain = _exception_chain(error)
+    if any(isinstance(item, _ToolRecoveryExhausted) for item in chain):
+        return _ProviderFailureClassification(
+            "agent.tool_recovery_exhausted",
+            502,
+            True,
+            "tool_recovery_exhausted",
+        )
+    if any(isinstance(item, _ToolCallBudgetExhausted) for item in chain):
+        return _ProviderFailureClassification(
+            "agent.tool_call_budget_exhausted",
+            503,
+            False,
+            "tool_call_budget_exhausted",
+        )
+    if any(isinstance(item, MaxTurnsExceeded) for item in chain):
+        return _ProviderFailureClassification(
+            "agent.turn_budget_exhausted", 503, False, "turn_budget_exhausted"
+        )
+    if type(error) is TimeoutError:
+        return _ProviderFailureClassification(
+            "agent.execution_timeout", 504, True, "execution_timeout"
+        )
+    if any(isinstance(item, (APITimeoutError, TimeoutException)) for item in chain):
+        return _ProviderFailureClassification(
+            "agent.provider_timeout", 504, True, "provider_timeout"
+        )
+    if any(isinstance(item, RateLimitError) for item in chain):
+        return _ProviderFailureClassification(
+            "agent.provider_rate_limited", 429, True, "provider_rate_limited"
+        )
+    if any(isinstance(item, ModelRefusalError) for item in chain):
+        return _ProviderFailureClassification(
+            "agent.provider_refused", 422, False, "provider_refused"
+        )
+    if any(isinstance(item, ModelBehaviorError) for item in chain):
+        return _ProviderFailureClassification(
+            "agent.provider_protocol_error", 502, False, "provider_protocol_error"
+        )
+    if any(isinstance(item, ToolTimeoutError) for item in chain):
+        return _ProviderFailureClassification("agent.tool_timeout", 504, False, "tool_timeout")
+    if any(isinstance(item, APIConnectionError) for item in chain):
+        return _ProviderFailureClassification(
+            "agent.provider_unavailable", 503, True, "provider_unavailable"
+        )
+    status_error = next(
+        (item for item in chain if isinstance(item, APIStatusError)),
+        None,
+    )
+    if status_error is not None:
+        if status_error.status_code >= 500:
+            return _ProviderFailureClassification(
+                "agent.provider_unavailable", 503, True, "provider_unavailable"
+            )
+        return _ProviderFailureClassification(
+            "agent.provider_protocol_error", 502, False, "provider_protocol_error"
+        )
+    if any(isinstance(item, (UserError, ValueError)) for item in chain):
+        return _ProviderFailureClassification(
+            "agent.provider_protocol_error", 502, False, "provider_protocol_error"
+        )
+    return _ProviderFailureClassification("agent.provider_failed", 503, False, "provider_unknown")
+
+
+def _exception_chain(error: BaseException) -> tuple[BaseException, ...]:
+    """@brief 安全遍历异常因果链 / Safely traverse an exception cause chain.
+
+    @param error 起始异常 / The starting exception.
+    @return 去重后的异常链 / The de-duplicated exception chain.
+    """
+
+    items: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        items.append(current)
+        current = current.__cause__ or current.__context__
+    return tuple(items)
 
 
 __all__ = ["DeterministicAgentModel", "OpenAIAgentsSDKProvider"]

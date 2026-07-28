@@ -61,6 +61,7 @@ from backend.domain.agent_v2 import (
     AgentRunStateDispatch,
     AgentRunStatus,
     AgentRunView,
+    AgentToolInvocationTrace,
     AgentUsage,
     Conversation,
     ConversationCapability,
@@ -112,6 +113,9 @@ V2_AGENT_ENDPOINT_METHODS = (
 
 _PROVIDER_HISTORY_MESSAGE_LIMIT = 40
 """@brief 单次模型请求携带的最近会话消息上限 / Recent conversation-message limit sent to one model request."""
+
+_PROVIDER_HISTORY_CHARACTER_LIMIT = 48_000
+"""@brief 会话历史文本的保守字符预算 / Conservative character budget for conversation history."""
 
 _PROVIDER_HISTORY_SCAN_LIMIT = 2_000
 """@brief 为取得最近消息最多扫描的有界消息数 / Bounded number of messages scanned for recent history."""
@@ -1316,6 +1320,7 @@ class AgentWorkerService:
                 prepared.run,
                 prepared.job,
                 error.problem,
+                invocations=error.invocations,
             )
         except AgentDomainError:
             return await self._record_run_failure(
@@ -1389,16 +1394,20 @@ class AgentWorkerService:
             raise
         except AgentProviderFailure as error:
             problem = error.problem
+            invocations = error.invocations
         except AgentDomainError:
             problem = _provider_protocol_problem(dispatch.run_id)
+            invocations = ()
         except Exception:
             problem = _unexpected_provider_problem(dispatch.run_id)
+            invocations = ()
         return await self._record_run_failure(
             dispatch.workspace_id,
             dispatch.run_id,
             prepared.run,
             prepared.job,
             problem,
+            invocations=invocations,
         )
 
     async def _prepare_proposal_continuation(
@@ -2113,6 +2122,8 @@ class AgentWorkerService:
         started_run: AgentRun,
         started_job: Job,
         problem: ProblemDetails,
+        *,
+        invocations: tuple[AgentToolInvocationTrace, ...] = (),
     ) -> AgentRunView:
         """@brief 在独立短事务中终结执行失败 / Finalize an execution failure in a separate short transaction.
 
@@ -2121,6 +2132,7 @@ class AgentWorkerService:
         @param started_run 外部 I/O 前提交的 Run snapshot / Run snapshot committed before I/O.
         @param started_job 外部 I/O 前提交的 Job snapshot / Job snapshot committed before I/O.
         @param problem 已脱敏执行问题 / Redacted execution problem.
+        @param invocations 失败前不含内容的工具轨迹 / Content-free tool traces before failure.
         @return failed 或并发取消后的 Run view / Failed or concurrently cancelled Run view.
         """
         failed_at = self._clock.now()
@@ -2148,6 +2160,17 @@ class AgentWorkerService:
                 failed_run = current.fail(problem, at=failed_at)
                 failed_job = current_job.fail(problem, at=failed_at)
                 validate_run_job_alignment(failed_run, failed_job)
+                if invocations:
+                    await uow.resume_proposals.record_invocations(
+                        AgentToolInvocationCommand(
+                            workspace_id=current.workspace_id,
+                            actor_id=current.created_by,
+                            run_id=current.meta.id,
+                            invocations=invocations,
+                            proposal_ref=None,
+                            created_at=failed_at,
+                        )
+                    )
                 await uow.repository.save_run(
                     failed_run,
                     expected_revision=current.meta.revision,
@@ -2588,7 +2611,21 @@ async def _load_provider_conversation_history(
         (item for item in collected if belongs_to_complete_turn(item)),
         key=lambda item: (item.sequence, item.meta.id),
     )
-    return tuple(ordered[-_PROVIDER_HISTORY_MESSAGE_LIMIT:])
+    recent = ordered[-_PROVIDER_HISTORY_MESSAGE_LIMIT:]
+    selected: list[Message] = []
+    character_count = 0
+    for message in reversed(recent):
+        message_characters = sum(
+            len(part.text) for part in message.content if isinstance(part, TextContentPart)
+        )
+        if character_count + message_characters > _PROVIDER_HISTORY_CHARACTER_LIMIT:
+            break
+        selected.append(message)
+        character_count += message_characters
+    selected.reverse()
+    if selected and selected[0].role is MessageRole.ASSISTANT:
+        selected.pop(0)
+    return tuple(selected)
 
 
 async def _refresh_execution_grant(

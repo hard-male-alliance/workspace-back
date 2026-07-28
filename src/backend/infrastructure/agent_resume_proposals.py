@@ -43,8 +43,10 @@ from backend.infrastructure.persistence.models import (
 )
 from backend.infrastructure.resumes import (
     decode_resume_document,
-    decode_resume_operation,
+    decode_resume_operation_wire,
     encode_resume_operation,
+    encode_resume_operation_wire,
+    normalize_resume_operation_wire,
 )
 
 _RESOURCE_REFS_ADAPTER: TypeAdapter[tuple[ResourceRef, ...]] = TypeAdapter(
@@ -371,6 +373,11 @@ class PostgresAgentResumeProposalBoundary:
             result: JsonObject = {
                 "kind": invocation.status,
                 "duration_ms": round(invocation.duration_ms, 3),
+                "result_kind": invocation.result_kind,
+                "result_code": invocation.result_code,
+                "validation_phase": invocation.validation_phase,
+                "argument_signature": invocation.argument_signature,
+                "consecutive_invalid_count": invocation.consecutive_invalid_count,
             }
             bound_proposal_id = (
                 proposal_id
@@ -538,17 +545,19 @@ def _materialize_operations(
 
     operations: list[ResumeOperation] = []
     for ordinal, payload in enumerate(payloads):
-        normalized = _remap_operation_payload(payload, remapped)
+        normalized = normalize_resume_operation_wire(
+            _remap_operation_payload(payload, remapped)
+        )
         normalized["operation_id"] = _stable_id(
             "operation",
             f"{run_id}:{ordinal}",
         )
-        operation = decode_resume_operation(normalized)
+        operation = decode_resume_operation_wire(normalized)
         if (
             normalized.get("op") != operation.op
             or not _matches_canonical_subset(
                 normalized,
-                encode_resume_operation(operation),
+                encode_resume_operation_wire(operation),
             )
         ):
             raise ValueError(

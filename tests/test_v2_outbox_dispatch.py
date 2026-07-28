@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from unittest.mock import Mock
 
 import pytest
 
@@ -260,7 +261,9 @@ async def test_dispatch_completes_registered_and_notification_only_events() -> N
 
 
 @pytest.mark.asyncio
-async def test_dispatch_persists_only_controlled_or_generic_failure_codes() -> None:
+async def test_dispatch_persists_only_controlled_or_generic_failure_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """@brief 重试记录不得保存异常正文 / Retry records never persist exception text."""
     clock = _Clock(datetime(2026, 7, 23, 12, tzinfo=UTC))
     controlled = _claim(event_type="agent.run.queued")
@@ -269,6 +272,8 @@ async def test_dispatch_persists_only_controlled_or_generic_failure_codes() -> N
         event_id=ApiEventId("event_00000002"),
     )
     repository = _Repository((controlled, unexpected))
+    warning = Mock()
+    monkeypatch.setattr("backend.application.outbox_dispatch.logger.warning", warning)
     service = _service(
         repository,
         {
@@ -287,6 +292,20 @@ async def test_dispatch_persists_only_controlled_or_generic_failure_codes() -> N
     ]
     assert "secret-token" not in repr(repository.retries)
     assert all(retry_at > clock.value for _, _, retry_at in repository.retries)
+    diagnostics = [
+        call.kwargs["extra"]["telemetry_attributes"]
+        for call in warning.call_args_list
+        if call.args[0] == "backend.outbox.dispatch_retry"
+    ]
+    assert len(diagnostics) == 2
+    assert diagnostics[0]["outbox_id"] == "event_00000001"
+    assert diagnostics[0]["event_type"] == "agent.run.queued"
+    assert diagnostics[0]["error_code"] == "agent.provider_unavailable"
+    assert diagnostics[0]["attempt"] == 1
+    assert diagnostics[0]["outcome"] == "retried"
+    assert diagnostics[0]["terminal"] is False
+    assert "next_attempt_at" in diagnostics[0]
+    assert "secret-token" not in repr(diagnostics)
 
 
 @pytest.mark.asyncio

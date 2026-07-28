@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 import shutil
 import signal
 import sys
@@ -26,6 +28,8 @@ from backend.infrastructure.process_confinement import (
 )
 from workspace_shared.ids import new_opaque_id
 
+logger = logging.getLogger(__name__)
+
 _killpg: Callable[[int, int], None] | None = getattr(os, "killpg", None)
 """@brief POSIX 进程组信号函数 / POSIX process-group signal function."""
 
@@ -43,6 +47,12 @@ _PROCESS_TERMINATION_GRACE_SECONDS = 1.0
 
 _PROCESS_KILL_REAP_SECONDS = 1.0
 """@brief 发出 SIGKILL 后等待回收的上限 / Maximum wait for reaping after SIGKILL."""
+
+_OVERFULL_HBOX_PATTERN = re.compile(rb"Overfull \\hbox \((\d+(?:\.\d+)?)pt too wide\)")
+"""XeLaTeX overfull-box diagnostic without retaining user content."""
+
+_MAXIMUM_ACCEPTABLE_OVERFLOW_PT = 1.0
+"""Maximum tolerated horizontal overflow before a render is rejected."""
 
 
 class _CombinedOutputLimitExceeded(Exception):
@@ -176,7 +186,7 @@ class SandboxedXeLaTeXRenderer:
     @note 生产必需边界是无特权 Landlock/libseccomp；Bubblewrap 仅为真实 probe 后的额外层。
     """
 
-    version = "xelatex-fixed-template-v1"
+    version = "xelatex-fixed-template-v2"
     """@brief 写入 Artifact 审计元数据的稳定 renderer 版本 / Stable renderer version written to Artifact audit metadata."""
 
     def __init__(
@@ -215,7 +225,8 @@ class SandboxedXeLaTeXRenderer:
         latex = _safe_template(
             document,
             main_font_preamble=_configured_main_font_preamble(
-                self._settings.allowed_font_directories
+                self._settings.allowed_font_directories,
+                letter_spacing_em=_document_letter_spacing(document),
             ),
         )
         if len(latex.encode("utf-8")) > self._settings.max_input_bytes:
@@ -286,6 +297,38 @@ class SandboxedXeLaTeXRenderer:
                             extensions={
                                 "exit_code": process.returncode,
                                 "diagnostic": _safe_diagnostic(stderr),
+                            },
+                        )
+                    )
+                compiler_log = _read_diagnostic_tail(workdir / "resume.log")
+                overflow_count, maximum_overflow_pt = _layout_overflow(compiler_log or stderr)
+                if overflow_count:
+                    logger.warning(
+                        "backend.resume.render.layout_overflow",
+                        extra={
+                            "event_name": "backend.resume.render.layout_overflow",
+                            "telemetry_attributes": {
+                                "operation": "resume_render",
+                                "outcome": (
+                                    "failure"
+                                    if maximum_overflow_pt > _MAXIMUM_ACCEPTABLE_OVERFLOW_PT
+                                    else "attention_required"
+                                ),
+                                "overflow_box_count": overflow_count,
+                                "maximum_overflow_pt": maximum_overflow_pt,
+                                "template_id": _safe_template_id(document),
+                            },
+                        },
+                    )
+                if maximum_overflow_pt > _MAXIMUM_ACCEPTABLE_OVERFLOW_PT:
+                    raise DomainError(
+                        Problem(
+                            "resume.layout_overflow",
+                            422,
+                            "Resume content exceeds the printable page width",
+                            extensions={
+                                "overflow_box_count": overflow_count,
+                                "maximum_overflow_pt": maximum_overflow_pt,
                             },
                         )
                     )
@@ -422,7 +465,7 @@ def _minimal_pdf(title: object) -> bytes:
 def _safe_template(
     document: dict[str, Any],
     *,
-    main_font_preamble: str = "\\setmainfont{Noto Sans CJK SC}\n",
+    main_font_preamble: str | None = None,
 ) -> str:
     """@brief 从 SIR 生成固定受限 TeX 模板 / Generate a fixed restricted TeX template from SIR.
 
@@ -430,9 +473,28 @@ def _safe_template(
     @return 无用户 TeX 命令的固定模板 / Fixed template containing no user TeX commands.
     """
     profile = _mapping(document.get("profile"))
+    style = _mapping(document.get("style"))
+    typography = _mapping(style.get("typography"))
     template_id = _text(_mapping(document.get("template")).get("template_id"))
     ats_professional = template_id == "tpl_ats_professional_v1"
     modern_professional = template_id == "tpl_modern_professional_v1"
+    base_size_pt = _bounded_number(typography.get("base_size_pt"), 10.0, 5.0, 72.0)
+    line_height = _bounded_number(typography.get("line_height"), 1.25, 0.5, 5.0)
+    heading_scale = _bounded_number(typography.get("heading_scale"), 1.2, 0.5, 5.0)
+    letter_spacing_em = _bounded_number(
+        typography.get("letter_spacing_em"), 0.0, -1.0, 2.0
+    )
+    if main_font_preamble is None:
+        main_font_preamble = _configured_main_font_preamble(
+            (),
+            letter_spacing_em=letter_spacing_em,
+        )
+    heading_size_pt = base_size_pt * heading_scale
+    headline_size_pt = max(base_size_pt * 1.25, base_size_pt + 1.0)
+    name_size_pt = max(
+        base_size_pt * (2.2 if modern_professional else 1.8),
+        18.0 if modern_professional else 16.0,
+    )
     document_title = _latex_escape(_text(document.get("title")))
     full_name = _latex_escape(_text(profile.get("full_name")))
     headline = _latex_paragraph(_text(profile.get("headline")))
@@ -444,23 +506,30 @@ def _safe_template(
     )
     if ats_professional:
         body: list[str] = [
-            f"{{\\LARGE\\bfseries {full_name}}}\\\\[2pt]\n",
+            f"{{\\fontsize{{{name_size_pt:.2f}pt}}{{{name_size_pt * 1.15:.2f}pt}}"
+            f"\\selectfont\\bfseries {full_name}}}\\par\\vspace{{2pt}}\n",
         ]
     elif modern_professional:
         body = [
-            f"{{\\fontsize{{24}}{{28}}\\selectfont\\bfseries\\color{{AIWSAccent}} {full_name}}}\\\\[3pt]\n",
+            f"{{\\fontsize{{{name_size_pt:.2f}pt}}{{{name_size_pt * 1.15:.2f}pt}}"
+            f"\\selectfont\\bfseries\\color{{AIWSAccent}} {full_name}}}"
+            "\\par\\vspace{3pt}\n",
         ]
     else:
         body = [
             "\\begin{center}\n",
-            f"{{\\LARGE\\bfseries {full_name}}}\\\\[4pt]\n",
+            f"{{\\fontsize{{{name_size_pt:.2f}pt}}{{{name_size_pt * 1.15:.2f}pt}}"
+            f"\\selectfont\\bfseries {full_name}}}\\par\\vspace{{4pt}}\n",
         ]
     if headline:
-        body.append(f"{{\\large {headline}}}\\\\[4pt]\n")
+        body.append(
+            f"{{\\fontsize{{{headline_size_pt:.2f}pt}}{{{headline_size_pt * 1.2:.2f}pt}}"
+            f"\\selectfont {headline}}}\\par\\vspace{{4pt}}\n"
+        )
     if document_title:
-        body.append(f"{{\\small {document_title}}}\\\\[4pt]\n")
+        body.append(f"{{\\small {document_title}}}\\par\\vspace{{4pt}}\n")
     if contacts:
-        body.append(f"{{\\small {' \\quad | \\quad '.join(contacts)}}}\n")
+        body.append(f"{{\\small {' \\quad | \\quad '.join(contacts)}}}\\par\n")
     if ats_professional:
         body.append("\\par\\noindent\\rule{\\textwidth}{0.5pt}\\vspace{3pt}\n")
     elif modern_professional:
@@ -473,8 +542,12 @@ def _safe_template(
     if profile_summary:
         body.extend(
             (
-                _section_heading("Professional Summary", modern_professional),
-                f"{profile_summary}\n",
+                _section_heading(
+                    _summary_heading(document),
+                    modern_professional,
+                    heading_size_pt=heading_size_pt,
+                ),
+                f"{profile_summary}\\par\n",
             )
         )
     for raw_section in _sequence(document.get("sections")):
@@ -490,35 +563,57 @@ def _safe_template(
         )
         if not section_title or (not content and not items):
             continue
-        body.append(_section_heading(section_title, modern_professional))
+        layout = _section_layout(style, _text(section.get("id")))
+        body.append(_section_layout_start(layout))
+        body.append(
+            _section_heading(
+                section_title,
+                modern_professional,
+                heading_size_pt=heading_size_pt,
+            )
+        )
         if content:
-            body.append(f"{content}\n")
+            body.append(f"{content}\\par\n")
         body.extend(items)
-    geometry = (
-        "margin=15mm"
+        body.append("\\endgroup\n")
+    fallback_margin = (
+        "15mm"
         if ats_professional
-        else "margin=17mm"
+        else "17mm"
         if modern_professional
-        else "margin=16mm"
+        else "16mm"
     )
+    geometry = _geometry_options(style, fallback_margin=fallback_margin)
+    accent_color, rule_color, text_color = _style_colors(style)
     color_preamble = (
         "\\usepackage{xcolor}\n"
-        "\\definecolor{AIWSAccent}{HTML}{244A65}\n"
-        "\\definecolor{AIWSRule}{HTML}{7B9AAF}\n"
+        f"\\definecolor{{AIWSAccent}}{{HTML}}{{{accent_color}}}\n"
+        f"\\definecolor{{AIWSRule}}{{HTML}}{{{rule_color}}}\n"
+        f"\\definecolor{{AIWSText}}{{HTML}}{{{text_color}}}\n"
         if modern_professional
         else ""
     )
+    text_color_command = "\\color{AIWSText}\n" if modern_professional else ""
+    paragraph_skip_pt = 6.0 - 4.0 * _bounded_number(style.get("density"), 0.5, 0.0, 1.0)
+    page_style = "plain" if _show_page_numbers(style) else "empty"
     return "".join(
         (
             "\\documentclass[10pt]{article}\n",
             "\\usepackage{fontspec}\n",
+            "\\usepackage{tabularx}\n",
             f"\\usepackage[{geometry}]{{geometry}}\n",
             color_preamble,
             main_font_preamble,
+            '\\XeTeXlinebreaklocale "zh"\n',
+            "\\XeTeXlinebreakskip=0pt plus 1pt\n",
+            "\\emergencystretch=2em\n",
+            f"\\fontsize{{{base_size_pt:.2f}pt}}{{{base_size_pt * line_height:.2f}pt}}"
+            "\\selectfont\n",
+            text_color_command,
             "\\setlength{\\parindent}{0pt}\n",
-            "\\setlength{\\parskip}{4pt}\n",
+            f"\\setlength{{\\parskip}}{{{paragraph_skip_pt:.2f}pt}}\n",
             "\\setcounter{secnumdepth}{0}\n",
-            "\\pagestyle{plain}\n",
+            f"\\pagestyle{{{page_style}}}\n",
             "\\begin{document}\n",
             "".join(body),
             "\\end{document}\n",
@@ -526,10 +621,19 @@ def _safe_template(
     )
 
 
-def _configured_main_font_preamble(font_directories: tuple[str, ...]) -> str:
+def _configured_main_font_preamble(
+    font_directories: tuple[str, ...],
+    *,
+    letter_spacing_em: float = 0.0,
+) -> str:
     """Select the operator-provided fixed CJK font files without a warm Fontconfig cache."""
 
     unsafe_path_characters = frozenset("\\{}[]%#")
+    letter_spacing_option = (
+        f"LetterSpace={letter_spacing_em * 100:.2f},"
+        if abs(letter_spacing_em) >= 0.0001
+        else ""
+    )
     for configured_directory in font_directories:
         directory = Path(configured_directory).resolve()
         regular = directory / "NotoSansCJK-Regular.ttc"
@@ -540,26 +644,163 @@ def _configured_main_font_preamble(font_directories: tuple[str, ...]) -> str:
             continue
         return (
             "\\setmainfont["
+            f"{letter_spacing_option}"
             f"Path={directory.as_posix()}/,"
             "UprightFont=NotoSansCJK-Regular.ttc,"
             "BoldFont=NotoSansCJK-Regular.ttc,"
             "BoldFeatures={FakeBold=2}"
             "]{NotoSansCJK-Regular.ttc}\n"
         )
+    if letter_spacing_option:
+        return (
+            f"\\setmainfont[{letter_spacing_option.rstrip(',')}]"
+            "{Noto Sans CJK SC}\n"
+        )
     return "\\setmainfont{Noto Sans CJK SC}\n"
 
 
-def _section_heading(title: str, modern: bool) -> str:
+def _document_letter_spacing(document: dict[str, Any]) -> float:
+    """Return the bounded font letter spacing configured by the style intent."""
+
+    typography = _mapping(_mapping(document.get("style")).get("typography"))
+    return _bounded_number(typography.get("letter_spacing_em"), 0.0, -1.0, 2.0)
+
+
+def _section_heading(title: str, modern: bool, *, heading_size_pt: float) -> str:
     """Render one fixed section heading without accepting user TeX."""
 
     if modern:
         return (
-            "\\vspace{5pt}\\noindent"
-            f"{{\\large\\bfseries\\color{{AIWSAccent}} {title}}}"
-            "\\par\\vspace{1pt}\\noindent"
-            "\\color{AIWSRule}\\rule{\\textwidth}{0.4pt}\\color{black}\\vspace{2pt}\n"
+            "\\par\\addvspace{5pt}\\noindent"
+            f"{{\\fontsize{{{heading_size_pt:.2f}pt}}{{{heading_size_pt * 1.15:.2f}pt}}"
+            f"\\selectfont\\bfseries\\color{{AIWSAccent}} {title}}}"
+            "\\par\\nobreak\\vspace{1pt}\\noindent"
+            "\\color{AIWSRule}\\rule{\\linewidth}{0.4pt}\\color{AIWSText}"
+            "\\par\\nobreak\\vspace{2pt}\n"
         )
-    return f"\\section*{{{title}}}\n"
+    return (
+        "\\par\\addvspace{4pt}\\noindent"
+        f"{{\\fontsize{{{heading_size_pt:.2f}pt}}{{{heading_size_pt * 1.15:.2f}pt}}"
+        f"\\selectfont\\bfseries {title}}}\\par\\nobreak\\vspace{{2pt}}\n"
+    )
+
+
+def _summary_heading(document: dict[str, Any]) -> str:
+    """Return the fixed localized summary heading for the document locale."""
+
+    locale = _text(document.get("locale")).lower()
+    if locale.startswith("zh"):
+        return "个人简介"
+    return "Professional Summary"
+
+
+def _geometry_options(style: dict[str, Any], *, fallback_margin: str) -> str:
+    """Map the renderer-independent page intent into bounded geometry options."""
+
+    page = _mapping(style.get("page"))
+    size = _text(page.get("size")).upper()
+    options: list[str] = []
+    if size == "A4":
+        options.append("a4paper")
+    elif size == "LETTER":
+        options.append("letterpaper")
+    elif size == "LEGAL":
+        options.append("legalpaper")
+    elif size == "CUSTOM":
+        width = _latex_measurement(page.get("custom_width"))
+        height = _latex_measurement(page.get("custom_height"))
+        if width and height:
+            options.extend((f"paperwidth={width}", f"paperheight={height}"))
+    if _text(page.get("orientation")) == "landscape":
+        options.append("landscape")
+    margins = _mapping(page.get("margins"))
+    rendered_margins = {
+        side: _latex_measurement(margins.get(side))
+        for side in ("top", "right", "bottom", "left")
+    }
+    if all(rendered_margins.values()):
+        options.extend(
+            f"{side}={rendered_margins[side]}"
+            for side in ("top", "right", "bottom", "left")
+        )
+    else:
+        options.append(f"margin={fallback_margin}")
+    return ",".join(options)
+
+
+def _latex_measurement(value: object) -> str:
+    """Render one validated absolute measurement without accepting TeX."""
+
+    measurement = _mapping(value)
+    number = measurement.get("value")
+    unit = _text(measurement.get("unit"))
+    if not isinstance(number, int | float) or isinstance(number, bool):
+        return ""
+    if unit not in {"pt", "mm", "cm", "in", "px", "em"}:
+        return ""
+    numeric = float(number)
+    if not 0 < numeric <= 10_000:
+        return ""
+    if unit == "px":
+        numeric *= 0.75
+        unit = "pt"
+    return f"{numeric:.4f}".rstrip("0").rstrip(".") + unit
+
+
+def _style_colors(style: dict[str, Any]) -> tuple[str, str, str]:
+    """Return safe HTML hex colors from the style palette with template defaults."""
+
+    palette = _mapping(style.get("palette"))
+    return (
+        _hex_color(palette.get("primary"), "244A65"),
+        _hex_color(palette.get("secondary"), "7B9AAF"),
+        _hex_color(palette.get("text"), "1A1A1A"),
+    )
+
+
+def _hex_color(value: object, fallback: str) -> str:
+    color = _mapping(value)
+    raw = _text(color.get("value"))
+    if _text(color.get("space")) == "srgb_hex" and re.fullmatch(r"#[0-9A-Fa-f]{6}", raw):
+        return raw[1:].upper()
+    return fallback
+
+
+def _show_page_numbers(style: dict[str, Any]) -> bool:
+    value = _mapping(style.get("page")).get("show_page_numbers")
+    return value if isinstance(value, bool) else False
+
+
+def _section_layout(style: dict[str, Any], section_id: str) -> dict[str, Any]:
+    for raw_layout in _sequence(style.get("section_layout")):
+        layout = _mapping(raw_layout)
+        if _text(layout.get("section_id")) == section_id:
+            return layout
+    return {}
+
+
+def _section_layout_start(layout: dict[str, Any]) -> str:
+    """Start one section group and apply safe pagination and compactness intent."""
+
+    parts = ["\\par\n"]
+    if layout.get("page_break_before") is True:
+        parts.append("\\clearpage\n")
+    if layout.get("keep_together") is True:
+        parts.append("\\filbreak\n")
+    compactness = _bounded_number(layout.get("compactness"), 0.5, 0.0, 1.0)
+    parts.append("\\begingroup\n")
+    parts.append(f"\\setlength{{\\parskip}}{{{6.0 - compactness * 4.0:.2f}pt}}\n")
+    return "".join(parts)
+
+
+def _bounded_number(value: object, fallback: float, minimum: float, maximum: float) -> float:
+    if (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and minimum <= float(value) <= maximum
+    ):
+        return float(value)
+    return fallback
 
 
 def _mapping(value: object) -> dict[str, Any]:
@@ -604,16 +845,21 @@ def _latex_item(value: object) -> str:
     date_range = _latex_date_range(item.get("date_range"))
     primary = " — ".join(part for part in (title, organization) if part)
     secondary = " · ".join(part for part in (subtitle, location) if part)
-    lines: list[str] = []
+    lines: list[str] = ["\\par\\noindent\n"]
     if primary or date_range:
-        lines.append(
-            f"\\textbf{{{primary}}}" + (f"\\hfill {date_range}" if date_range else "") + "\\\\\n"
-        )
+        if date_range:
+            lines.append(
+                "\\begin{tabularx}{\\linewidth}{@{}>{\\raggedright\\arraybackslash}Xr@{}}\n"
+                f"\\textbf{{{primary}}} & {date_range}\\\\\n"
+                "\\end{tabularx}\\par\\nobreak\n"
+            )
+        else:
+            lines.append(f"\\textbf{{{primary}}}\\par\\nobreak\n")
     if secondary:
-        lines.append(f"\\textit{{{secondary}}}\\\\\n")
+        lines.append(f"\\textit{{{secondary}}}\\par\\nobreak\n")
     summary = _latex_rich_text(item.get("summary"))
     if summary:
-        lines.append(f"{summary}\n")
+        lines.append(f"{summary}\\par\n")
     highlights = tuple(
         rendered
         for raw_highlight in _sequence(item.get("highlights"))
@@ -629,11 +875,11 @@ def _latex_item(value: object) -> str:
         if (raw_skill := _text(raw_value).strip())
     )
     if skills:
-        lines.append(f"\\textbf{{Skills:}} {', '.join(skills)}\n")
+        lines.append(f"\\textbf{{Skills:}} {', '.join(skills)}\\par\n")
     url = _text(item.get("url")).strip()
     if url:
-        lines.append(f"\\textbf{{Link:}} {_latex_escape(url)}\n")
-    lines.append("\\medskip\n")
+        lines.append(f"\\textbf{{Link:}} {_latex_escape(url)}\\par\n")
+    lines.append("\\par\\medskip\n")
     return "".join(lines)
 
 
@@ -1008,6 +1254,19 @@ def _read_limited_pdf(path: Path, max_output_bytes: int) -> bytes:
     return content
 
 
+def _read_diagnostic_tail(path: Path, maximum_bytes: int = 256 * 1024) -> bytes:
+    """Read a bounded compiler-log tail for aggregate layout diagnostics."""
+
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as diagnostic_file:
+            if size > maximum_bytes:
+                diagnostic_file.seek(-maximum_bytes, os.SEEK_END)
+            return diagnostic_file.read(maximum_bytes)
+    except OSError:
+        return b""
+
+
 async def _terminate_process_group(
     process: asyncio.subprocess.Process,
     *,
@@ -1135,3 +1394,22 @@ def _safe_diagnostic(stderr: bytes) -> str:
     @return 安全诊断摘要 / Safe diagnostic summary.
     """
     return stderr.decode("utf-8", "replace").replace("/work/", "").replace("\x00", "")[-1000:]
+
+
+def _layout_overflow(diagnostic: bytes) -> tuple[int, float]:
+    """Return only bounded aggregate horizontal-overflow diagnostics."""
+
+    widths = tuple(
+        float(match.group(1)) for match in _OVERFULL_HBOX_PATTERN.finditer(diagnostic)
+    )
+    return len(widths), max(widths, default=0.0)
+
+
+def _safe_template_id(document: dict[str, Any]) -> str:
+    """Project a bounded template identity into low-cardinality telemetry."""
+
+    template_id = _text(_mapping(document.get("template")).get("template_id"))
+    return template_id if template_id in {
+        "tpl_ats_professional_v1",
+        "tpl_modern_professional_v1",
+    } else "other"

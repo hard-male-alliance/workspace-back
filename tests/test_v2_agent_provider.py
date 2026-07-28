@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from agents.exceptions import ModelBehaviorError
 from agents.items import ModelResponse, TResponseStreamEvent
 from agents.models.interface import Model, ModelTracing
 from agents.usage import Usage
@@ -17,6 +20,7 @@ from openai.types.responses import (
     ResponseOutputText,
 )
 
+from backend.application.ports.agent_v2 import AgentProviderFailure
 from backend.domain.agent_v2 import (
     AgentExecutionGrant,
     AgentOutputMode,
@@ -138,6 +142,110 @@ class SequenceModel(Model):
         del args, kwargs
         if False:
             yield
+
+
+class RecordingTelemetry:
+    """@brief 记录测试遥测且不执行 I/O / Record test telemetry without performing I/O."""
+
+    def __init__(self) -> None:
+        """@brief 初始化捕获列表 / Initialize capture lists."""
+
+        self.metrics: list[tuple[str, dict[str, object]]] = []
+        self.logs: list[tuple[str, dict[str, object]]] = []
+
+    def record_metric(
+        self,
+        name: str,
+        value: float,
+        scope: object,
+        request_id: str | None,
+        attributes: dict[str, object],
+        **kwargs: object,
+    ) -> bool:
+        """@brief 捕获 metric / Capture one metric.
+
+        @param name 仪器名 / Instrument name.
+        @param value 指标值 / Metric value.
+        @param scope actor 范围 / Actor scope.
+        @param request_id 请求 ID / Request ID.
+        @param attributes 脱敏属性 / Redacted attributes.
+        @param kwargs 可选端口参数 / Optional port arguments.
+        @return 始终接受 / Always accepted.
+        """
+
+        del value, scope, request_id, kwargs
+        self.metrics.append((name, dict(attributes)))
+        return True
+
+    def record_log(
+        self,
+        name: str,
+        severity_number: object,
+        severity_text: str,
+        scope: object,
+        request_id: str | None,
+        attributes: dict[str, object],
+        **kwargs: object,
+    ) -> bool:
+        """@brief 捕获 log / Capture one log.
+
+        @param name 事件名 / Event name.
+        @param severity_number 严重度编号 / Severity number.
+        @param severity_text 严重度文本 / Severity text.
+        @param scope actor 范围 / Actor scope.
+        @param request_id 请求 ID / Request ID.
+        @param attributes 脱敏属性 / Redacted attributes.
+        @param kwargs 可选端口参数 / Optional port arguments.
+        @return 始终接受 / Always accepted.
+        """
+
+        del severity_number, severity_text, scope, request_id, kwargs
+        self.logs.append((name, dict(attributes)))
+        return True
+
+
+class SlowModel(SequenceModel):
+    """@brief 模拟超过 Run 总时限的模型 / Simulate a model exceeding the Run deadline."""
+
+    def __init__(self, responses: list[ModelResponse], *, delay_seconds: float = 1) -> None:
+        """@brief 创建可控延迟模型 / Create a model with a controllable delay.
+
+        @param responses 按顺序返回的模型结果 / Model responses returned in order.
+        @param delay_seconds 每次模型调用的等待秒数 / Delay in seconds for each model call.
+        """
+
+        super().__init__(responses)
+        self.delay_seconds = delay_seconds
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        """@brief 等待后返回模型结果 / Return a model result after a delay.
+
+        @param args SDK 位置参数 / SDK positional arguments.
+        @param kwargs SDK 关键字参数 / SDK keyword arguments.
+        @return 不应在超时测试中到达的结果 / A result not reached by the timeout test.
+        """
+
+        await asyncio.sleep(self.delay_seconds)
+        return await super().get_response(*args, **kwargs)
+
+
+class FailingModel(SequenceModel):
+    """@brief 抛出指定 Provider 异常 / Raise a specified provider exception."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__([])
+        self.error = error
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        """@brief 抛出测试异常 / Raise the test exception.
+
+        @param args SDK 位置参数 / SDK positional arguments.
+        @param kwargs SDK 关键字参数 / SDK keyword arguments.
+        @return 永不返回 / Never returns.
+        """
+
+        del args, kwargs
+        raise self.error
 
 
 def _request() -> AgentProviderRequest:
@@ -314,3 +422,301 @@ async def test_native_tool_call_interrupts_and_resumes_same_sdk_state() -> None:
     assert resumed.tool_invocations[0].tool_name == "resume_request_proposal_decision"
     resumed_input = model.calls[-1][0]
     assert "call_proposal_0001" in repr(resumed_input)
+
+
+@pytest.mark.asyncio
+async def test_run_deadline_returns_specific_retryable_problem() -> None:
+    model = SlowModel(
+        [_text_response("late", "response_late")],
+        delay_seconds=0.2,
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        execution_timeout_ms=50,
+    )
+    request = replace(
+        _request(),
+        spec=replace(
+            _request().spec,
+            inference=replace(_request().spec.inference, latency_budget_ms=100),
+        ),
+    )
+
+    with pytest.raises(AgentProviderFailure) as captured:
+        await provider.execute(request)
+
+    assert captured.value.problem.code == "agent.execution_timeout"
+    assert captured.value.problem.status == 504
+    assert captured.value.problem.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_latency_budget_does_not_cancel_the_agent_run() -> None:
+    model = SlowModel(
+        [_text_response("completed after latency target", "response_completed")],
+        delay_seconds=0.2,
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        execution_timeout_ms=1_000,
+    )
+    request = replace(
+        _request(),
+        spec=replace(
+            _request().spec,
+            inference=replace(_request().spec.inference, latency_budget_ms=100),
+        ),
+    )
+
+    outcome = await provider.execute(request)
+
+    assert isinstance(outcome, AgentProviderCompleted)
+    assert outcome.content == (TextContentPart("completed after latency target"),)
+
+
+@pytest.mark.asyncio
+async def test_model_behavior_error_is_not_masked_as_generic_provider_failure() -> None:
+    provider = OpenAIAgentsSDKProvider(
+        FailingModel(ModelBehaviorError("invalid tool protocol")),
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+
+    with pytest.raises(AgentProviderFailure) as captured:
+        await provider.execute(_request())
+
+    assert captured.value.problem.code == "agent.provider_protocol_error"
+    assert captured.value.problem.status == 502
+    assert captured.value.problem.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_repetitive_valid_tool_loop_returns_tool_call_budget_problem() -> None:
+    responses = [
+        _tool_response("resume_read_snapshot", "{}", f"call_snapshot_{index:02d}")
+        for index in range(20)
+    ]
+    provider = OpenAIAgentsSDKProvider(
+        SequenceModel(responses),
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+
+    with pytest.raises(AgentProviderFailure) as captured:
+        await provider.execute(_resume_request())
+
+    assert captured.value.problem.code == "agent.tool_call_budget_exhausted"
+    assert captured.value.problem.status == 503
+    assert captured.value.problem.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_proposal_decision_remains_resumable_at_tool_call_budget() -> None:
+    """@brief 编辑预算用尽也不能阻断已提交 Proposal 的决定 / Preserve proposal decisions at the tool budget."""
+
+    model = SequenceModel(
+        [
+            *[
+                _tool_response(
+                    "resume_read_snapshot",
+                    "{}",
+                    f"call_snapshot_{index:02d}",
+                )
+                for index in range(15)
+            ],
+            _tool_response(
+                "resume_draft_set_field",
+                '{"entity_id":"resume_provider_0001","field_path":["title"],'
+                '"value":"Focused title"}',
+                "call_draft_budget_0001",
+            ),
+            _tool_response(
+                "resume_request_proposal_decision",
+                '{"title":"Improve title at budget"}',
+                "call_proposal_budget_0001",
+            ),
+            _text_response("已接受建议。", "response_budget_resumed"),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+    request = _resume_request()
+
+    interrupted = await provider.execute(request)
+    assert isinstance(interrupted, AgentProviderProposalDecisionRequired)
+
+    resumed = await provider.execute(
+        replace(
+            request,
+            proposal_decision=AgentProposalDecisionContext(
+                ResourceRef("resume_proposal", "proposal_provider_budget_0001", 2),
+                "accept",
+                ResourceRef("resume", "resume_provider_0001", 2),
+            ),
+            provider_state=interrupted.provider_state,
+        )
+    )
+
+    assert isinstance(resumed, AgentProviderCompleted)
+    assert resumed.content == (TextContentPart("已接受建议。"),)
+    assert resumed.tool_invocations[0].tool_name == "resume_request_proposal_decision"
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_arguments_are_returned_to_model_for_recovery() -> None:
+    model = SequenceModel(
+        [
+            _tool_response(
+                "resume_draft_set_fields",
+                '{"updates":[]}',
+                "call_invalid_batch_0001",
+            ),
+            _tool_response(
+                "resume_draft_set_field",
+                '{"entity_id":"resume_provider_0001","field_path":["title"],'
+                '"value":"Recovered title"}',
+                "call_recovered_draft_0001",
+            ),
+            _tool_response(
+                "resume_request_proposal_decision",
+                '{"title":"Recover from malformed batch arguments"}',
+                "call_recovered_proposal_0001",
+            ),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+
+    outcome = await provider.execute(_resume_request())
+
+    assert isinstance(outcome, AgentProviderProposalDecisionRequired)
+    assert [trace.status for trace in outcome.tool_invocations] == [
+        "invalid",
+        "completed",
+        "decision_required",
+    ]
+    assert "invalid_tool_arguments" in repr(model.calls[1][0])
+    invalid_trace = outcome.tool_invocations[0]
+    assert invalid_trace.result_kind == "invalid_tool_arguments"
+    assert invalid_trace.result_code == "agent.tool_arguments_invalid"
+    assert invalid_trace.validation_phase == "arguments_schema"
+    assert invalid_trace.consecutive_invalid_count == 1
+    assert invalid_trace.argument_signature is not None
+
+
+@pytest.mark.asyncio
+async def test_date_normalization_emits_content_free_tool_telemetry() -> None:
+    """@brief 日期归一化进入遥测但不泄漏原文 / Emit date telemetry without raw content."""
+
+    arguments = {
+        "section": {
+            "id": "tmp_section_experience_01",
+            "kind": "experience",
+            "title": "工作经历",
+            "visible": True,
+            "content": None,
+            "items": [
+                {
+                    "id": "tmp_item_experience_01",
+                    "kind": "experience",
+                    "title": "高级前端工程师",
+                    "subtitle": None,
+                    "organization": "示例公司",
+                    "location": None,
+                    "date_range": {
+                        "start": "２０２４．３",
+                        "end": "至今",
+                    },
+                    "summary": None,
+                    "highlights": [],
+                    "skills": [],
+                    "tags": [],
+                    "visible": True,
+                    "url": None,
+                }
+            ],
+        },
+        "after_section_id": None,
+    }
+    model = SequenceModel(
+        [
+            _tool_response(
+                "resume_draft_upsert_section",
+                json.dumps(arguments, ensure_ascii=False),
+                "call_normalized_date_0001",
+            ),
+            _tool_response(
+                "resume_request_proposal_decision",
+                '{"title":"新增工作经历"}',
+                "call_normalized_date_proposal_0001",
+            ),
+        ]
+    )
+    telemetry = RecordingTelemetry()
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+        telemetry=telemetry,  # type: ignore[arg-type]
+    )
+
+    outcome = await provider.execute(_resume_request())
+
+    assert isinstance(outcome, AgentProviderProposalDecisionRequired)
+    tool_attributes = next(
+        attributes
+        for name, attributes in telemetry.metrics
+        if name == "aiws.agent.tool.count"
+        and attributes["operation"] == "resume_draft_upsert_section"
+    )
+    assert tool_attributes["date_normalization_count"] == 1
+    assert tool_attributes["date_normalization_applied"] is True
+    serialized = repr((telemetry.metrics, telemetry.logs))
+    assert "２０２４" not in serialized
+    assert "至今" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_repeated_identical_invalid_call_stops_with_recovery_error() -> None:
+    model = SequenceModel(
+        [
+            _tool_response(
+                "resume_draft_set_fields",
+                '{"updates":[]}',
+                "call_invalid_batch_0001",
+            ),
+            _tool_response(
+                "resume_draft_set_fields",
+                '{"updates":[]}',
+                "call_invalid_batch_0002",
+            ),
+        ]
+    )
+    provider = OpenAIAgentsSDKProvider(
+        model,
+        input_cost_microusd_per_million_tokens=0,
+        output_cost_microusd_per_million_tokens=0,
+    )
+
+    with pytest.raises(AgentProviderFailure) as captured:
+        await provider.execute(_resume_request())
+
+    assert captured.value.problem.code == "agent.tool_recovery_exhausted"
+    assert captured.value.problem.status == 502
+    assert captured.value.problem.retryable is True
+    assert len(captured.value.invocations) == 2
+    assert captured.value.invocations[-1].consecutive_invalid_count == 2
+    assert (
+        captured.value.invocations[0].argument_signature
+        == captured.value.invocations[1].argument_signature
+    )
