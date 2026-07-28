@@ -1160,12 +1160,6 @@ async def test_proposal_decision_remains_resumable_at_tool_call_budget() -> None
         meta=request.resume_context.document.meta.advance(NOW),
     )
 
-    assert request.resume_context is not None
-    accepted_ref = ResourceRef("resume", "resume_provider_0001", 2)
-    accepted_document = replace(
-        request.resume_context.document,
-        meta=request.resume_context.document.meta.advance(NOW),
-    )
     resumed = await provider.execute(
         replace(
             request,
