@@ -61,13 +61,22 @@ class AgentProviderFailure(RuntimeError):
     problem: ProblemDetails
     """@brief 已脱敏且可持久化的问题 / Redacted persistable problem."""
 
-    def __init__(self, problem: ProblemDetails) -> None:
+    invocations: tuple[AgentToolInvocationTrace, ...]
+    """@brief 失败前产生的不含内容工具轨迹 / Content-free tool traces produced before failure."""
+
+    def __init__(
+        self,
+        problem: ProblemDetails,
+        invocations: tuple[AgentToolInvocationTrace, ...] = (),
+    ) -> None:
         """@brief 初始化 provider 失败 / Initialize a provider failure.
 
         @param problem 已脱敏 ProblemDetails / Redacted Problem Details.
+        @param invocations 失败前工具诊断 / Tool diagnostics produced before failure.
         """
         super().__init__(problem.code)
         self.problem = problem
+        self.invocations = invocations
 
 
 class AgentProposalFailure(RuntimeError):

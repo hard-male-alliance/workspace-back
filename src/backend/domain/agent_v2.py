@@ -590,15 +590,22 @@ class AgentProposalDecisionContext:
 
 @dataclass(frozen=True, slots=True)
 class AgentToolInvocationTrace:
-    """Content-free diagnostic record for one narrow Agent tool invocation."""
+    """@brief 一次窄工具调用的不含内容诊断 / Content-free diagnostic for one narrow tool call."""
 
     ordinal: int
     tool_name: str
     argument_keys: tuple[str, ...]
     status: str
     duration_ms: float
+    result_kind: str | None = None
+    result_code: str | None = None
+    validation_phase: str | None = None
+    argument_signature: str | None = None
+    consecutive_invalid_count: int = 0
 
     def __post_init__(self) -> None:
+        """@brief 校验诊断字段有界且不含工具内容 / Validate bounded content-free diagnostics."""
+
         if (
             isinstance(self.ordinal, bool)
             or self.ordinal < 1
@@ -609,6 +616,38 @@ class AgentToolInvocationTrace:
             or self.status not in {"completed", "invalid", "failure", "decision_required"}
             or isinstance(self.duration_ms, bool)
             or not 0 <= self.duration_ms <= 3_600_000
+            or (
+                self.result_kind is not None
+                and (not self.result_kind or len(self.result_kind) > 100)
+            )
+            or (
+                self.result_code is not None
+                and (not self.result_code or len(self.result_code) > 200)
+            )
+            or (
+                self.validation_phase is not None
+                and self.validation_phase
+                not in {
+                    "tool",
+                    "arguments_schema",
+                    "domain_validation",
+                    "entity_resolution",
+                    "draft_conflict",
+                    "provider_protocol",
+                }
+            )
+            or (
+                self.argument_signature is not None
+                and (
+                    len(self.argument_signature) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in self.argument_signature
+                    )
+                )
+            )
+            or isinstance(self.consecutive_invalid_count, bool)
+            or not 0 <= self.consecutive_invalid_count <= 1_000
         ):
             raise AgentDomainError("Agent tool invocation diagnostic is invalid")
 

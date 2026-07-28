@@ -28,6 +28,7 @@ from backend.application.ports.agent_v2 import (
     AgentPermissionGrant,
     AgentPermissionRequest,
     AgentPolicyDenied,
+    AgentProviderFailure,
     AgentResumeProposalCommand,
     AgentRunPolicyRequest,
     AgentToolDecisionClaim,
@@ -48,6 +49,7 @@ from backend.domain.agent_v2 import (
     AgentRunQueuedDispatch,
     AgentRunSpec,
     AgentRunStatus,
+    AgentToolInvocationTrace,
     AgentUsage,
     Conversation,
     ConversationCapability,
@@ -73,7 +75,7 @@ from backend.domain.knowledge_retrieval import (
     KnowledgeSelectionMode,
 )
 from backend.domain.knowledge_sources import ModelRegion
-from backend.domain.platform import AuditEvent, Job, JobId
+from backend.domain.platform import AuditEvent, Job, JobId, ProblemDetails
 from backend.domain.principals import (
     ClientId,
     ResourceMeta,
@@ -135,6 +137,7 @@ class State:
     active_transactions: int = 0
     malicious_conversation: Conversation | None = None
     policy_denied: bool = False
+    invocation_commands: list[AgentToolInvocationCommand] = field(default_factory=list)
 
 
 class FakeAuthorizer:
@@ -397,6 +400,11 @@ class FakeAudit:
 class FakeResumeProposals:
     """通用 Agent 测试不启用 Resume Proposal 持久边界。"""
 
+    def __init__(self, state: State) -> None:
+        """@brief 绑定工具诊断探针 / Bind the tool-diagnostic probe."""
+
+        self.state = state
+
     async def load_base(
         self,
         workspace_id: WorkspaceId,
@@ -410,8 +418,7 @@ class FakeResumeProposals:
         raise AssertionError("unexpected Resume Proposal creation")
 
     async def record_invocations(self, command: AgentToolInvocationCommand) -> None:
-        del command
-        raise AssertionError("unexpected Agent tool invocation persistence")
+        self.state.invocation_commands.append(command)
 
 
 class FakeUow:
@@ -423,7 +430,7 @@ class FakeUow:
         self.jobs = FakeJobs(state)
         self.outbox = FakeOutbox(state)
         self.audit = FakeAudit(state)
-        self.resume_proposals = FakeResumeProposals()
+        self.resume_proposals = FakeResumeProposals(state)
         self.committed = False
 
     async def __aenter__(self) -> FakeUow:
@@ -1321,6 +1328,81 @@ async def test_provider_failure_is_persisted_and_never_leaks_exception_text() ->
     assert failed.problem.code == "agent.provider_failed"
     assert "secret" not in str(failed.problem)
     assert state.jobs[state.runs[run.meta.id].job_id].status.value == "failed"
+
+
+@pytest.mark.asyncio
+async def test_controlled_provider_failure_persists_content_free_tool_traces() -> None:
+    """@brief 受控失败应与 Run 终态原子保存工具诊断 / Persist tool diagnostics with a controlled failure."""
+
+    state = State()
+    ids = DeterministicIds()
+    service = _service(state, ids)
+    conversation = await service.create_conversation(
+        PRINCIPAL,
+        WORKSPACE,
+        CreateConversationCommand(ConversationCapability.GENERAL, "trace failure"),
+        CONTEXT,
+    )
+    message = await service.create_message(
+        PRINCIPAL,
+        WORKSPACE,
+        conversation.meta.id,
+        CreateMessageCommand(None, (TextContentPart("hello"),)),
+        expected_conversation_revision=1,
+        context=CONTEXT,
+    )
+    run = await service.create_agent_run(
+        PRINCIPAL,
+        WORKSPACE,
+        _spec(conversation.meta.id, message.meta.id),
+        CONTEXT,
+    )
+    trace = AgentToolInvocationTrace(
+        1,
+        "resume_draft_set_fields",
+        ("updates",),
+        "invalid",
+        12.5,
+        result_kind="invalid_tool_arguments",
+        result_code="agent.tool_arguments_invalid",
+        validation_phase="arguments_schema",
+        argument_signature="a" * 64,
+        consecutive_invalid_count=1,
+    )
+    problem = ProblemDetails(
+        "https://errors.example.test/agent/tool-recovery-exhausted",
+        "Agent tool recovery exhausted",
+        502,
+        "agent.tool_recovery_exhausted",
+        str(run.meta.id),
+        True,
+    )
+
+    class ControlledFailingProvider:
+        """@brief 返回带诊断轨迹的受控失败 / Return a controlled failure with traces."""
+
+        async def execute(self, request: object) -> object:
+            """@brief 在事务外抛出受控失败 / Raise the controlled failure outside a transaction."""
+
+            del request
+            assert state.active_transactions == 0
+            raise AgentProviderFailure(problem, (trace,))
+
+    worker = AgentWorkerService(
+        FakeWorkerUowFactory(state),
+        ControlledFailingProvider(),  # type: ignore[arg-type]
+        FakeToolExecutor(state),
+        clock=FixedClock(),
+        id_factory=ids,
+    )
+
+    failed = await worker.execute_run(_queued_dispatch(state, run.meta.id))
+
+    assert failed.status is AgentRunStatus.FAILED
+    assert failed.problem == problem
+    assert len(state.invocation_commands) == 1
+    assert state.invocation_commands[0].invocations == (trace,)
+    assert state.invocation_commands[0].proposal_ref is None
 
 
 @pytest.mark.asyncio

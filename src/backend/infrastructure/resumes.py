@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -78,12 +80,15 @@ from backend.domain.resume_jobs import (
 from backend.domain.resume_proposals import ResumeProposal, ResumeProposalStatus
 from backend.domain.resumes import (
     ChangeTarget,
+    DateRange,
     OperationLedgerEntry,
     PageSize,
+    PartialDate,
     ResourceRef,
     Resume,
     ResumeBatchId,
     ResumeDocument,
+    ResumeDomainError,
     ResumeId,
     ResumeOperation,
     ResumeOperationId,
@@ -308,6 +313,262 @@ def encode_resume_operation(operation: ResumeOperation) -> JsonObject:
     """
 
     return _dump_object(_OPERATION_ADAPTER, operation)
+
+
+def decode_resume_operation_wire(payload: Mapping[str, object]) -> ResumeOperation:
+    """@brief 从公开线格式解码 Resume operation / Decode a Resume operation from public wire format.
+
+    @param payload 使用字符串日期和 ``present`` sentinel 的公开 JSON / Public JSON using
+        string dates and the ``present`` sentinel.
+    @return 完整验证的领域 operation / Fully validated domain operation.
+    @note 持久化 codec 保留领域 dataclass 结构；本边界只负责稳定公开格式与内部格式之间的
+        转换。/ The persistence codec keeps the domain dataclass shape; this boundary only
+        translates between the stable public shape and the internal representation.
+    """
+
+    normalized = normalize_resume_operation_wire(payload)
+    for item in _operation_item_payloads(normalized):
+        date_range = item.get("date_range")
+        if date_range is not None:
+            item["date_range"] = _date_range_wire_to_internal(date_range)
+    return decode_resume_operation(normalized)
+
+
+def normalize_resume_operation_wire(payload: Mapping[str, object]) -> JsonObject:
+    """@brief 归一化 operation 中无歧义日期 / Normalize unambiguous dates in an operation.
+
+    @param payload 使用公开 Resume operation 结构的 JSON / JSON using the public Resume
+        operation shape.
+    @return 只规范化结构化日期字段的新 JSON / New JSON with only structured date fields
+        normalized.
+    @raise ResumeDomainError 日期歧义、格式不支持或日历值无效时抛出 /
+        Raised for ambiguous, unsupported, or invalid calendar dates.
+    """
+
+    normalized = deepcopy(dict(payload))
+    for item in _operation_item_payloads(normalized):
+        date_range = item.get("date_range")
+        if date_range is not None:
+            item["date_range"] = _normalize_date_range_wire(date_range)
+    return cast(JsonObject, normalized)
+
+
+def encode_resume_operation_wire(operation: ResumeOperation) -> JsonObject:
+    """@brief 将 Resume operation 编码为公开线格式 / Encode a Resume operation to public wire format.
+
+    @param operation 已验证的领域 operation / Validated domain operation.
+    @return 使用字符串日期和 ``present`` sentinel 的 JSON / JSON using string dates and
+        the ``present`` sentinel.
+    """
+
+    payload = encode_resume_operation(operation)
+    for item in _operation_item_payloads(payload):
+        date_range = item.get("date_range")
+        if date_range is not None:
+            item["date_range"] = _date_range_internal_to_wire(date_range)
+    return payload
+
+
+def _operation_item_payloads(payload: dict[str, object]) -> tuple[dict[str, object], ...]:
+    """@brief 返回 operation 中结构化 item payload / Return structured item payloads in an operation.
+
+    @param payload 可变 operation JSON / Mutable operation JSON.
+    @return upsert section 或 item 内的条目 / Items nested in an upsert section or item.
+    """
+
+    operation = payload.get("op")
+    if operation == "upsert_item":
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            raise ValueError("Resume operation item must be an object")
+        return (item,)
+    if operation != "upsert_section":
+        return ()
+    section = payload.get("section")
+    if not isinstance(section, dict):
+        raise ValueError("Resume operation section must be an object")
+    items = section.get("items")
+    if not isinstance(items, (list, tuple)):
+        raise ValueError("Resume section items must be an array")
+    if not all(isinstance(item, dict) for item in items):
+        raise ValueError("Resume section items must be objects")
+    return tuple(cast(dict[str, object], item) for item in items)
+
+
+def _date_range_wire_to_internal(value: object) -> JsonObject:
+    """@brief 将公开日期范围转换为领域持久形状 / Convert a public date range to domain storage shape.
+
+    @param value ``start``/``end`` 字符串对象 / Object containing string ``start`` and ``end``.
+    @return Pydantic 领域 codec 可解码的日期对象 / Date object accepted by the domain codec.
+    """
+
+    normalized = _normalize_date_range_wire(value)
+    start = normalized["start"]
+    end = normalized["end"]
+    start_date = PartialDate(start) if isinstance(start, str) else None
+    end_date = (
+        PartialDate(end)
+        if isinstance(end, str) and end != "present"
+        else None
+    )
+    DateRange(start_date, end_date, present=end == "present")
+    return {
+        "start": None if start is None else {"value": start},
+        "end": None if end is None or end == "present" else {"value": end},
+        "present": end == "present",
+    }
+
+
+class ResumeDateNormalizationError(ResumeDomainError):
+    """@brief 带脱敏原因的日期归一化错误 / Date-normalization error with a safe reason.
+
+    @param reason 不含输入内容的诊断原因 / Diagnostic reason without input content.
+    """
+
+    reason: str
+    """@brief 可进入遥测的有界原因 / Bounded reason safe for telemetry."""
+
+    def __init__(self, reason: str) -> None:
+        """@brief 初始化兼容错误码 / Initialize with the compatible public error code.
+
+        @param reason 不含原始日期的拒绝分类 / Rejection category without the raw date.
+        """
+
+        super().__init__("resume.invalid_date", "partial date is invalid")
+        self.reason = reason
+
+
+_PRESENT_ALIASES = frozenset(
+    {
+        "present",
+        "current",
+        "now",
+        "至今",
+        "现在",
+        "目前",
+    }
+)
+"""@brief 无歧义的进行中日期别名 / Unambiguous aliases for an ongoing date range."""
+
+_YEAR_FIRST_DATE = re.compile(
+    r"^(?P<year>[0-9]{4})(?:(?P<separator>[-./])(?P<month>[0-9]{1,2})"
+    r"(?:(?P=separator)(?P<day>[0-9]{1,2}))?)?$"
+)
+"""@brief 年优先数字日期 / Year-first numeric date."""
+
+_CHINESE_DATE = re.compile(
+    r"^(?P<year>[0-9]{4})年(?:(?P<month>[0-9]{1,2})月"
+    r"(?:(?P<day>[0-9]{1,2})日)?)?$"
+)
+"""@brief 中文年月日日期 / Chinese year-month-day date."""
+
+_DAY_MONTH_YEAR_DATE = re.compile(
+    r"^[0-9]{1,2}[-./][0-9]{1,2}[-./][0-9]{4}$"
+)
+"""@brief 可能混淆月日顺序的日期 / Date with an ambiguous month/day order."""
+
+
+def _normalize_date_range_wire(value: object) -> JsonObject:
+    """@brief 归一化公开日期范围 / Normalize a public date range.
+
+    @param value 含 ``start`` 与 ``end`` 的公开对象 / Public object with ``start`` and ``end``.
+    @return 规范日期范围 / Canonical date range.
+    """
+
+    if not isinstance(value, Mapping) or set(value) != {"start", "end"}:
+        raise ValueError("Resume date range must contain exactly start and end")
+    start = value.get("start")
+    end = value.get("end")
+    if start is not None and not isinstance(start, str):
+        raise ValueError("Resume date range start must be a string or null")
+    if end is not None and not isinstance(end, str):
+        raise ValueError("Resume date range end must be a string or null")
+    normalized_start = (
+        None if start is None else _normalize_partial_date_wire(start)
+    )
+    normalized_end: str | None
+    if end is None:
+        normalized_end = None
+    elif _normalized_date_text(end).casefold() in _PRESENT_ALIASES:
+        normalized_end = "present"
+    else:
+        normalized_end = _normalize_partial_date_wire(end)
+    return {"start": normalized_start, "end": normalized_end}
+
+
+def _normalize_partial_date_wire(value: str) -> str:
+    """@brief 将无歧义本地日期转为年优先格式 / Normalize an unambiguous local date.
+
+    @param value 未信任的日期字符串 / Untrusted date string.
+    @return ``YYYY``、``YYYY-MM`` 或 ``YYYY-MM-DD`` / Canonical partial date.
+    """
+
+    normalized = _normalized_date_text(value)
+    if normalized.casefold() in _PRESENT_ALIASES:
+        raise ResumeDateNormalizationError("invalid_present_position")
+    matched = _YEAR_FIRST_DATE.fullmatch(normalized)
+    if matched is None:
+        matched = _CHINESE_DATE.fullmatch(normalized)
+    if matched is None:
+        reason = (
+            "ambiguous_order"
+            if _DAY_MONTH_YEAR_DATE.fullmatch(normalized)
+            else "unsupported_format"
+        )
+        raise ResumeDateNormalizationError(reason)
+    year = int(matched.group("year"))
+    month_text = matched.group("month")
+    day_text = matched.group("day")
+    canonical = f"{year:04d}"
+    if month_text is not None:
+        canonical += f"-{int(month_text):02d}"
+    if day_text is not None:
+        canonical += f"-{int(day_text):02d}"
+    try:
+        PartialDate(canonical)
+    except ResumeDomainError as error:
+        raise ResumeDateNormalizationError("invalid_calendar_date") from error
+    return canonical
+
+
+def _normalized_date_text(value: str) -> str:
+    """@brief 规范 Unicode 与无语义空白 / Normalize Unicode and insignificant whitespace.
+
+    @param value 原始日期字符串 / Raw date string.
+    @return 适合确定性匹配的文本 / Text suitable for deterministic matching.
+    """
+
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).strip())
+
+
+def _date_range_internal_to_wire(value: object) -> JsonObject:
+    """@brief 将领域持久日期转换为公开日期范围 / Convert a stored domain date to public range.
+
+    @param value Pydantic 序列化的 ``DateRange`` / Pydantic-serialized ``DateRange``.
+    @return ``start``/``end`` 公开对象 / Public ``start``/``end`` object.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError("Persisted Resume date range must be an object")
+    start = value.get("start")
+    end = value.get("end")
+    present = value.get("present")
+    if start is not None and not isinstance(start, Mapping):
+        raise ValueError("Persisted Resume date range start is invalid")
+    if end is not None and not isinstance(end, Mapping):
+        raise ValueError("Persisted Resume date range end is invalid")
+    if not isinstance(present, bool):
+        raise ValueError("Persisted Resume date range present flag is invalid")
+    start_value = None if start is None else start.get("value")
+    end_value = None if end is None else end.get("value")
+    if start_value is not None and not isinstance(start_value, str):
+        raise ValueError("Persisted Resume date range start value is invalid")
+    if end_value is not None and not isinstance(end_value, str):
+        raise ValueError("Persisted Resume date range end value is invalid")
+    return {
+        "start": start_value,
+        "end": "present" if present else end_value,
+    }
 
 
 def _row_id(prefix: str) -> str:
@@ -2736,5 +2997,8 @@ __all__ = [
     "PostgresResumeWorkerUnitOfWorkFactory",
     "decode_resume_document",
     "decode_resume_operation",
+    "decode_resume_operation_wire",
     "encode_resume_operation",
+    "encode_resume_operation_wire",
+    "normalize_resume_operation_wire",
 ]
