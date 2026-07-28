@@ -10,6 +10,7 @@ dispatcher retains lease, retry, and cross-Workspace scanning responsibilities.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, TypeIs
 
@@ -61,9 +62,18 @@ _TOOL_DECISION_PAYLOAD_FIELDS = frozenset(
 )
 """@brief 工具决定 payload 的封闭字段集 / Closed field set for a tool-decision payload."""
 
-_PROPOSAL_DECISION_PAYLOAD_FIELDS = frozenset(
+_PROPOSAL_DECISION_EVENT_PAYLOAD_FIELDS = frozenset(
+    {"actor_id", "subject", "data"}
+)
+"""@brief Resume outbox 标准 envelope 的封闭字段集 / Closed fields for the standard Resume outbox envelope."""
+
+_PROPOSAL_DECISION_SUBJECT_FIELDS = frozenset({"resource_type", "id", "revision"})
+"""@brief Resume outbox subject 的封闭字段集 / Closed fields for the Resume outbox subject."""
+
+_PROPOSAL_DECISION_DATA_FIELDS = frozenset(
     {"actor_id", "run_id", "decision", "resume_id", "resume_revision"}
 )
+"""@brief Resume 到 Agent 续跑数据的封闭字段集 / Closed fields for Resume-to-Agent continuation data."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,21 +344,40 @@ def _proposal_decision_claim(
     """Strictly validate the Resume-to-Agent continuation envelope."""
 
     payload = claim.payload
+    envelope_actor_id = payload.get("actor_id")
+    subject = payload.get("subject")
+    data = payload.get("data")
     if (
         claim.event_type != _PROPOSAL_DECISION_EVENT_TYPE
         or claim.subject.resource_type != "resume_proposal"
         or claim.subject.revision is None
-        or frozenset(payload) != _PROPOSAL_DECISION_PAYLOAD_FIELDS
+        or frozenset(payload) != _PROPOSAL_DECISION_EVENT_PAYLOAD_FIELDS
+        or not isinstance(envelope_actor_id, str)
+        or envelope_actor_id != claim.actor_id
+        or not isinstance(subject, Mapping)
+        or frozenset(subject) != _PROPOSAL_DECISION_SUBJECT_FIELDS
+        or not isinstance(data, Mapping)
+        or frozenset(data) != _PROPOSAL_DECISION_DATA_FIELDS
     ):
         raise OutboxHandlerFailure("agent.proposal_decision_event_invalid")
-    actor_id = payload.get("actor_id")
-    run_id = payload.get("run_id")
-    decision = payload.get("decision")
-    resume_id = payload.get("resume_id")
-    resume_revision = payload.get("resume_revision")
+    subject_resource_type = subject.get("resource_type")
+    subject_id = subject.get("id")
+    subject_revision = subject.get("revision")
+    actor_id = data.get("actor_id")
+    run_id = data.get("run_id")
+    decision = data.get("decision")
+    resume_id = data.get("resume_id")
+    resume_revision = data.get("resume_revision")
     if (
-        not isinstance(actor_id, str)
+        not isinstance(subject_resource_type, str)
+        or subject_resource_type != claim.subject.resource_type
+        or not isinstance(subject_id, str)
+        or subject_id != claim.subject.id
+        or not _is_positive_int(subject_revision)
+        or subject_revision != claim.subject.revision
+        or not isinstance(actor_id, str)
         or actor_id != claim.actor_id
+        or actor_id != envelope_actor_id
         or not isinstance(run_id, str)
         or not isinstance(decision, str)
         or decision not in {"accept", "accept_selected", "reject"}

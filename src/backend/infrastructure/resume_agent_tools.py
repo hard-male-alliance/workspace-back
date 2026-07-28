@@ -62,6 +62,12 @@ class _SetProfileFieldInput(_ClosedInput):
     value: JsonValue
 
 
+class _SetDocumentTitleInput(_ClosedInput):
+    """@brief 简历文档标题输入 / Resume document-title input."""
+
+    value: str = Field(min_length=1, max_length=300)
+
+
 class _ProfileFieldUpdateInput(_ClosedInput):
     """@brief 同构批量中的候选人字段更新 / Profile-field update in a homogeneous batch."""
 
@@ -582,6 +588,23 @@ class ResumeToolSession:
 def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]:
     """Build the small LangChain instruction set for an authorized Run."""
 
+    def set_document_title(value: str) -> str:
+        """@brief 暂存简历文档标题修改 / Stage a Resume document-title change.
+
+        @param value 编辑器与简历列表使用的文档标题 / Document title used by the editor and Resume list.
+        @return 结构化草稿验证结果 / Structured draft-validation result.
+        @note 服务端绑定简历根身份 / The server binds the Resume root identity.
+        """
+
+        return session.stage(
+            {
+                "op": "set_field",
+                "entity_id": str(session.context.document.meta.id),
+                "field_path": ("title",),
+                "value": value,
+            }
+        )
+
     def set_profile_field(field: str, value: JsonValue) -> str:
         return session.stage(
             {
@@ -961,6 +984,16 @@ def resume_agent_tools(session: ResumeToolSession) -> tuple[StructuredTool, ...]
             name="resume_read_item",
             description="Read one Resume item by semantic item ID.",
             args_schema=_ItemInput,
+        ),
+        StructuredTool.from_function(
+            func=set_document_title,
+            name="resume_draft_set_document_title",
+            description=(
+                "Stage the Resume document title shown in the editor and Resume list. "
+                "This is not the candidate full name, professional headline, section title, "
+                "or item title. The server binds the Resume root identity."
+            ),
+            args_schema=_SetDocumentTitleInput,
         ),
         StructuredTool.from_function(
             func=set_profile_field,

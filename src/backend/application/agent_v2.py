@@ -9,12 +9,13 @@ Run、ToolApproval、统一 Job、outbox 与 audit 在一个 UoW 中提交。外
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol
 
 from backend.application.ports.agent_v2 import (
     AgentCasMismatch,
+    AgentContextRevisionSuperseded,
     AgentModelProvider,
     AgentPage,
     AgentPageRequest,
@@ -43,6 +44,7 @@ from backend.domain.agent_v2 import (
     AgentDomainError,
     AgentExecutionGrant,
     AgentOutboxId,
+    AgentOutputMode,
     AgentProposalDecisionContext,
     AgentProviderApprovalRequired,
     AgentProviderCompleted,
@@ -1207,6 +1209,12 @@ class _PreparedAgentExecution:
     job: Job
     """@brief 与 Run revision 对齐的 running Job / Running Job aligned with the Run revision."""
 
+    execution_spec: AgentRunSpec
+    """Exact spec authorized for this provider attempt."""
+
+    grant: AgentExecutionGrant
+    """Exact grant authorized for this provider attempt."""
+
     input_message: Message
     """@brief 精确用户输入 / Exact user input."""
 
@@ -1296,6 +1304,11 @@ class AgentWorkerService:
             )
         except AgentProposalFailure as error:
             return await self._record_preflight_failure(dispatch, error.problem)
+        except (AgentDomainError, AgentPortProtocolError):
+            return await self._record_preflight_failure(
+                dispatch,
+                _preflight_state_problem(run_id),
+            )
         if isinstance(prepared, AgentRunView):
             return prepared
         try:
@@ -1357,7 +1370,15 @@ class AgentWorkerService:
     ) -> AgentRunView:
         """Resume the same Agent Run after a committed human Proposal decision."""
 
-        prepared = await self._prepare_proposal_continuation(dispatch)
+        try:
+            prepared = await self._prepare_proposal_continuation(dispatch)
+        except AgentContextRevisionSuperseded as error:
+            if _is_accepted_proposal_resume_superseded(dispatch, error):
+                return await self._record_proposal_continuation_failure(
+                    dispatch,
+                    _resume_authority_changed_problem(dispatch.run_id),
+                )
+            raise
         if isinstance(prepared, AgentRunView):
             return prepared
         decision_context = AgentProposalDecisionContext(
@@ -1385,6 +1406,11 @@ class AgentWorkerService:
             )
         except asyncio.CancelledError:
             raise
+        except AgentContextRevisionSuperseded as error:
+            if _is_accepted_proposal_resume_superseded(dispatch, error):
+                problem = _resume_authority_changed_problem(dispatch.run_id)
+            else:
+                raise
         except AgentProviderFailure as error:
             problem = error.problem
             invocations = error.invocations
@@ -1402,6 +1428,58 @@ class AgentWorkerService:
             problem,
             invocations=invocations,
         )
+
+    async def _record_proposal_continuation_failure(
+        self,
+        dispatch: AgentProposalDecisionClaim,
+        problem: ProblemDetails,
+    ) -> AgentRunView:
+        """Atomically close a committed Proposal continuation before provider I/O."""
+
+        failed_at = self._clock.now()
+        try:
+            async with self._uow_factory(
+                dispatch.workspace_id,
+                dispatch.actor_id,
+            ) as uow:
+                run = await _worker_run(
+                    uow,
+                    dispatch.workspace_id,
+                    dispatch.run_id,
+                    for_update=True,
+                )
+                job = await _worker_job(
+                    uow,
+                    dispatch.workspace_id,
+                    run.job_id,
+                    for_update=True,
+                )
+                validate_run_job_alignment(run, job)
+                if run.is_terminal:
+                    await uow.commit()
+                    return run.view
+                _require_proposal_continuation_failure_binding(run, job, dispatch)
+                failed_run = run.fail(problem, at=failed_at)
+                failed_job = job.fail(problem, at=failed_at)
+                validate_run_job_alignment(failed_run, failed_job)
+                await uow.repository.save_run(
+                    failed_run,
+                    expected_revision=run.meta.revision,
+                )
+                await uow.jobs.save(
+                    failed_job,
+                    expected_revision=job.meta.revision,
+                )
+                await uow.outbox.add(
+                    self._run_state_dispatch(failed_run, failed_job, failed_at)
+                )
+                await uow.commit()
+                return failed_run.view
+        except AgentCasMismatch as error:
+            raise AgentConflict(
+                "agent_run.worker_race",
+                "agent run changed while its Proposal continuation failure was committed",
+            ) from error
 
     async def _prepare_proposal_continuation(
         self,
@@ -1490,6 +1568,10 @@ class AgentWorkerService:
                     resumed_run.spec.conversation_id,
                     input_message,
                 )
+                continuation_spec = _proposal_continuation_spec(
+                    resumed_run,
+                    dispatch,
+                )
                 grant = await _refresh_execution_grant(
                     uow,
                     resumed_run.created_by,
@@ -1497,8 +1579,14 @@ class AgentWorkerService:
                     resumed_run,
                     conversation,
                     input_message,
+                    spec=continuation_spec,
                 )
-                if grant != resumed_run.grant:
+                if not _is_committed_proposal_resume_grant_delta(
+                    resumed_run,
+                    dispatch,
+                    continuation_spec,
+                    grant,
+                ):
                     raise AgentPolicyDenied(
                         "execution grant changed while awaiting Proposal decision"
                     )
@@ -1510,6 +1598,8 @@ class AgentWorkerService:
                 return _PreparedAgentExecution(
                     resumed_run,
                     resumed_job,
+                    continuation_spec,
+                    grant,
                     input_message,
                     history,
                     resume_context,
@@ -1619,6 +1709,8 @@ class AgentWorkerService:
                 return _PreparedAgentExecution(
                     started_run,
                     started_job,
+                    started_run.spec,
+                    started_run.grant,
                     input_message,
                     conversation_history,
                     resume_context,
@@ -1682,8 +1774,8 @@ class AgentWorkerService:
         """@brief 构造由 Provider 原生工具按需检索的请求 / Build a request whose Provider retrieves on demand via a native tool."""
         return AgentProviderRequest(
             run_id=prepared.run.meta.id,
-            spec=prepared.run.spec,
-            grant=prepared.run.grant,
+            spec=prepared.execution_spec,
+            grant=prepared.grant,
             input_message=prepared.input_message,
             actor_id=prepared.run.created_by,
             resume_context=prepared.resume_context,
@@ -1744,6 +1836,7 @@ class AgentWorkerService:
                     current,
                     conversation,
                     input_message,
+                    spec=request.spec,
                 )
                 if grant != request.grant:
                     raise AgentPolicyDenied(
@@ -1927,6 +2020,25 @@ class AgentWorkerService:
             outcome.usage,
             outcome.provider_state,
             at=finished_at,
+        )
+        prior_session = request.grant.session_ref
+        if (
+            prior_session.resource_type != "conversation"
+            or prior_session.id != run.spec.conversation_id
+            or prior_session.revision is None
+            or reservation.conversation_revision != prior_session.revision + 1
+        ):
+            raise AgentProviderFailure(_provider_protocol_problem(run.meta.id))
+        waiting_run = replace(
+            waiting_run,
+            grant=replace(
+                request.grant,
+                session_ref=ResourceRef(
+                    "conversation",
+                    run.spec.conversation_id,
+                    reservation.conversation_revision,
+                ),
+            ),
         )
         waiting_job = job.report_progress(
             JobProgress(
@@ -2505,7 +2617,15 @@ async def _load_provider_conversation_history(
     conversation_id: ConversationId,
     input_message: Message,
 ) -> tuple[Message, ...]:
-    """Load a bounded, ordered history snapshot from the exact Run conversation."""
+    """@brief 加载有界且有序的精确会话历史 / Load bounded, ordered history from the exact conversation.
+
+    @param uow 当前工作单元 / Current unit of work.
+    @param workspace_id Run 所属 Workspace / Workspace owning the Run.
+    @param conversation_id Run 所属 Conversation / Conversation owning the Run.
+    @param input_message 当前 Run 的用户输入 / User input of the current Run.
+    @return 保留全部既往用户消息、仅保留可靠助手输出的历史 / History preserving all prior user messages and only reliable assistant output.
+    @note Run 失败只表示执行未完成，不会使用户提供的信息失效 / A failed Run means execution did not complete; it does not invalidate user-provided information.
+    """
 
     collected: list[Message] = []
     after: str | None = None
@@ -2555,7 +2675,6 @@ async def _load_provider_conversation_history(
         AgentRunStatus.SUCCEEDED,
         AgentRunStatus.WAITING_FOR_PROPOSAL_DECISION,
     }
-    runs_by_input: dict[MessageId, list[AgentRun]] = {}
     for run in runs:
         if (
             run.workspace_id != workspace_id
@@ -2565,14 +2684,15 @@ async def _load_provider_conversation_history(
                 "agent.repository_scope_violation",
                 "run repository returned history outside the Run conversation",
             )
-        runs_by_input.setdefault(run.spec.input_message_id, []).append(run)
 
-    def belongs_to_complete_turn(message: Message) -> bool:
+    def belongs_to_reliable_history(message: Message) -> bool:
+        """@brief 判断消息能否安全进入后续上下文 / Decide whether a message is safe for later context.
+
+        @param message 候选历史消息 / Candidate history message.
+        @return 用户消息始终保留；助手消息仅在来源 Run 可靠时保留 / Always retain user messages; retain assistant messages only from reliable Runs.
+        """
         if message.role is MessageRole.USER:
-            linked_runs = runs_by_input.get(message.meta.id)
-            return linked_runs is None or any(
-                run.view.status in eligible_statuses for run in linked_runs
-            )
+            return True
         if message.source_run_id is None:
             return False
         return any(
@@ -2582,7 +2702,7 @@ async def _load_provider_conversation_history(
         )
 
     ordered = sorted(
-        (item for item in collected if belongs_to_complete_turn(item)),
+        (item for item in collected if belongs_to_reliable_history(item)),
         key=lambda item: (item.sequence, item.meta.id),
     )
     recent = ordered[-_PROVIDER_HISTORY_MESSAGE_LIMIT:]
@@ -2609,6 +2729,8 @@ async def _refresh_execution_grant(
     run: AgentRun,
     conversation: Conversation,
     input_message: Message,
+    *,
+    spec: AgentRunSpec | None = None,
 ) -> AgentExecutionGrant:
     """@brief 根据当前策略重新计算精确 grant / Recompute the exact grant from current policy.
 
@@ -2620,6 +2742,7 @@ async def _refresh_execution_grant(
     @param input_message 原始输入 Message / Original input Message.
     @return 经领域交叉校验的当前 grant / Current grant cross-validated by the domain.
     """
+    execution_spec = run.spec if spec is None else spec
     try:
         grant = await uow.policy.authorize_run(
             AgentRunPolicyRequest(
@@ -2627,15 +2750,121 @@ async def _refresh_execution_grant(
                 workspace_id=workspace_id,
                 conversation=conversation,
                 input_message=input_message,
-                spec=run.spec,
+                spec=execution_spec,
             )
         )
-        grant.validate_for(conversation, run.spec)
+        grant.validate_for(conversation, execution_spec)
     except AgentPolicyDenied:
         raise
     except AgentDomainError as error:
         raise AgentPolicyDenied("execution grant failed domain validation") from error
     return grant
+
+
+def _proposal_continuation_spec(
+    run: AgentRun,
+    dispatch: AgentProposalDecisionClaim,
+) -> AgentRunSpec:
+    """Bind continuation authorization to the committed authoritative Resume ref."""
+
+    if (
+        run.spec.capability is not ConversationCapability.RESUME_EDIT
+        or AgentOutputMode.RESUME_OPERATIONS not in run.spec.output_modes
+        or len(run.spec.context_refs) != 1
+        or run.spec.context_refs[0].resource_type != "resume"
+        or run.spec.context_refs[0].id != dispatch.resume_ref.id
+        or dispatch.resume_ref.resource_type != "resume"
+        or dispatch.resume_ref.revision is None
+    ):
+        raise AgentPolicyDenied("Proposal continuation has an invalid Resume context")
+    return replace(run.spec, context_refs=(dispatch.resume_ref,))
+
+
+def _is_accepted_proposal_resume_superseded(
+    dispatch: AgentProposalDecisionClaim,
+    error: AgentContextRevisionSuperseded,
+) -> bool:
+    """Return whether this exact accepted continuation lost its authoritative Resume."""
+
+    return (
+        dispatch.decision in {"accept", "accept_selected"}
+        and error.reference == dispatch.resume_ref
+    )
+
+
+def _is_committed_proposal_resume_grant_delta(
+    run: AgentRun,
+    dispatch: AgentProposalDecisionClaim,
+    continuation_spec: AgentRunSpec,
+    refreshed_grant: AgentExecutionGrant,
+) -> bool:
+    """Allow only the exact committed Resume and legacy self-output session deltas."""
+
+    previous_grant = run.grant
+    previous_contexts = previous_grant.context_refs
+    if (
+        not run.matches_proposal_decision(dispatch.proposal_ref)
+        or len(run.spec.context_refs) != 1
+        or len(continuation_spec.context_refs) != 1
+        or len(previous_contexts) != 1
+        or len(refreshed_grant.context_refs) != 1
+    ):
+        return False
+    requested_ref = run.spec.context_refs[0]
+    continuation_ref = continuation_spec.context_refs[0]
+    previous_ref = previous_contexts[0]
+    refreshed_ref = refreshed_grant.context_refs[0]
+    if (
+        requested_ref.resource_type != "resume"
+        or previous_ref.resource_type != "resume"
+        or requested_ref.id != dispatch.resume_ref.id
+        or previous_ref.id != dispatch.resume_ref.id
+        or (
+            requested_ref.revision is not None
+            and requested_ref.revision != previous_ref.revision
+        )
+        or previous_ref.revision is None
+        or continuation_ref != dispatch.resume_ref
+        or refreshed_ref != dispatch.resume_ref
+    ):
+        return False
+    if dispatch.decision == "reject":
+        if dispatch.resume_ref != previous_ref:
+            return False
+    elif dispatch.decision in {"accept", "accept_selected"}:
+        if dispatch.resume_ref.revision not in {
+            previous_ref.revision,
+            previous_ref.revision + 1,
+        }:
+            return False
+    else:
+        return False
+    previous_session = previous_grant.session_ref
+    refreshed_session = refreshed_grant.session_ref
+    if (
+        previous_session.resource_type != "conversation"
+        or refreshed_session.resource_type != "conversation"
+        or previous_session.id != run.spec.conversation_id
+        or refreshed_session.id != run.spec.conversation_id
+        or previous_session.revision is None
+        or refreshed_session.revision is None
+        or (
+            refreshed_session != previous_session
+            and (
+                run.view.output_message_id is None
+                or refreshed_session.revision != previous_session.revision + 1
+            )
+        )
+    ):
+        return False
+    return (
+        replace(
+            refreshed_grant,
+            session_ref=previous_session,
+            context_refs=previous_contexts,
+        )
+        == previous_grant
+    )
 
 
 async def _load_resume_context(
@@ -2786,6 +3015,30 @@ def _require_queued_handoff_revision(
             "agent_run.worker_revision_mismatch",
             "agent queued dispatch does not own the current run and job revisions",
         )
+
+
+def _require_proposal_continuation_failure_binding(
+    run: AgentRun,
+    job: Job,
+    dispatch: AgentProposalDecisionClaim,
+) -> None:
+    """Verify an accepted continuation still owns a resumable Proposal wait."""
+
+    if (
+        dispatch.decision not in {"accept", "accept_selected"}
+        or run.workspace_id != dispatch.workspace_id
+        or run.created_by != dispatch.actor_id
+        or run.meta.id != dispatch.run_id
+        or not run.matches_proposal_decision(dispatch.proposal_ref)
+        or job.progress is None
+        or job.progress.phase
+        not in {"waiting_for_proposal_decision", "proposal_decision_recorded"}
+    ):
+        raise AgentPortProtocolError(
+            "agent.proposal_continuation_binding_mismatch",
+            "Proposal continuation does not own the waiting Agent Run",
+        )
+    _proposal_continuation_spec(run, dispatch)
 
 
 async def _worker_job(
@@ -3010,6 +3263,23 @@ def _provider_protocol_problem(run_id: AgentRunId) -> ProblemDetails:
     )
 
 
+def _preflight_state_problem(run_id: AgentRunId) -> ProblemDetails:
+    """@brief 构造不泄漏持久化细节的确定性前置状态错误 / Build a deterministic preflight-state problem without leaking persistence details.
+
+    @param run_id 稳定关联 Run / Stable correlated Run.
+    @return 不可重试且不包含内部异常正文的问题 / Non-retryable problem without internal exception text.
+    """
+    return ProblemDetails(
+        type_uri="https://api.hmalliances.org/problems/agent/preflight-state-invalid",
+        title="Agent execution state is invalid",
+        status=500,
+        code="agent.preflight_state_invalid",
+        request_id=str(run_id),
+        retryable=False,
+        detail="The saved Agent state cannot be executed safely.",
+    )
+
+
 def _authorization_revoked_problem(run_id: AgentRunId) -> ProblemDetails:
     """@brief 构造执行时授权收紧问题 / Build an execution-time authorization tightening problem.
 
@@ -3030,6 +3300,24 @@ def _authorization_revoked_problem(run_id: AgentRunId) -> ProblemDetails:
     )
 
 
+def _resume_authority_changed_problem(run_id: AgentRunId) -> ProblemDetails:
+    """Build the terminal conflict for a committed continuation superseded by a user edit."""
+
+    return ProblemDetails(
+        type_uri=(
+            "https://api.hmalliances.org/problems/"
+            "agent/resume-authority-changed"
+        ),
+        title="Authoritative resume changed",
+        status=409,
+        code="agent.resume_authority_changed",
+        request_id=str(run_id),
+        retryable=False,
+        detail=(
+            "The authoritative resume changed after the proposal decision. "
+            "Reload it before continuing."
+        ),
+    )
 def _tool_unavailable_problem(run_id: AgentRunId) -> ProblemDetails:
     """@brief 构造未注册工具建议的失败 / Build a failure for an unregistered tool suggestion.
 

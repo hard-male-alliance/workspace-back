@@ -68,11 +68,15 @@ from backend.infrastructure.agent_prompt import render_resume_agent_system_promp
 from backend.infrastructure.resume_agent_tools import ResumeToolSession, resume_agent_tools
 from workspace_shared.tenancy import ActorScope
 
-_MAX_TURNS = 20
-_MAX_TOOL_CALLS = 16
-_MAX_INVALID_TOOL_CALLS = 6
-_MAX_REPEATED_INVALID_SIGNATURE = 2
-_MAX_KNOWLEDGE_RETRIEVALS = 8
+_MAX_TURNS = 25
+_MAX_RESUME_TOOL_CALLS = 16
+_MAX_TOTAL_TOOL_CALLS = 24
+_MAX_INVALID_TOOL_CALLS = 3
+# @brief 相同无效参数也应获得完整纠错预算 / Give repeated invalid arguments the full recovery budget.
+_MAX_REPEATED_INVALID_SIGNATURE = _MAX_INVALID_TOOL_CALLS
+_MAX_KNOWLEDGE_TOOL_CALLS = 4
+_MAX_KNOWLEDGE_RETRIEVALS = 3
+_MAX_KNOWLEDGE_EVIDENCE = 24
 _MAX_INPUT_CHARACTERS = 1_000_000
 _PROPOSAL_TOOL = "resume_request_proposal_decision"
 _DEFAULT_LATENCY_BUDGET_MS = 60_000
@@ -106,7 +110,7 @@ class _KnowledgeSearchInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(min_length=1, max_length=8_000)
-    top_k: int = Field(default=10, ge=1, le=20)
+    top_k: int = Field(default=10, ge=1, le=10)
 
 
 @dataclass(slots=True)
@@ -124,23 +128,31 @@ class _KnowledgeToolState:
 
 @dataclass(slots=True)
 class _ToolExecutionState:
-    """@brief 原子分配工具调用序号与总预算 / Atomically allocate tool ordinals and budget."""
+    """@brief 原子分配工具序号及分层预算 / Atomically allocate tool ordinals and layered budgets."""
 
     next_ordinal: int
+    total_call_count: int
+    resume_tool_call_count: int
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    async def reserve(self, *, counted: bool = True) -> int:
+    async def reserve(self, *, resume_tool: bool = True) -> int:
         """@brief 原子预留一次工具调用 / Atomically reserve one tool invocation.
 
-        @param counted 是否计入普通工具安全上限 / Whether the normal tool safety cap applies.
+        @param resume_tool 是否计入简历工具预算 / Whether the Resume-tool budget applies.
         @return 本执行段内唯一序号 / Unique ordinal in this execution segment.
-        @raise _ToolCallBudgetExhausted 普通工具预算已满 / Raised when the normal budget is full.
+        @raise _ToolCallBudgetExhausted 简历工具预算已满 / Raised when the Resume-tool budget is full.
+        @raise _TotalToolCallBudgetExhausted 全局工具预算已满 / Raised when the global tool budget is full.
         """
 
         async with self.lock:
-            if counted and self.next_ordinal >= _MAX_TOOL_CALLS:
+            if self.total_call_count >= _MAX_TOTAL_TOOL_CALLS:
+                raise _TotalToolCallBudgetExhausted
+            if resume_tool and self.resume_tool_call_count >= _MAX_RESUME_TOOL_CALLS:
                 raise _ToolCallBudgetExhausted
             self.next_ordinal += 1
+            self.total_call_count += 1
+            if resume_tool:
+                self.resume_tool_call_count += 1
             return self.next_ordinal
 
 
@@ -149,7 +161,11 @@ class _ToolRecoveryExhausted(RuntimeError):
 
 
 class _ToolCallBudgetExhausted(RuntimeError):
-    """@brief 工具调用已耗尽独立预算 / Tool calls exhausted their independent budget."""
+    """@brief 简历工具调用已耗尽独立预算 / Resume tool calls exhausted their budget."""
+
+
+class _TotalToolCallBudgetExhausted(RuntimeError):
+    """@brief 所有工具调用已耗尽全局预算 / All tool calls exhausted the global budget."""
 
 
 class _KnowledgeRetrievalFailed(RuntimeError):
@@ -275,6 +291,12 @@ class OpenAIAgentsSDKProvider:
                 _problem(request, "agent.knowledge_retrieval_failed", 502, True)
             )
         traces: list[AgentToolInvocationTrace] = []
+        checkpoint_tool_count = _checkpoint_tool_call_count(request.provider_state)
+        execution_state = _ToolExecutionState(
+            next_ordinal=checkpoint_tool_count,
+            total_call_count=checkpoint_tool_count,
+            resume_tool_call_count=checkpoint_tool_count,
+        )
         tools = _sdk_tools(
             session,
             request,
@@ -282,7 +304,7 @@ class OpenAIAgentsSDKProvider:
             self._record_tool,
             knowledge_retriever=self._knowledge_retriever,
             knowledge_state=knowledge_state,
-            ordinal_offset=_checkpoint_tool_call_count(request.provider_state),
+            execution_state=execution_state,
         )
         agent = Agent[dict[str, JsonValue]](
             name="resume_agent" if session else "workspace_agent",
@@ -310,7 +332,7 @@ class OpenAIAgentsSDKProvider:
                 else:
                     state = await RunState.from_json(
                         agent,
-                        _plain_json_object(request.provider_state),
+                        _provider_state_for_resume(request.provider_state),
                         context_override={
                             "proposal_decision": (
                                 None
@@ -365,7 +387,9 @@ class OpenAIAgentsSDKProvider:
                 latency_budget_ms,
                 self._execution_timeout_ms,
             )
-            diagnostic_attributes.update(_knowledge_diagnostics(knowledge_state))
+            diagnostic_attributes.update(
+                _run_budget_diagnostics(knowledge_state, execution_state)
+            )
             self._record_run(
                 request,
                 "failure",
@@ -385,7 +409,9 @@ class OpenAIAgentsSDKProvider:
                 latency_budget_ms,
                 self._execution_timeout_ms,
             )
-            diagnostic_attributes.update(_knowledge_diagnostics(knowledge_state))
+            diagnostic_attributes.update(
+                _run_budget_diagnostics(knowledge_state, execution_state)
+            )
             if failure.failure_class == "execution_timeout":
                 diagnostic_attributes["timeout_scope"] = "active_agent_execution_segment"
             self._record_run(
@@ -432,7 +458,9 @@ class OpenAIAgentsSDKProvider:
                     latency_budget_ms,
                     self._execution_timeout_ms,
                 )
-                diagnostic_attributes.update(_knowledge_diagnostics(knowledge_state))
+                diagnostic_attributes.update(
+                    _run_budget_diagnostics(knowledge_state, execution_state)
+                )
                 self._record_run(
                     request,
                     "failure",
@@ -453,7 +481,7 @@ class OpenAIAgentsSDKProvider:
                 request,
                 "success",
                 (perf_counter() - started) * 1000,
-                _knowledge_diagnostics(knowledge_state),
+                _run_budget_diagnostics(knowledge_state, execution_state),
             )
             return outcome
 
@@ -478,7 +506,9 @@ class OpenAIAgentsSDKProvider:
                 latency_budget_ms,
                 self._execution_timeout_ms,
             )
-            diagnostic_attributes.update(_knowledge_diagnostics(knowledge_state))
+            diagnostic_attributes.update(
+                _run_budget_diagnostics(knowledge_state, execution_state)
+            )
             self._record_run(
                 request,
                 "failure",
@@ -507,7 +537,9 @@ class OpenAIAgentsSDKProvider:
                 latency_budget_ms,
                 self._execution_timeout_ms,
             )
-            diagnostic_attributes.update(_knowledge_diagnostics(knowledge_state))
+            diagnostic_attributes.update(
+                _run_budget_diagnostics(knowledge_state, execution_state)
+            )
             self._record_run(
                 request,
                 "failure",
@@ -522,7 +554,7 @@ class OpenAIAgentsSDKProvider:
             request,
             "success",
             (perf_counter() - started) * 1000,
-            _knowledge_diagnostics(knowledge_state),
+            _run_budget_diagnostics(knowledge_state, execution_state),
         )
         return completed
 
@@ -660,19 +692,32 @@ def _sdk_tools(
     *,
     knowledge_retriever: AgentKnowledgeRetriever | None,
     knowledge_state: _KnowledgeToolState,
-    ordinal_offset: int,
+    execution_state: _ToolExecutionState,
 ) -> tuple[FunctionTool, ...]:
     recovery = _ToolRecoveryState()
-    execution_state = _ToolExecutionState(ordinal_offset)
     signature_salt = secrets.token_bytes(32)
     converted: list[FunctionTool] = []
     if request.grant.knowledge_contexts and knowledge_retriever is not None:
         schema = _KnowledgeSearchInput.model_json_schema()
 
+        def knowledge_enabled(_context: Any, _agent: Any) -> bool:
+            """@brief 饱和或降级后从后续模型轮次移除知识工具 / Remove Knowledge after saturation or degradation.
+
+            @param _context SDK Run 上下文 / SDK Run context.
+            @param _agent 当前 SDK Agent / Current SDK Agent.
+            @return 当前执行段是否仍允许知识调用 / Whether this segment still permits Knowledge calls.
+            """
+
+            return (
+                knowledge_state.call_count < _MAX_KNOWLEDGE_TOOL_CALLS
+                and knowledge_state.status
+                not in {"saturated", "degraded_with_cached_evidence", "failed"}
+            )
+
         async def invoke_knowledge(_context: Any, arguments_json: str) -> str:
             """@brief 执行一次 grant 约束的原生检索 / Execute one grant-confined native search."""
 
-            ordinal = await execution_state.reserve()
+            ordinal = await execution_state.reserve(resume_tool=False)
             knowledge_state.call_count += 1
             started = perf_counter()
             signature = _argument_signature(
@@ -794,6 +839,7 @@ def _sdk_tools(
                 params_json_schema=schema,
                 on_invoke_tool=invoke_knowledge,
                 strict_json_schema=_strict_schema_compatible(schema),
+                is_enabled=knowledge_enabled,
             )
         )
 
@@ -808,7 +854,7 @@ def _sdk_tools(
             name: str = tool_name,
         ) -> str:
             assert session is not None
-            ordinal = await execution_state.reserve(counted=name != _PROPOSAL_TOOL)
+            ordinal = await execution_state.reserve(resume_tool=name != _PROPOSAL_TOOL)
             started = perf_counter()
             arguments: object = {}
             argument_signature = _argument_signature(
@@ -990,7 +1036,7 @@ def _merge_knowledge_evidence(
     merged = list(existing)
     seen = {item.chunk_id for item in existing}
     for item in retrieved:
-        if item.chunk_id in seen or len(merged) >= 99:
+        if item.chunk_id in seen or len(merged) >= _MAX_KNOWLEDGE_EVIDENCE:
             continue
         seen.add(item.chunk_id)
         merged.append(AgentKnowledgeEvidence(len(merged), item.chunk_id, item.citation))
@@ -1265,13 +1311,47 @@ def _plain_json_object(value: Mapping[str, JsonValue]) -> dict[str, Any]:
     return cast(dict[str, Any], _plain_json(value))
 
 
+def _provider_state_for_resume(value: Mapping[str, JsonValue]) -> dict[str, Any]:
+    """@brief 修复 SDK 序列化的 assistant 历史消息形状 / Normalize SDK-serialized assistant history for resume.
+
+    @param value 持久化的 SDK RunState / Persisted SDK RunState.
+    @return 可由当前 SDK 严格恢复的独立 JSON 对象 / An independent JSON object accepted by the current SDK restore path.
+    @note Agents SDK 会给原始 assistant 历史补 ``status`` 和 ``output_text``，但遗漏
+        ``type=message``；仅修复这一种已确认的序列化形状，不放宽其他 provider state 校验。
+        / The Agents SDK adds ``status`` and ``output_text`` to original assistant history but
+        omits ``type=message``; only that confirmed shape is repaired.
+    """
+
+    state = _plain_json_object(value)
+    original_input = state.get("original_input")
+    if not isinstance(original_input, list):
+        return state
+
+    normalized_input: list[Any] = []
+    for item in original_input:
+        if (
+            isinstance(item, dict)
+            and item.get("role") == "assistant"
+            and item.get("status") == "completed"
+            and "type" not in item
+            and isinstance(item.get("content"), list)
+        ):
+            normalized_item = dict(item)
+            normalized_item["type"] = "message"
+            normalized_input.append(normalized_item)
+            continue
+        normalized_input.append(item)
+    state["original_input"] = normalized_input
+    return state
+
+
 def _checkpoint_tool_call_count(
     state: Mapping[str, JsonValue] | None,
 ) -> int:
     if state is None:
         return 0
     items = state.get("generated_items")
-    if not isinstance(items, tuple):
+    if not isinstance(items, (list, tuple)):
         return 0
     return sum(isinstance(item, Mapping) and item.get("type") == "tool_call_item" for item in items)
 
@@ -1365,6 +1445,7 @@ def _invalid_tool_arguments_result(
         "resume_draft_upsert_sections": "resume_draft_upsert_section",
         "resume_draft_upsert_items": "resume_draft_upsert_item",
     }.get(tool_name, tool_name)
+    correction = _tool_argument_correction(tool_name)
     result: dict[str, JsonValue] = {
         "kind": "invalid_tool_arguments",
         "code": "agent.tool_arguments_invalid",
@@ -1375,6 +1456,7 @@ def _invalid_tool_arguments_result(
             "strategy": "correct_arguments",
             "suggested_tool": suggested_tool,
             "repeat_unchanged": False,
+            **({"correction": correction} if correction is not None else {}),
         },
     }
     expectation = _tool_argument_expectation(tool_name)
@@ -1385,6 +1467,26 @@ def _invalid_tool_arguments_result(
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
+    )
+
+
+def _tool_argument_correction(tool_name: str) -> str | None:
+    """@brief 返回不含用户内容的工具参数纠正建议 / Return content-free tool argument correction guidance.
+
+    @param tool_name 参数校验失败的工具 / Tool whose arguments failed validation.
+    @return 可空纠正建议 / Optional correction guidance.
+    """
+
+    if tool_name not in {
+        "resume_draft_upsert_section",
+        "resume_draft_upsert_sections",
+    }:
+        return None
+    return (
+        "Send exactly one valid JSON object matching the runtime schema. "
+        "For a new section with items, first call resume_draft_upsert_section "
+        "with section.items=[], then call resume_draft_upsert_item or "
+        "resume_draft_upsert_items with complete items."
     )
 
 
@@ -1459,14 +1561,47 @@ def _knowledge_diagnostics(
 
     return {
         "knowledge_tool_call_count": state.call_count,
+        "knowledge_tool_call_limit": _MAX_KNOWLEDGE_TOOL_CALLS,
         "knowledge_retrieval_count": state.retrieval_count,
         "knowledge_cache_hit_count": state.cache_hit_count,
         "knowledge_retrieval_limit": _MAX_KNOWLEDGE_RETRIEVALS,
         "knowledge_evidence_attached_count": len(state.evidence),
+        "knowledge_evidence_limit": _MAX_KNOWLEDGE_EVIDENCE,
         "knowledge_retrieval_status": (
             "not_called" if state.status == "available" else state.status
         ),
     }
+
+
+def _run_budget_diagnostics(
+    knowledge_state: _KnowledgeToolState,
+    execution_state: _ToolExecutionState,
+) -> dict[str, str | int | float | bool]:
+    """@brief 汇总知识与简历工具的独立预算 / Summarize independent Knowledge and Resume budgets.
+
+    @param knowledge_state 当前知识工具状态 / Current Knowledge-tool state.
+    @param execution_state 当前分层工具计数 / Current layered tool counters.
+    @return 可安全记录的预算指标 / Budget metrics safe for telemetry.
+    """
+
+    attributes = _knowledge_diagnostics(knowledge_state)
+    attributes.update(
+        {
+            "total_tool_call_count": execution_state.total_call_count,
+            "total_tool_call_limit": _MAX_TOTAL_TOOL_CALLS,
+            "remaining_total_tool_calls": max(
+                0,
+                _MAX_TOTAL_TOOL_CALLS - execution_state.total_call_count,
+            ),
+            "resume_tool_call_count": execution_state.resume_tool_call_count,
+            "resume_tool_call_limit": _MAX_RESUME_TOOL_CALLS,
+            "remaining_resume_tool_calls": max(
+                0,
+                _MAX_RESUME_TOOL_CALLS - execution_state.resume_tool_call_count,
+            ),
+        }
+    )
+    return attributes
 
 
 def _validation_phase(result_kind: str | None, result_code: str | None) -> str:
@@ -1525,7 +1660,9 @@ def _failure_diagnostics(
         "failure_class": failure_class,
         "exception_type": exception_type,
         "max_turns": _MAX_TURNS,
-        "max_tool_calls": _MAX_TOOL_CALLS,
+        "max_tool_calls": _MAX_RESUME_TOOL_CALLS,
+        "max_resume_tool_calls": _MAX_RESUME_TOOL_CALLS,
+        "max_total_tool_calls": _MAX_TOTAL_TOOL_CALLS,
         "max_invalid_tool_calls": _MAX_INVALID_TOOL_CALLS,
         "history_message_count": len(request.conversation_history),
         "knowledge_context_count": len(request.grant.knowledge_contexts),
@@ -1533,6 +1670,10 @@ def _failure_diagnostics(
             {context.source_id for context in request.grant.knowledge_contexts}
         ),
         "tool_call_count": len(traces),
+        "resume_tool_call_count": sum(
+            trace.tool_name not in {"knowledge_search", _PROPOSAL_TOOL}
+            for trace in traces
+        ),
         "invalid_tool_call_count": sum(trace.status == "invalid" for trace in traces),
         "last_tool_name": last_trace.tool_name if last_trace else "none",
         "last_tool_status": last_trace.status if last_trace else "none",
@@ -1571,6 +1712,13 @@ def _classify_provider_exception(error: Exception) -> _ProviderFailureClassifica
             503,
             False,
             "tool_call_budget_exhausted",
+        )
+    if any(isinstance(item, _TotalToolCallBudgetExhausted) for item in chain):
+        return _ProviderFailureClassification(
+            "agent.total_tool_call_budget_exhausted",
+            503,
+            False,
+            "total_tool_call_budget_exhausted",
         )
     if any(isinstance(item, _KnowledgeRetrievalFailed) for item in chain):
         return _ProviderFailureClassification(

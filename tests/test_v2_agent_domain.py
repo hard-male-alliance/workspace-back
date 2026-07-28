@@ -54,7 +54,7 @@ from backend.domain.knowledge_retrieval import (
     KnowledgeSelectionMode,
 )
 from backend.domain.knowledge_sources import ModelRegion
-from backend.domain.platform import Job, JobId, JobProgress, JobProgressUnit
+from backend.domain.platform import Job, JobId, JobProgress, JobProgressUnit, ProblemDetails
 from backend.domain.principals import ResourceMeta, UserId, WorkspaceId
 from backend.domain.resources import ResourceRef
 
@@ -282,6 +282,41 @@ def test_agent_run_and_unified_job_state_machines_remain_aligned() -> None:
 
     with pytest.raises(AgentRunTransitionError):
         resumed.start(at=NOW + timedelta(seconds=4))
+
+
+def test_terminalizing_proposal_wait_clears_its_intermediate_result_fields() -> None:
+    """Proposal-wait output belongs only to the waiting state, never a terminal failure."""
+
+    waiting = (
+        _run()
+        .start(at=NOW + timedelta(seconds=1))
+        .wait_for_proposal_decision(
+            MessageId("message_proposal_output_0001"),
+            ResourceRef("resume_proposal", "proposal_0001", 1),
+            AgentUsage(10, 5, "12"),
+            {"response_id": "response_proposal_0001"},
+            at=NOW + timedelta(seconds=2),
+        )
+    )
+    problem = ProblemDetails(
+        "https://problems.example.invalid/agent/resume-authority-changed",
+        "Resume authority changed",
+        409,
+        "agent.resume_authority_changed",
+        "request_proposal_0001",
+        False,
+    )
+
+    failed = waiting.fail(problem, at=NOW + timedelta(seconds=3))
+    cancelled = waiting.cancel(at=NOW + timedelta(seconds=3))
+
+    for terminal in (failed, cancelled):
+        assert terminal.view.output_message_id is None
+        assert terminal.view.proposal_refs == ()
+        assert terminal.view.usage is None
+        assert terminal.provider_state is None
+    assert failed.view.problem == problem
+    assert cancelled.view.problem is None
 
 
 def test_tool_approval_is_exact_expiring_and_one_time() -> None:
