@@ -26,6 +26,7 @@ from backend.application.ports.access import AccessAuthorizer
 from backend.application.ports.agent_v2 import (
     AgentCasMismatch,
     AgentContextResolver,
+    AgentContextRevisionSuperseded,
     AgentModelRoute,
     AgentPage,
     AgentPageRequest,
@@ -437,9 +438,14 @@ class InMemoryAgentContextResolver:
             current = self._store.contexts.get(
                 (workspace_id, reference.resource_type, reference.id)
             )
-            if current is None or (
-                reference.revision is not None and reference.revision != current.revision
-            ):
+            if current is None:
+                raise AgentPolicyDenied("agent context is absent, stale, or outside the Workspace")
+            current_revision = current.revision
+            if current_revision is None:
+                raise AgentPolicyDenied("agent context is absent, stale, or outside the Workspace")
+            if reference.revision is not None and reference.revision < current_revision:
+                raise AgentContextRevisionSuperseded(reference, current_revision)
+            if reference.revision is not None and reference.revision != current_revision:
                 raise AgentPolicyDenied("agent context is absent, stale, or outside the Workspace")
             resolved.append(current)
         return tuple(resolved)
@@ -1326,9 +1332,13 @@ class PostgresAgentContextResolver:
         resolved: list[ResourceRef] = []
         for reference in references:
             current_revision = revisions.get(reference.id)
-            if current_revision is None or (
-                reference.revision is not None and reference.revision != current_revision
-            ):
+            if current_revision is None:
+                raise AgentPolicyDenied(
+                    "an Agent context is absent, stale, or outside the Workspace"
+                )
+            if reference.revision is not None and reference.revision < current_revision:
+                raise AgentContextRevisionSuperseded(reference, current_revision)
+            if reference.revision is not None and reference.revision != current_revision:
                 raise AgentPolicyDenied(
                     "an Agent context is absent, stale, or outside the Workspace"
                 )

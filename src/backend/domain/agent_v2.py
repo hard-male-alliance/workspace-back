@@ -919,7 +919,10 @@ class AgentRun:
                 self.view,
                 meta=self.meta.advance(at),
                 status=AgentRunStatus.FAILED,
+                output_message_id=None,
+                proposal_refs=(),
                 pending_approval_id=None,
+                usage=None,
                 problem=problem,
             ),
             active_tool_call_id=None,
@@ -943,7 +946,10 @@ class AgentRun:
                 self.view,
                 meta=self.meta.advance(at),
                 status=AgentRunStatus.CANCELLED,
+                output_message_id=None,
+                proposal_refs=(),
                 pending_approval_id=None,
+                usage=None,
             ),
             active_tool_call_id=None,
             provider_state=None,
@@ -1180,10 +1186,16 @@ class AgentProviderRequest:
             )
         if (
             self.resume_context is not None
-            and self.proposal_decision is None
             and self.resume_context.resume_ref not in self.grant.context_refs
         ):
             raise AgentDomainError("provider Resume context exceeds the execution grant")
+        if self.proposal_decision is not None and (
+            self.resume_context is None
+            or self.proposal_decision.resume_ref != self.resume_context.resume_ref
+        ):
+            raise AgentDomainError(
+                "provider Proposal decision does not match the authorized Resume context"
+            )
 
 
 @dataclass(frozen=True, slots=True)

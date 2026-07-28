@@ -138,20 +138,69 @@ def _tool_decision_claim(
     )
 
 
-def _proposal_decision_claim() -> OutboxDispatchClaim:
+def _proposal_decision_subject(
+    *,
+    resource_type: str = "resume_proposal",
+    subject_id: str = "proposal_worker0001",
+    revision: int = 2,
+) -> dict[str, JsonValue]:
+    """Build the Resume subject serialized by the standard outbox envelope."""
+
+    return {
+        "resource_type": resource_type,
+        "id": subject_id,
+        "revision": revision,
+    }
+
+
+def _proposal_decision_data(
+    *,
+    actor_id: str = "user_agentworker01",
+    run_id: str = "agent_run_worker0001",
+    decision: str = "accept",
+    resume_id: str = "resume_worker0000001",
+    resume_revision: int = 3,
+) -> dict[str, JsonValue]:
+    """Build the Resume-to-Agent continuation data emitted by the service."""
+
+    return {
+        "actor_id": actor_id,
+        "run_id": run_id,
+        "decision": decision,
+        "resume_id": resume_id,
+        "resume_revision": resume_revision,
+    }
+
+
+def _proposal_decision_payload(
+    *,
+    actor_id: str = "user_agentworker01",
+    subject: dict[str, JsonValue] | None = None,
+    data: dict[str, JsonValue] | None = None,
+) -> dict[str, JsonValue]:
+    """Build the persisted Resume outbox standard envelope."""
+
+    return {
+        "actor_id": actor_id,
+        "subject": _proposal_decision_subject() if subject is None else subject,
+        "data": _proposal_decision_data() if data is None else data,
+    }
+
+
+def _proposal_decision_claim(
+    *,
+    claim_actor_id: str = "user_agentworker01",
+    payload: dict[str, JsonValue] | None = None,
+) -> OutboxDispatchClaim:
+    """Build the persisted Resume outbox envelope for an Agent continuation."""
+
     return OutboxDispatchClaim(
         ApiEventId("event_proposaldecision01"),
         WorkspaceId("workspace_agentworker01"),
-        UserId("user_agentworker01"),
+        UserId(claim_actor_id),
         ResourceRef("resume_proposal", "proposal_worker0001", 2),
         "agent.proposal_decision.recorded",
-        {
-            "actor_id": "user_agentworker01",
-            "run_id": "agent_run_worker0001",
-            "decision": "accept",
-            "resume_id": "resume_worker0000001",
-            "resume_revision": 3,
-        },
+        _proposal_decision_payload() if payload is None else payload,
         1,
         OutboxLease("proposal-decision-lease-token-with-adequate-entropy"),
         NOW + timedelta(minutes=2),
@@ -228,6 +277,63 @@ async def test_outbox_handler_binds_resume_proposal_continuation() -> None:
     )
     assert decision.resume_ref == ResourceRef("resume", "resume_worker0000001", 3)
     assert decision.decision == "accept"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "claim",
+    (
+        _proposal_decision_claim(
+            payload={
+                **_proposal_decision_payload(),
+                "unexpected": "must-not-pass",
+            }
+        ),
+        _proposal_decision_claim(
+            payload=_proposal_decision_payload(actor_id="user_different0001")
+        ),
+        _proposal_decision_claim(claim_actor_id="user_different0001"),
+        _proposal_decision_claim(
+            payload=_proposal_decision_payload(
+                data=_proposal_decision_data(actor_id="user_different0001")
+            )
+        ),
+        _proposal_decision_claim(
+            payload=_proposal_decision_payload(
+                subject=_proposal_decision_subject(subject_id="proposal_different001")
+            )
+        ),
+        _proposal_decision_claim(
+            payload=_proposal_decision_payload(
+                subject=_proposal_decision_subject(revision=3)
+            )
+        ),
+        _proposal_decision_claim(
+            payload=_proposal_decision_payload(
+                data=_proposal_decision_data(decision="defer")
+            )
+        ),
+        _proposal_decision_claim(
+            payload=_proposal_decision_payload(
+                data=_proposal_decision_data(resume_revision=0)
+            )
+        ),
+    ),
+)
+async def test_outbox_handler_rejects_mismatched_resume_proposal_envelope(
+    claim: OutboxDispatchClaim,
+) -> None:
+    """The durable header, envelope actor, subject, and continuation data agree exactly."""
+
+    worker = _CapturingWorker()
+
+    with pytest.raises(
+        OutboxHandlerFailure,
+        match=r"agent\.proposal_decision_event_invalid",
+    ):
+        await AgentRunOutboxHandler(worker).handle(claim)
+
+    assert worker.proposal_decisions == []
 
 
 @pytest.mark.asyncio

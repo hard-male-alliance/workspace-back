@@ -51,6 +51,23 @@ class AgentPolicyDenied(RuntimeError):
     """@brief Agent/session/Knowledge/model 约束交集拒绝执行 / Agent/session/Knowledge/model intersection denied execution."""
 
 
+class AgentContextRevisionSuperseded(AgentPolicyDenied):
+    """@brief 精确 context revision 已被同一资源的更高权威版本取代 / An exact context revision was superseded by a newer authoritative version of the same resource."""
+
+    reference: ResourceRef
+    """@brief 被取代的精确 context ref / Superseded exact context ref."""
+
+    current_revision: int
+    """@brief 当前权威 revision / Current authoritative revision."""
+
+    def __init__(self, reference: ResourceRef, current_revision: int) -> None:
+        """@brief 构造不泄漏资源内容的 superseded 信号 / Construct a content-free superseded signal."""
+
+        super().__init__("an Agent context revision was superseded")
+        self.reference = reference
+        self.current_revision = current_revision
+
+
 class AgentProviderFailure(RuntimeError):
     """@brief 模型调用的公开安全失败 / Public-safe model-provider failure.
 
@@ -754,6 +771,7 @@ __all__ = [
     "AgentAuditSink",
     "AgentCasMismatch",
     "AgentContextResolver",
+    "AgentContextRevisionSuperseded",
     "AgentJobStore",
     "AgentKnowledgeRetrievalRequest",
     "AgentKnowledgeRetriever",

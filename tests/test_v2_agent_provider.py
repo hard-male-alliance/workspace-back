@@ -22,6 +22,7 @@ from openai.types.responses import (
 
 from backend.application.ports.agent_v2 import AgentProviderFailure
 from backend.domain.agent_v2 import (
+    AgentDomainError,
     AgentExecutionGrant,
     AgentOutputMode,
     AgentProposalDecisionContext,
@@ -342,6 +343,40 @@ def _resume_request() -> AgentProviderRequest:
     )
 
 
+def test_proposal_continuation_cannot_supply_resume_context_outside_grant() -> None:
+    """A committed decision does not exempt its Resume snapshot from grant coverage."""
+
+    request = _resume_request()
+    assert request.resume_context is not None
+    with pytest.raises(AgentDomainError, match="Resume context exceeds"):
+        replace(
+            request,
+            grant=replace(request.grant, context_refs=()),
+            proposal_decision=AgentProposalDecisionContext(
+                ResourceRef("resume_proposal", "proposal_provider_0001", 2),
+                "accept",
+                request.resume_context.resume_ref,
+            ),
+            provider_state={"response_id": "response_proposal_0001"},
+        )
+
+
+def test_proposal_continuation_requires_its_authorized_resume_context() -> None:
+    """A Proposal decision is only valid for a Resume-edit provider request."""
+
+    request = _request()
+    with pytest.raises(AgentDomainError, match="Proposal decision does not match"):
+        replace(
+            request,
+            proposal_decision=AgentProposalDecisionContext(
+                ResourceRef("resume_proposal", "proposal_provider_0001", 2),
+                "accept",
+                ResourceRef("resume", "resume_provider_0001", 1),
+            ),
+            provider_state={"response_id": "response_proposal_0001"},
+        )
+
+
 @pytest.mark.asyncio
 async def test_resume_provider_preserves_explicit_date_facts_in_model_input() -> None:
     """@brief 显式年份进入模型输入且提示禁止替换 / Preserve an explicit year and forbid replacing it."""
@@ -442,13 +477,22 @@ async def test_native_tool_call_interrupts_and_resumes_same_sdk_state() -> None:
     assert proposal_tool.needs_approval is True
     assert model.calls[0][2] is None
 
+    assert request.resume_context is not None
+    accepted_document = replace(
+        request.resume_context.document,
+        meta=request.resume_context.document.meta.advance(NOW),
+    )
+    accepted_ref = ResourceRef("resume", "resume_provider_0001", 2)
     resumed = await provider.execute(
         replace(
             request,
+            spec=replace(request.spec, context_refs=(accepted_ref,)),
+            grant=replace(request.grant, context_refs=(accepted_ref,)),
+            resume_context=AgentResumeContext(accepted_ref, accepted_document),
             proposal_decision=AgentProposalDecisionContext(
                 ResourceRef("resume_proposal", "proposal_provider_0001", 2),
                 "accept",
-                ResourceRef("resume", "resume_provider_0001", 2),
+                accepted_ref,
             ),
             provider_state=interrupted.provider_state,
         )
