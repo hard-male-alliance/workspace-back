@@ -34,8 +34,8 @@ _DEMO_STYLES = """
 :root {
   color-scheme: light;
   font-family: "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
-  color: #172033;
-  background: #f4f7fb;
+  color: #211b27;
+  background: #f6f4f8;
 }
 * { box-sizing: border-box; }
 body {
@@ -44,17 +44,33 @@ body {
   display: grid;
   place-items: center;
   padding: 24px;
-  background:
-    radial-gradient(circle at top left, #e8efff 0, transparent 42%),
-    #f4f7fb;
+  background: #f6f4f8;
 }
 main {
   width: min(100%, 440px);
   padding: 36px;
-  border: 1px solid #dbe2ee;
-  border-radius: 18px;
+  border: 1px solid #ddd6e3;
+  border-radius: 14px;
   background: #fff;
-  box-shadow: 0 18px 55px rgb(33 50 84 / 12%);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 24px;
+  color: #211b27;
+  font-size: 16px;
+  font-weight: 700;
+}
+.brand span {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border-radius: 10px;
+  background: #ede5ff;
+  color: #4f2697;
+  font-size: 16px;
 }
 h1 {
   margin: 0 0 8px;
@@ -63,7 +79,7 @@ h1 {
 }
 .subtitle {
   margin: 0 0 28px;
-  color: #667085;
+  color: #625a6b;
   font-size: 14px;
   line-height: 1.6;
 }
@@ -71,7 +87,7 @@ form { display: grid; gap: 18px; }
 label {
   display: grid;
   gap: 8px;
-  color: #344054;
+  color: #211b27;
   font-size: 14px;
   font-weight: 600;
 }
@@ -79,45 +95,55 @@ input {
   width: 100%;
   min-height: 44px;
   padding: 10px 12px;
-  border: 1px solid #cfd7e6;
+  border: 1px solid #c7bacf;
   border-radius: 9px;
   background: #fff;
-  color: #172033;
+  color: #211b27;
   font: inherit;
   font-weight: 400;
   outline: none;
 }
 input:focus {
-  border-color: #4f6bed;
-  box-shadow: 0 0 0 3px rgb(79 107 237 / 14%);
+  border-color: #6d35dc;
+  box-shadow: 0 0 0 3px rgb(109 53 220 / 28%);
 }
 button {
   min-height: 46px;
   margin-top: 4px;
   border: 0;
   border-radius: 9px;
-  background: #3659d9;
+  background: #6d35dc;
   color: #fff;
   font: inherit;
   font-weight: 700;
   cursor: pointer;
+  transition: background-color 150ms cubic-bezier(0.22, 1, 0.36, 1);
 }
-button:hover { background: #2949c1; }
+button:hover { background: #5d2ac2; }
+button:active { background: #4f21a9; }
+button:focus-visible {
+  outline: 3px solid rgb(109 53 220 / 28%);
+  outline-offset: 2px;
+}
 .alternate {
   margin: 24px 0 0;
   text-align: center;
-  color: #667085;
+  color: #625a6b;
   font-size: 14px;
 }
-a { color: #3659d9; font-weight: 600; text-decoration: none; }
+a { color: #6d35dc; font-weight: 600; text-decoration: none; }
 a:hover { text-decoration: underline; }
+a:focus-visible {
+  outline: 3px solid rgb(109 53 220 / 28%);
+  outline-offset: 2px;
+}
 [role="alert"] {
   margin: 0 0 20px;
   padding: 12px 14px;
-  border: 1px solid #fecaca;
+  border: 1px solid #e0a7ae;
   border-radius: 9px;
-  background: #fef2f2;
-  color: #b42318;
+  background: #f5dfe2;
+  color: #943342;
   font-size: 14px;
 }
 @media (max-width: 520px) {
@@ -241,7 +267,8 @@ def _demo_page(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f'<link rel="stylesheet" href="{DEMO_STYLES_PATH}">'
-        f"<title>{title}</title></head><body><main><h1>{title}</h1>"
+        f'<title>{title}</title></head><body><main><p class="brand">'
+        f'<span aria-hidden="true">墨</span>RoleStory</p><h1>{title}</h1>'
         '<p class="subtitle">使用邮箱和密码继续进入本地 Demo 工作台</p>'
         f"{error}"
         f'<form method="post" action="{AUTHORIZE_CONTINUE_PREFIX}'

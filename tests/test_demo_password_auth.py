@@ -170,6 +170,8 @@ def test_demo_pages_are_scriptless_secure_and_follow_screen_hint(
     signup_uri, _, _ = _begin(demo_client, "signup")
     signup = demo_client.get(signup_uri)
     assert "<h1>创建账号</h1>" in signup.text
+    assert '<p class="brand">' in signup.text
+    assert "RoleStory" in signup.text
     assert 'name="confirm_password"' in signup.text
     assert 'rel="stylesheet" href="/oauth/demo.css"' in signup.text
     assert "<script" not in signup.text
@@ -179,6 +181,8 @@ def test_demo_pages_are_scriptless_secure_and_follow_screen_hint(
     assert stylesheet.headers["content-type"].startswith("text/css")
     assert "Noto Sans CJK SC" in stylesheet.text
     assert "display: grid" in stylesheet.text
+    assert "#6d35dc" in stylesheet.text
+    assert "#3659d9" not in stylesheet.text
 
     login_uri, _, _ = _begin(demo_client, "login")
     login = demo_client.get(login_uri)
