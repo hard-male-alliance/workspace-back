@@ -303,6 +303,7 @@ def replayable_json(
     status_code: int,
     location: str | None = None,
     etag: bool = False,
+    etag_representation: JsonValue | None = None,
     max_response_bytes: int = DEFAULT_MAX_JSON_RESPONSE_BYTES,
 ) -> ReplayableResponse:
     """@brief 构造可逐字持久化的成功 response / Build a byte-exact persistable success response.
@@ -311,13 +312,19 @@ def replayable_json(
     @param status_code HTTP status / HTTP status.
     @param location 可选 Location / Optional Location.
     @param etag 是否包含强 ETag / Whether to include a strong ETag.
+    @param etag_representation 可选的 ETag 权威表示 / Optional authoritative representation for ETag generation.
     @param max_response_bytes 可持久化 canonical body 的字节上限 / Persistable canonical-body byte limit.
     @return 不含 request-specific header 的可重放 response / Replayable response without request-specific headers.
     """
 
     headers: list[tuple[str, str]] = [("Content-Type", JSON_MEDIA_TYPE)]
     if etag:
-        headers.append(("ETag", strong_etag(payload)))
+        headers.append(
+            (
+                "ETag",
+                strong_etag(payload if etag_representation is None else etag_representation),
+            )
+        )
     if location is not None:
         if not location.startswith("/api/v2/"):
             raise ValueError("API v2 replayable Location must be a canonical API path")

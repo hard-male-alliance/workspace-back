@@ -580,6 +580,36 @@ def test_resume_crud_revisions_operations_and_jobs_follow_the_published_contract
         )
         assert current.json()["title"].startswith("Principal")
 
+        second_operation = harness.client.post(
+            f"/api/v2/workspaces/{WORKSPACE_ID}/resumes/{resume_id}/operations",
+            headers=_headers(
+                idempotency_key="resume-operation-key-0002",
+                etag=operation.headers["etag"],
+            ),
+            json={
+                "client_batch_id": "batch_http_000002",
+                "base_revision": 3,
+                "conflict_strategy": "reject",
+                "operations": [
+                    {
+                        "operation_id": "operation_http_000007",
+                        "op": "set_field",
+                        "entity_id": resume_id,
+                        "field_path": ["title"],
+                        "value": "Staff Distributed Systems Engineer",
+                    }
+                ],
+                "render_hint": "none",
+            },
+        )
+        assert second_operation.status_code == 200, second_operation.text
+        assert second_operation.json()["resume"]["revision"] == 4
+        current = harness.client.get(
+            f"/api/v2/workspaces/{WORKSPACE_ID}/resumes/{resume_id}",
+            headers=_headers(),
+        )
+        assert second_operation.headers["etag"] == current.headers["etag"]
+
         render = harness.client.post(
             f"/api/v2/workspaces/{WORKSPACE_ID}/resumes/{resume_id}/render-jobs",
             headers=_headers(idempotency_key="resume-render-key-000001"),
@@ -686,6 +716,12 @@ def test_proposal_list_detail_and_decision_are_workspace_bound_and_replayable() 
         assert decision.status_code == 200
         assert decision.json()["resume"]["title"] == "Staff Systems Researcher"
         harness.validator.validate_definition("ResumeOperationResult", decision.json())
+        current = harness.client.get(
+            f"/api/v2/workspaces/{WORKSPACE_ID}/resumes/{resume_id}",
+            headers=_headers(),
+        )
+        assert current.status_code == 200
+        assert decision.headers["etag"] == current.headers["etag"]
         continuation_events = [
             event
             for event in harness.factory.store.outbox_events.values()
