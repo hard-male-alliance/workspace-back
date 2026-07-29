@@ -22,7 +22,7 @@ from types import TracebackType
 from typing import Any, Protocol, Self, cast
 
 from pydantic import TypeAdapter, ValidationError
-from sqlalchemy import and_, literal, or_, select, update
+from sqlalchemy import and_, delete, literal, or_, select, update
 from sqlalchemy.engine import CursorResult, Result
 from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction
 
@@ -186,6 +186,7 @@ _PERMISSION_ACTION: Mapping[InterviewPermission, WorkspaceAction] = {
     InterviewPermission.READ_SESSION: WorkspaceAction.READ_INTERVIEW_SESSION,
     InterviewPermission.CREATE_CONNECTION: WorkspaceAction.CREATE_INTERVIEW_CONNECTION,
     InterviewPermission.END_SESSION: WorkspaceAction.END_INTERVIEW_SESSION,
+    InterviewPermission.DELETE_SESSION: WorkspaceAction.DELETE_INTERVIEW_SESSION,
     InterviewPermission.READ_TRANSCRIPT: WorkspaceAction.READ_INTERVIEW_TRANSCRIPT,
     InterviewPermission.CREATE_REPORT_JOB: WorkspaceAction.CREATE_INTERVIEW_REPORT_JOB,
     InterviewPermission.READ_REPORT: WorkspaceAction.READ_INTERVIEW_REPORT,
@@ -1055,6 +1056,44 @@ class InMemoryInterviewRepository:
         ):
             raise InterviewCasMismatch
         self._store.sessions[key] = session
+
+    async def delete_session(
+        self,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+        *,
+        expected_revision: int,
+    ) -> None:
+        """@brief 按 revision 删除会话拥有的内存状态 / Delete Session-owned in-memory state by revision.
+
+        @param workspace_id 会话所属工作区 / Owning Workspace.
+        @param session_id 待删除会话 / Session to delete.
+        @param expected_revision 调用方确认的精确版本 / Exact revision confirmed by the caller.
+        @return 无返回值 / No return value.
+        """
+        key = (workspace_id, session_id)
+        current = self._store.sessions.get(key)
+        if current is None or current.meta.revision != expected_revision:
+            raise InterviewCasMismatch
+        del self._store.sessions[key]
+        self._store.transcript.pop(key, None)
+        self._store.next_realtime_sequence.pop(key, None)
+        self._store.next_transcript_sequence.pop(key, None)
+        self._store.leases = {
+            candidate: value
+            for candidate, value in self._store.leases.items()
+            if candidate[:2] != key
+        }
+        self._store.realtime_inputs = {
+            candidate: value
+            for candidate, value in self._store.realtime_inputs.items()
+            if candidate[:2] != key
+        }
+        self._store.reports = {
+            candidate: value
+            for candidate, value in self._store.reports.items()
+            if value.workspace_id != workspace_id or value.session_id != session_id
+        }
 
     async def add_connection_lease(self, lease: RealtimeConnectionLease) -> None:
         """@brief 保存 secret-free connection lease / Save a secret-free connection lease."""
@@ -2098,6 +2137,58 @@ class PostgresInterviewRepository:
             .execution_options(synchronize_session=False)
         )
         if _affected_rows(result) != 1:
+            raise InterviewCasMismatch
+
+    async def delete_session(
+        self,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+        *,
+        expected_revision: int,
+    ) -> None:
+        """@brief 有序清理关联行并按 revision 删除会话 / Delete dependants in order and remove the Session by revision.
+
+        @param workspace_id 会话所属工作区 / Owning Workspace.
+        @param session_id 待删除会话 / Session to delete.
+        @param expected_revision 调用方确认的精确版本 / Exact revision confirmed by the caller.
+        @return 无返回值 / No return value.
+        """
+        await self._scope.ensure_workspace(workspace_id)
+        workspace = str(workspace_id)
+        session = str(session_id)
+        detached = await self._session.execute(
+            update(InterviewSessionRecord)
+            .where(
+                InterviewSessionRecord.workspace_id == workspace,
+                InterviewSessionRecord.id == session,
+                InterviewSessionRecord.revision == expected_revision,
+            )
+            .values(report_id=None)
+            .execution_options(synchronize_session=False)
+        )
+        if _affected_rows(detached) != 1:
+            raise InterviewCasMismatch
+        for model in (
+            InterviewReportEvidenceRecord,
+            InterviewReportRecord,
+            TranscriptSegmentRecord,
+            InterviewEventRecord,
+            InterviewRealtimeConnectionRecord,
+        ):
+            await self._session.execute(
+                delete(model).where(
+                    model.workspace_id == workspace,
+                    model.session_id == session,
+                )
+            )
+        removed = await self._session.execute(
+            delete(InterviewSessionRecord).where(
+                InterviewSessionRecord.workspace_id == workspace,
+                InterviewSessionRecord.id == session,
+                InterviewSessionRecord.revision == expected_revision,
+            )
+        )
+        if _affected_rows(removed) != 1:
             raise InterviewCasMismatch
 
     async def add_connection_lease(self, lease: RealtimeConnectionLease) -> None:

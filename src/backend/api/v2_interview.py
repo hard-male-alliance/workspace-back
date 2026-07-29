@@ -34,6 +34,7 @@ from backend.api.v2_transport import (
     PageCursor,
     PageLimit,
     canonical_json_bytes,
+    empty_response,
     idempotent_response,
     if_match_header,
     json_response,
@@ -239,7 +240,10 @@ class V2InterviewHttpAdapter:
 
     def _register_routes(self) -> None:
         """@brief 注册契约 5.5 的 12 条路由 / Register the twelve section-5.5 routes."""
-        routes: tuple[tuple[str, str, Callable[..., Awaitable[Response]], str | None, str], ...] = (
+        routes: tuple[
+            tuple[str, str, Callable[..., Awaitable[Response]], str | None, str | None],
+            ...,
+        ] = (
             (
                 "GET",
                 "/api/v2/workspaces/{workspace_id}/interview-scenarios",
@@ -290,6 +294,13 @@ class V2InterviewHttpAdapter:
                 "InterviewSession",
             ),
             (
+                "DELETE",
+                "/api/v2/workspaces/{workspace_id}/interview-sessions/{session_id}",
+                self.delete_session,
+                None,
+                None,
+            ),
+            (
                 "POST",
                 "/api/v2/workspaces/{workspace_id}/interview-sessions/{session_id}/connections",
                 self.create_connection,
@@ -326,10 +337,9 @@ class V2InterviewHttpAdapter:
             ),
         )
         for method, path, endpoint, request_definition, response_definition in routes:
-            extra: dict[str, JsonValue] = {
-                "x-api-v2-phase": 2,
-                "x-contract-response": response_definition,
-            }
+            extra: dict[str, JsonValue] = {"x-api-v2-phase": 2}
+            if response_definition is not None:
+                extra["x-contract-response"] = response_definition
             if request_definition is not None:
                 extra["x-contract-request"] = request_definition
             self.router.add_api_route(
@@ -546,6 +556,42 @@ class V2InterviewHttpAdapter:
         return response
 
     @_translate_http_errors
+    async def delete_session(
+        self, request: Request, workspace_id: OpaquePath, session_id: OpaquePath
+    ) -> Response:
+        """@brief 按强版本永久删除终态会话 / Permanently delete a terminal Session by strong revision.
+
+        @param request 含 If-Match 的无 body 请求 / Bodyless request with If-Match.
+        @param workspace_id 路径工作区 / Path Workspace.
+        @param session_id 待删除会话 / Session to delete.
+        @return 空 204 响应 / Empty 204 response.
+        """
+        require_query(request)
+        await require_no_body(request)
+        runtime, principal, workspace = self._request_context(request, workspace_id)
+        typed_session_id = InterviewSessionId(session_id)
+        current = await runtime.interview_v2.get_session_for_delete(
+            principal,
+            workspace,
+            typed_session_id,
+        )
+        payload = _session(current)
+        runtime.contracts_v2.validate_definition("InterviewSession", payload)
+        expected_revision = match_etag_revision(
+            if_match_header(request),
+            payload,
+            current.meta.revision,
+        )
+        await runtime.interview_v2.delete_session(
+            principal,
+            workspace,
+            typed_session_id,
+            expected_revision=expected_revision,
+            context=InterviewMutationContext(request_id(request)),
+        )
+        return empty_response(request)
+
+    @_translate_http_errors
     async def create_connection(
         self, request: Request, workspace_id: OpaquePath, session_id: OpaquePath
     ) -> Response:
@@ -724,6 +770,8 @@ def create_v2_interview_router(
 
 def _declared_status(method: str, path: str) -> int:
     """@brief 返回 OpenAPI 声明成功状态 / Return the declared success status."""
+    if method == "DELETE":
+        return 204
     if method == "POST" and path.endswith(("end-requests", "report-jobs")):
         return 202
     if method == "POST":

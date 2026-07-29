@@ -101,6 +101,7 @@ class WorkspaceAction(StrEnum):
     READ_INTERVIEW_SESSION = "interview_session.read"
     CREATE_INTERVIEW_CONNECTION = "interview_session.connection.create"
     END_INTERVIEW_SESSION = "interview_session.end"
+    DELETE_INTERVIEW_SESSION = "interview_session.delete"
     READ_INTERVIEW_TRANSCRIPT = "interview_session.transcript.read"
     CREATE_INTERVIEW_REPORT_JOB = "interview_session.report.create"
     READ_INTERVIEW_REPORT = "interview_report.read"

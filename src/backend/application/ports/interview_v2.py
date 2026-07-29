@@ -107,6 +107,7 @@ class InterviewPermission(StrEnum):
     READ_SESSION = "interview_session.read"
     CREATE_CONNECTION = "interview_session.connection.create"
     END_SESSION = "interview_session.end"
+    DELETE_SESSION = "interview_session.delete"
     READ_TRANSCRIPT = "interview_session.transcript.read"
     CREATE_REPORT_JOB = "interview_session.report.create"
     READ_REPORT = "interview_report.read"
@@ -132,6 +133,7 @@ class InterviewPermissionRequest:
             InterviewPermission.READ_SESSION: "interview_session",
             InterviewPermission.CREATE_CONNECTION: "interview_session",
             InterviewPermission.END_SESSION: "interview_session",
+            InterviewPermission.DELETE_SESSION: "interview_session",
             InterviewPermission.READ_TRANSCRIPT: "interview_session",
             InterviewPermission.CREATE_REPORT_JOB: "interview_session",
             InterviewPermission.READ_REPORT: "interview_report",
@@ -360,6 +362,21 @@ class InterviewRepository(Protocol):
         expected_revision: int,
     ) -> None:
         """@brief 以旧 revision CAS Session / CAS a Session using its old revision."""
+
+    async def delete_session(
+        self,
+        workspace_id: WorkspaceId,
+        session_id: InterviewSessionId,
+        *,
+        expected_revision: int,
+    ) -> None:
+        """@brief 按强 revision 永久删除会话及其关联记录 / Permanently delete a Session and its dependants by strong revision.
+
+        @param workspace_id 会话所属工作区 / Owning Workspace.
+        @param session_id 待删除会话 / Session to delete.
+        @param expected_revision 调用方确认的精确版本 / Exact revision confirmed by the caller.
+        @return 无返回值 / No return value.
+        """
 
     async def add_connection_lease(self, lease: RealtimeConnectionLease) -> None:
         """@brief 保存无 token/ICE secret 的连接 lease / Save a connection lease without token or ICE secrets."""
