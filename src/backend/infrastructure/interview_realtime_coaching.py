@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Protocol
+from typing import Literal, Protocol
 
 from backend.application.interview_v2 import RealtimeCoachingContext
 from backend.application.ports.interview_v2 import InterviewWorkerOperationId
@@ -22,6 +25,23 @@ from backend.infrastructure.interview_media_analysis import (
 )
 
 _MAX_FOLLOWUP_CHARS = 2_000
+_KNOWLEDGE_RETRIEVAL_TIMEOUT_SECONDS = 4.0
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeKnowledgeUse:
+    """@brief 单道面试题的脱敏知识检索结果 / Redacted Knowledge retrieval result for one Interview question.
+
+    @param status 检索结果状态 / Retrieval outcome status.
+    @param hit_count 授权证据命中数 / Number of authorized evidence hits.
+    @param elapsed_ms 检索耗时毫秒 / Retrieval latency in milliseconds.
+    @note 不包含 query、quote 或候选人回答 / Contains no query, quote, or candidate answer.
+    """
+
+    status: Literal["hit", "miss", "not_selected", "unavailable"]
+    hit_count: int
+    elapsed_ms: int
 
 
 class RealtimeInterviewCoach(Protocol):
@@ -52,7 +72,7 @@ class RealtimeInterviewCoach(Protocol):
         live_history: tuple[tuple[str, str], ...],
         *,
         operation_id: str,
-    ) -> AsyncIterator[str]: ...
+    ) -> AsyncIterator[str | RealtimeKnowledgeUse]: ...
 
 
 class ProviderRealtimeInterviewCoach:
@@ -108,7 +128,7 @@ class ProviderRealtimeInterviewCoach:
         live_history: tuple[tuple[str, str], ...],
         *,
         operation_id: str,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | RealtimeKnowledgeUse]:
         history = [
             {
                 "speaker": item.speaker.value,
@@ -117,11 +137,12 @@ class ProviderRealtimeInterviewCoach:
             for item in context.transcript
             if item.text.strip()
         ]
-        knowledge_evidence = await self._retrieve_knowledge(
+        knowledge_evidence, knowledge_use = await self._retrieve_knowledge(
             context,
             candidate_text,
             live_history,
         )
+        yield knowledge_use
         initial_question = candidate_text.strip() == ""
         task = (
             (
@@ -212,11 +233,19 @@ class ProviderRealtimeInterviewCoach:
         context: RealtimeCoachingContext,
         candidate_text: str,
         live_history: tuple[tuple[str, str], ...],
-    ) -> list[dict[str, object]]:
-        """Retrieve a small, frozen-provenance evidence set without breaking live coaching."""
+    ) -> tuple[list[dict[str, object]], RealtimeKnowledgeUse]:
+        """@brief 检索冻结来源范围内的证据并返回脱敏状态 / Retrieve frozen-scope evidence and return a redacted outcome.
 
+        @param context 已授权实时面试上下文 / Authorized realtime Interview context.
+        @param candidate_text 候选人本轮文本 / Candidate text for the current turn.
+        @param live_history 有界实时历史 / Bounded live history.
+        @return 可进入提示词的证据与安全状态 / Prompt-safe evidence and redacted status.
+        @note 检索失败降级为空证据，不中断实时面试 / Retrieval failures degrade to empty evidence without breaking the live interview.
+        """
+
+        started = time.monotonic()
         if self._knowledge_search is None or not context.knowledge_contexts:
-            return []
+            return [], RealtimeKnowledgeUse("not_selected", 0, 0)
         scopes = tuple(
             KnowledgeSearchScope(item.source_id, item.version_id, item.policy_version)
             for item in context.knowledge_contexts
@@ -226,14 +255,18 @@ class ProviderRealtimeInterviewCoach:
             for part in (
                 context.job_target.title,
                 context.job_target.company or "",
+                context.job_target.description or "",
+                " ".join(context.job_target.skills),
                 context.scenario_name,
+                context.scenario_description,
+                " ".join(context.focus_areas),
                 candidate_text,
                 " ".join(text for _, text in live_history[-6:]),
             )
             if part.strip()
         )[:8_000]
         if not query:
-            return []
+            return [], RealtimeKnowledgeUse("miss", 0, _elapsed_ms(started))
         plan = KnowledgeSearchPlan(
             context.workspace_id,
             context.actor_id,
@@ -244,12 +277,14 @@ class ProviderRealtimeInterviewCoach:
             SearchFilters(MappingProxyType({})),
         )
         try:
-            async with asyncio.timeout(1.5):
+            async with asyncio.timeout(_KNOWLEDGE_RETRIEVAL_TIMEOUT_SECONDS):
                 response = await self._knowledge_search.search(plan)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            return []
+        except Exception as error:
+            use = RealtimeKnowledgeUse("unavailable", 0, _elapsed_ms(started))
+            _record_knowledge_use(use, len(scopes), type(error).__name__)
+            return [], use
         expected_watermark = max(scope.policy_version for scope in scopes)
         allowed = {(scope.source_id, scope.version_id) for scope in scopes}
         if response.policy_version != expected_watermark or any(
@@ -257,7 +292,9 @@ class ProviderRealtimeInterviewCoach:
             or (hit.source_id, hit.version_id) not in allowed
             for hit in response.hits
         ):
-            return []
+            use = RealtimeKnowledgeUse("unavailable", 0, _elapsed_ms(started))
+            _record_knowledge_use(use, len(scopes), "provenance_mismatch")
+            return [], use
         ordered = sorted(
             response.hits,
             key=lambda hit: (
@@ -267,7 +304,7 @@ class ProviderRealtimeInterviewCoach:
                 hit.locator,
             ),
         )[:5]
-        return [
+        evidence: list[dict[str, object]] = [
             {
                 "source_id": str(hit.source_id),
                 "version_id": str(hit.version_id),
@@ -276,6 +313,51 @@ class ProviderRealtimeInterviewCoach:
             }
             for hit in ordered
         ]
+        use = RealtimeKnowledgeUse(
+            "hit" if evidence else "miss",
+            len(evidence),
+            _elapsed_ms(started),
+        )
+        _record_knowledge_use(use, len(scopes), None)
+        return evidence, use
+
+def _elapsed_ms(started: float) -> int:
+    """@brief 计算受限非负检索耗时 / Calculate bounded non-negative retrieval latency.
+
+    @param started 单调时钟起点 / Monotonic-clock start.
+    @return 四舍五入后的毫秒数 / Rounded milliseconds.
+    """
+
+    return max(0, round((time.monotonic() - started) * 1_000))
 
 
-__all__ = ["ProviderRealtimeInterviewCoach", "RealtimeInterviewCoach"]
+def _record_knowledge_use(
+    use: RealtimeKnowledgeUse,
+    selected_source_count: int,
+    failure_kind: str | None,
+) -> None:
+    """@brief 记录不含正文的知识检索遥测 / Record Knowledge retrieval telemetry without content.
+
+    @param use 脱敏检索结果 / Redacted retrieval outcome.
+    @param selected_source_count 冻结授权来源数 / Number of frozen authorized sources.
+    @param failure_kind 低敏感失败类型 / Low-sensitivity failure type.
+    @return None / None.
+    """
+
+    _LOGGER.info(
+        "interview.knowledge_retrieval",
+        extra={
+            "knowledge_elapsed_ms": use.elapsed_ms,
+            "knowledge_failure_kind": failure_kind,
+            "knowledge_hit_count": use.hit_count,
+            "knowledge_selected_source_count": selected_source_count,
+            "knowledge_status": use.status,
+        },
+    )
+
+
+__all__ = [
+    "ProviderRealtimeInterviewCoach",
+    "RealtimeInterviewCoach",
+    "RealtimeKnowledgeUse",
+]

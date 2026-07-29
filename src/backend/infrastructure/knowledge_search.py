@@ -8,6 +8,7 @@ dense 使用 pgvector cosine distance，最终在有界候选集上做可解释�
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -32,6 +33,9 @@ from backend.domain.knowledge_sources import (
 )
 from backend.domain.principals import UserId, WorkspaceId
 from backend.infrastructure.persistence.database import AsyncDatabase
+
+logger = logging.getLogger(__name__)
+"""@brief 混合检索的脱敏降级诊断 logger / Redacted degradation diagnostics logger for hybrid search."""
 
 
 class KnowledgeQueryEmbedder(Protocol):
@@ -232,9 +236,24 @@ class PostgresHybridKnowledgeSearch:
             dense_rows = await self._semantic_rows(plan, filters, parameters)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
             if not self._allow_lexical_fallback:
                 raise
+            logger.warning(
+                "backend.knowledge.semantic_retrieval_degraded",
+                extra={
+                    "event_name": "backend.knowledge.semantic_retrieval_degraded",
+                    "telemetry_attributes": {
+                        "operation": "knowledge_search",
+                        "outcome": "degraded",
+                        "fallback": "lexical",
+                        "exception_type": type(error).__name__,
+                        "scope_count": len(plan.scopes),
+                        "lexical_hit_count": len(lexical_rows),
+                        "semantic_timeout_seconds": self._semantic_timeout_seconds,
+                    },
+                },
+            )
             dense_rows = ()
         return self._response(plan, lexical_rows, dense_rows)
 

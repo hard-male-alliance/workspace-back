@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, cast
@@ -41,6 +42,29 @@ class _FailingEmbedder:
 
         del texts
         raise RuntimeError("embedding provider unavailable")
+
+
+class _HangingEmbedder:
+    """@brief 等待取消的在线 embedding 替身 / Online embedding double that waits for cancellation."""
+
+    def __init__(self) -> None:
+        """@brief 初始化取消观测状态 / Initialize cancellation observation state."""
+
+        self.cancelled = False
+
+    async def embed(self, texts: list[str]) -> list[tuple[float, ...]]:
+        """@brief 挂起直到语义总预算取消调用 / Suspend until the semantic budget cancels the call.
+
+        @param texts 待编码文本 / Texts to encode.
+        @return 永不正常返回 / Never returns normally.
+        """
+
+        del texts
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
 
 
 class _LexicalRecallSearch(PostgresHybridKnowledgeSearch):
@@ -133,3 +157,47 @@ async def test_realtime_search_keeps_lexical_hits_when_embedding_fails() -> None
     assert len(response.hits) == 1
     assert response.hits[0].quote == "React 组件性能优化需要先定位重复渲染。"
     assert response.hits[0].score.semantic is None
+
+
+@pytest.mark.asyncio
+async def test_resume_search_timeout_returns_lexical_hits_within_online_budget(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """@brief 简历助手的查询 embedding 超时必须快速降级而非终止 Run / Resume query-embedding timeout must degrade promptly instead of terminating the run.
+
+    @param caplog pytest 日志捕获器 / Pytest log capture.
+    """
+
+    embedder = _HangingEmbedder()
+    search = _LexicalRecallSearch(
+        cast(Any, object()),
+        embedder,
+        EmbeddingSpaceSelection("provider", "model", "revision", 1024),
+        semantic_timeout_seconds=0.05,
+        allow_lexical_fallback=True,
+        substring_lexical_fallback=True,
+    )
+    plan = KnowledgeSearchPlan(
+        WorkspaceId("workspace_frontend01"),
+        UserId("user_frontend0001"),
+        "前端工程师 React TypeScript",
+        (
+            KnowledgeSearchScope(
+                KnowledgeSourceId("knowledge_source_frontend01"),
+                KnowledgeSourceVersionId("knowledge_version_frontend01"),
+                3,
+            ),
+        ),
+        "resume_assistant",
+        5,
+        SearchFilters(MappingProxyType({})),
+    )
+
+    with caplog.at_level("WARNING"):
+        async with asyncio.timeout(1):
+            response = await search.search(plan)
+
+    assert embedder.cancelled is True
+    assert len(response.hits) == 1
+    assert response.hits[0].score.semantic is None
+    assert "backend.knowledge.semantic_retrieval_degraded" in caplog.messages

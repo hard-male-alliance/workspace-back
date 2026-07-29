@@ -1170,6 +1170,9 @@ def _agent_runtime_for(
                 lexical_weight=settings.knowledge.search.lexical_weight,
                 semantic_weight=settings.knowledge.search.semantic_weight,
                 candidate_multiplier=settings.knowledge.search.candidate_multiplier,
+                semantic_timeout_seconds=5.0,
+                allow_lexical_fallback=True,
+                substring_lexical_fallback=True,
             )
         )
     else:
@@ -1389,7 +1392,7 @@ def _interview_runtime_for(
         lexical_weight=settings.knowledge.search.lexical_weight,
         semantic_weight=settings.knowledge.search.semantic_weight,
         candidate_multiplier=settings.knowledge.search.candidate_multiplier,
-        semantic_timeout_seconds=0.8,
+        semantic_timeout_seconds=3.0,
         allow_lexical_fallback=True,
         substring_lexical_fallback=True,
     )
@@ -1657,6 +1660,9 @@ def _knowledge_runtime_for(
             chunk_max_characters=settings.knowledge.index.chunk_max_characters,
             chunk_overlap_characters=(settings.knowledge.index.chunk_overlap_characters),
             embedding_batch_size=settings.knowledge.index.embedding_batch_size,
+            embedding_batch_maximum_attempts=(
+                settings.knowledge.index.embedding_batch_maximum_attempts
+            ),
         ),
         maximum_attempts=settings.knowledge.worker.maximum_attempts,
     )
@@ -2403,7 +2409,7 @@ def _embedding_provider_for(settings: BackendSettings) -> EmbeddingProvider:
         model=settings.ai.embedding_model,
         dimension=settings.ai.embedding_dimension,
         connect_timeout_ms=settings.network.connect_timeout_ms,
-        read_timeout_ms=settings.network.read_timeout_ms,
+        read_timeout_ms=settings.ai.embedding_read_timeout_ms,
         outbound_proxy_url=settings.network.outbound_proxy_url,
     )
 

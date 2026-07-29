@@ -66,9 +66,7 @@ def _postgres_root() -> dict[str, Any]:
             "credential_reference_hmac_key": _encoded_key(13),
         }
     )
-    root["knowledge"]["uploads"]["storage"]["local"]["signing_hmac_key"] = (
-        _encoded_key(14)
-    )
+    root["knowledge"]["uploads"]["storage"]["local"]["signing_hmac_key"] = _encoded_key(14)
     return root
 
 
@@ -98,9 +96,7 @@ def _production_root() -> dict[str, Any]:
             "identity_mode": "disabled",
             "trusted_proxy_hmac_secret": None,
             "cursor_hmac_secret": "cursor-signing-secret-that-has-32-bytes",
-            "sensitive_idempotency_hmac_secret": (
-                "sensitive-idempotency-secret-that-has-32-bytes"
-            ),
+            "sensitive_idempotency_hmac_secret": ("sensitive-idempotency-secret-that-has-32-bytes"),
         }
     )
     root["hosted_identity"]["password_breach"]["mode"] = "pwned_passwords"
@@ -163,6 +159,8 @@ def test_secret_free_example_exposes_typed_secure_development_defaults() -> None
     assert settings.knowledge.uploads.storage.mode == "local"
     assert settings.knowledge.uploads.malware.mode == "dev"
     assert settings.knowledge.source_network.allowed_schemes == ("https",)
+    assert settings.knowledge.index.embedding_batch_maximum_attempts == 2
+    assert settings.ai.embedding_read_timeout_ms == 60_000
 
 
 def test_production_uses_s3_reject_scanner_and_independent_durable_keys(
@@ -173,9 +171,7 @@ def test_production_uses_s3_reject_scanner_and_independent_durable_keys(
     @param tmp_path pytest 临时目录 / pytest temporary directory.
     """
 
-    settings = BackendSettings.from_file(
-        _write(_production_root(), tmp_path / "production.json")
-    )
+    settings = BackendSettings.from_file(_write(_production_root(), tmp_path / "production.json"))
 
     assert isinstance(settings.knowledge.uploads.storage, KnowledgeS3UploadStorageSettings)
     assert settings.knowledge.connections.provider_session_keyring.keys[0].key == bytes([10]) * 32
@@ -191,9 +187,7 @@ def test_production_rejects_local_storage_dev_scanner_and_plain_http(tmp_path: P
     """
 
     root = _production_root()
-    local = load_jsonc(PROJECT_ROOT / "example.jsonc")["knowledge"]["uploads"]["storage"][
-        "local"
-    ]
+    local = load_jsonc(PROJECT_ROOT / "example.jsonc")["knowledge"]["uploads"]["storage"]["local"]
     local["signing_hmac_key"] = _encoded_key(14)
     root["knowledge"]["uploads"]["storage"] = {
         "mode": "local",
@@ -267,7 +261,9 @@ def test_postgresql_provider_parses_exact_endpoints_scopes_and_api_validation(
         }
     ]
 
-    provider = BackendSettings.from_file(_write(root, tmp_path / "provider.json")).knowledge.connections.providers[0]
+    provider = BackendSettings.from_file(
+        _write(root, tmp_path / "provider.json")
+    ).knowledge.connections.providers[0]
 
     assert provider.provider == "github"
     assert provider.allowed_scopes == ("repo:read", "user:read")
@@ -288,9 +284,13 @@ def test_knowledge_rejects_unknown_fields_duplicate_json_keys_and_key_reuse(
     with pytest.raises(ConfigurationError, match="unknown keys"):
         BackendSettings.from_file(_write(root, tmp_path / "unknown.json"))
 
-    duplicate = (PROJECT_ROOT / "example.jsonc").read_text(encoding="utf-8").replace(
-        '"maximum_attempts": 12,',
-        '"maximum_attempts": 12, "maximum_attempts": 13,',
+    duplicate = (
+        (PROJECT_ROOT / "example.jsonc")
+        .read_text(encoding="utf-8")
+        .replace(
+            '"maximum_attempts": 12,',
+            '"maximum_attempts": 12, "maximum_attempts": 13,',
+        )
     )
     duplicate_path = tmp_path / "duplicate.jsonc"
     duplicate_path.write_text(duplicate, encoding="utf-8")
@@ -309,6 +309,7 @@ def test_knowledge_rejects_unknown_fields_duplicate_json_keys_and_key_reuse(
         (("uploads", "maximum_archive_depth"), 11, "maximum_archive_depth"),
         (("search", "candidate_multiplier"), 21, "candidate_multiplier"),
         (("index", "embedding_batch_size"), 513, "embedding_batch_size"),
+        (("index", "embedding_batch_maximum_attempts"), 6, "embedding_batch_maximum_attempts"),
         (("source_network", "maximum_redirects"), 21, "maximum_redirects"),
     ),
 )
@@ -332,3 +333,18 @@ def test_knowledge_resource_budgets_have_code_level_caps(
 
     with pytest.raises(ConfigurationError, match=message):
         BackendSettings.from_file(_write(root, tmp_path / f"{section}.json"))
+
+
+@pytest.mark.parametrize("value", (999, 300_001))
+def test_embedding_read_timeout_has_code_level_bounds(tmp_path: Path, value: int) -> None:
+    """@brief embedding 独立超时不能过短或无限放大 / The dedicated embedding timeout cannot be too short or unbounded.
+
+    @param tmp_path pytest 临时目录 / pytest temporary directory.
+    @param value 越界超时毫秒数 / Out-of-bound timeout in milliseconds.
+    """
+
+    root = load_jsonc(PROJECT_ROOT / "example.jsonc")
+    root["ai"]["embedding_read_timeout_ms"] = value
+
+    with pytest.raises(ConfigurationError, match="embedding_read_timeout_ms"):
+        BackendSettings.from_file(_write(root, tmp_path / f"embedding-timeout-{value}.json"))
