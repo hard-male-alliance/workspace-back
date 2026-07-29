@@ -97,7 +97,6 @@ V2_INTERVIEW_ENDPOINT_METHODS = (
     "list_sessions",
     "create_session",
     "get_session",
-    "delete_session",
     "create_realtime_connection",
     "create_end_request",
     "get_transcript",
@@ -593,89 +592,6 @@ class InterviewApplicationService:
                 principal,
                 workspace_id,
                 InterviewPermission.READ_SESSION,
-                ResourceRef("interview_session", session_id),
-            )
-            session = await self._session(uow, workspace_id, session_id)
-            await uow.commit()
-            return session.view
-
-    async def delete_session(
-        self,
-        principal: TokenPrincipal,
-        workspace_id: WorkspaceId,
-        session_id: InterviewSessionId,
-        *,
-        expected_revision: int,
-        context: InterviewMutationContext,
-    ) -> None:
-        """@brief 永久删除终态面试会话 / Permanently delete a terminal Interview Session.
-
-        @param principal 当前认证主体 / Current authenticated principal.
-        @param workspace_id 会话所属工作区 / Owning Workspace.
-        @param session_id 待删除会话 / Session to delete.
-        @param expected_revision 调用方确认的精确版本 / Exact revision confirmed by the caller.
-        @param context 安全审计上下文 / Safe audit context.
-        @return 无返回值 / No return value.
-        """
-        try:
-            async with self._uow_factory() as uow:
-                await self._authorize(
-                    uow,
-                    principal,
-                    workspace_id,
-                    InterviewPermission.DELETE_SESSION,
-                    ResourceRef("interview_session", session_id),
-                )
-                session = await self._session(
-                    uow,
-                    workspace_id,
-                    session_id,
-                    for_update=True,
-                )
-                _require_revision(session.meta.revision, expected_revision)
-                if not session.view.status.is_terminal:
-                    raise InterviewConflict(
-                        "interview_session.delete_forbidden",
-                        "only a terminal Interview Session can be deleted",
-                    )
-                await uow.repository.delete_session(
-                    workspace_id,
-                    session_id,
-                    expected_revision=session.meta.revision,
-                )
-                await uow.audit.add(
-                    self._audit(
-                        principal,
-                        workspace_id,
-                        "interview_session.delete",
-                        ResourceRef("interview_session", session_id, session.meta.revision),
-                        context,
-                        self._clock.now(),
-                    )
-                )
-                await uow.commit()
-        except InterviewCasMismatch as error:
-            raise InterviewPreconditionFailed from error
-
-    async def get_session_for_delete(
-        self,
-        principal: TokenPrincipal,
-        workspace_id: WorkspaceId,
-        session_id: InterviewSessionId,
-    ) -> InterviewSessionView:
-        """@brief 以删除权限读取 If-Match 快照 / Read an If-Match snapshot under delete permission.
-
-        @param principal 当前认证主体 / Current authenticated principal.
-        @param workspace_id 会话所属工作区 / Owning Workspace.
-        @param session_id 待删除会话 / Session to delete.
-        @return 当前公开会话投影 / Current public Session projection.
-        """
-        async with self._uow_factory() as uow:
-            await self._authorize(
-                uow,
-                principal,
-                workspace_id,
-                InterviewPermission.DELETE_SESSION,
                 ResourceRef("interview_session", session_id),
             )
             session = await self._session(uow, workspace_id, session_id)

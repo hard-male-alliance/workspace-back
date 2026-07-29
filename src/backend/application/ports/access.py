@@ -421,9 +421,6 @@ WORKSPACE_AUTHORIZATION_MATRIX: dict[WorkspaceAction, _AuthorizationRule] = {
     WorkspaceAction.END_INTERVIEW_SESSION: _AuthorizationRule(
         _INTERVIEW_WRITE_SCOPE, _CONTENT_EDITOR_ROLES
     ),
-    WorkspaceAction.DELETE_INTERVIEW_SESSION: _AuthorizationRule(
-        _INTERVIEW_WRITE_SCOPE, _CONTENT_EDITOR_ROLES
-    ),
     WorkspaceAction.READ_INTERVIEW_TRANSCRIPT: _AuthorizationRule(
         _INTERVIEW_READ_SCOPE, _ALL_ROLES
     ),

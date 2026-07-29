@@ -245,7 +245,7 @@ def _job() -> Job:
 
 
 class _Service:
-    """@brief 记录 13 个 HTTP 用例调用的 fake service / Fake service recording the thirteen HTTP use cases."""
+    """@brief 记录 12 个 HTTP 用例调用的 fake service / Fake service recording the twelve HTTP use cases."""
 
     def __init__(self) -> None:
         self.scenario = _scenario()
@@ -295,13 +295,6 @@ class _Service:
     async def get_session(self, *_args: object) -> InterviewSessionView:
         self.calls.append("get_session")
         return self.session
-
-    async def get_session_for_delete(self, *_args: object) -> InterviewSessionView:
-        self.calls.append("get_session_for_delete")
-        return self.session
-
-    async def delete_session(self, *_args: object, **_kwargs: object) -> None:
-        self.calls.append("delete_session")
 
     async def create_realtime_connection(self, *_args: object) -> RealtimeConnection:
         self.calls.append("create_realtime_connection")
@@ -497,11 +490,11 @@ def _session_body() -> dict[str, object]:
     }
 
 
-def test_router_registers_exactly_thirteen_contract_routes() -> None:
-    """@brief 路由表必须 13/13 且状态正确 / Route table is exactly 13/13 with correct statuses."""
+def test_router_registers_exactly_twelve_contract_routes() -> None:
+    """@brief 路由表必须 12/12 且状态正确 / Route table is exactly 12/12 with correct statuses."""
     router = create_v2_interview_router(lambda _request: object())  # type: ignore[arg-type]
     routes = [route for route in router.routes if isinstance(route, APIRoute)]
-    assert len(routes) == 13
+    assert len(routes) == 12
     shapes = {(next(iter(route.methods)), route.path, route.status_code) for route in routes}
     assert ("POST", "/api/v2/workspaces/{workspace_id}/interview-scenarios", 201) in shapes
     assert (
@@ -514,29 +507,6 @@ def test_router_registers_exactly_thirteen_contract_routes() -> None:
         "/api/v2/workspaces/{workspace_id}/interview-sessions/{session_id}/report-jobs",
         202,
     ) in shapes
-    assert (
-        "DELETE",
-        "/api/v2/workspaces/{workspace_id}/interview-sessions/{session_id}",
-        204,
-    ) in shapes
-
-
-def test_delete_session_requires_a_strong_revision_and_returns_no_content() -> None:
-    """@brief 删除会话使用强 If-Match 并返回 204 / Session deletion uses strong If-Match and returns 204."""
-
-    harness = _harness()
-    path = f"/api/v2/workspaces/{WORKSPACE}/interview-sessions/{SESSION_ID}"
-    fetched = harness.client.get(path)
-
-    deleted = harness.client.delete(
-        path,
-        headers=_headers(etag=fetched.headers["etag"]),
-    )
-
-    assert deleted.status_code == 204
-    assert deleted.content == b""
-    assert "get_session_for_delete" in harness.service.calls
-    assert "delete_session" in harness.service.calls
 
 
 def test_all_twelve_routes_validate_and_project_exact_contract_shapes() -> None:

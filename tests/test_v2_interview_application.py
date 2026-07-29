@@ -120,8 +120,6 @@ from backend.domain.principals import (
 from backend.domain.resources import ResourceRef
 from backend.infrastructure.access import InMemoryAccessStore
 from backend.infrastructure.interview import (
-    InMemoryInterviewRepository,
-    InMemoryInterviewStore,
     InMemoryInterviewUnitOfWorkFactory,
     StaticInterviewSessionPolicy,
 )
@@ -304,41 +302,6 @@ class FakeRepository:
         if current is None or current.meta.revision != expected_revision:
             raise InterviewCasMismatch
         self.state.sessions[session.meta.id] = session
-
-    async def delete_session(
-        self,
-        workspace_id: WorkspaceId,
-        session_id: InterviewSessionId,
-        *,
-        expected_revision: int,
-    ) -> None:
-        """@brief 删除终态会话及测试存储中的关联状态 / Delete a terminal Session and associated test state."""
-        current = self.state.sessions.get(session_id)
-        if (
-            current is None
-            or current.workspace_id != workspace_id
-            or current.meta.revision != expected_revision
-        ):
-            raise InterviewCasMismatch
-        del self.state.sessions[session_id]
-        self.state.transcript.pop(session_id, None)
-        self.state.next_input_sequence.pop(session_id, None)
-        self.state.next_transcript_sequence.pop(session_id, None)
-        self.state.leases = {
-            key: value
-            for key, value in self.state.leases.items()
-            if value.workspace_id != workspace_id or value.session_id != session_id
-        }
-        self.state.realtime_inputs = {
-            key: value
-            for key, value in self.state.realtime_inputs.items()
-            if key[:2] != (workspace_id, session_id)
-        }
-        self.state.reports = {
-            key: value
-            for key, value in self.state.reports.items()
-            if value.workspace_id != workspace_id or value.session_id != session_id
-        }
 
     async def add_connection_lease(self, lease: RealtimeConnectionLease) -> None:
         self.state.leases[lease.id] = lease
@@ -943,151 +906,6 @@ async def test_session_creation_rejects_unconfigured_recording_before_persistenc
 
 
 @pytest.mark.asyncio
-async def test_delete_session_removes_only_a_terminal_session_and_associated_state() -> None:
-    """@brief 终态会话可永久删除且关联状态同时移除 / A terminal Session can be permanently deleted with associated state."""
-
-    state = State()
-    service, _worker, _gateway = _services(state)
-    scenario = await service.create_scenario(
-        PRINCIPAL,
-        WORKSPACE,
-        CreateInterviewScenarioCommand(_scenario_spec()),
-        CONTEXT,
-    )
-    active = await service.update_scenario(
-        PRINCIPAL,
-        WORKSPACE,
-        scenario.meta.id,
-        InterviewScenarioPatch({"status": InterviewScenarioStatus.ACTIVE}),
-        expected_revision=scenario.meta.revision,
-        context=CONTEXT,
-    )
-    created = await service.create_session(
-        PRINCIPAL,
-        WORKSPACE,
-        _session_command(active.meta.id),
-        CONTEXT,
-    )
-    terminal = (
-        state.sessions[created.meta.id]
-        .begin_end(
-            JobId("job_delete_session_0001"),
-            EndInterviewReason.USER_CANCELLED,
-            at=NOW + timedelta(seconds=1),
-        )
-        .finish_end(at=NOW + timedelta(seconds=2))
-    )
-    state.sessions[created.meta.id] = terminal
-
-    await service.delete_session(
-        PRINCIPAL,
-        WORKSPACE,
-        created.meta.id,
-        expected_revision=terminal.meta.revision,
-        context=CONTEXT,
-    )
-
-    assert created.meta.id not in state.sessions
-    assert created.meta.id not in state.transcript
-    assert created.meta.id not in state.next_input_sequence
-    assert created.meta.id not in state.next_transcript_sequence
-    assert state.permissions[-1].permission is InterviewPermission.DELETE_SESSION
-    assert state.audits[-1].action == "interview_session.delete"
-
-
-@pytest.mark.asyncio
-async def test_delete_session_rejects_a_non_terminal_session() -> None:
-    """@brief 非终态会话不得永久删除 / A non-terminal Session cannot be permanently deleted."""
-
-    state = State()
-    service, _worker, _gateway = _services(state)
-    scenario = await service.create_scenario(
-        PRINCIPAL,
-        WORKSPACE,
-        CreateInterviewScenarioCommand(_scenario_spec()),
-        CONTEXT,
-    )
-    active = await service.update_scenario(
-        PRINCIPAL,
-        WORKSPACE,
-        scenario.meta.id,
-        InterviewScenarioPatch({"status": InterviewScenarioStatus.ACTIVE}),
-        expected_revision=scenario.meta.revision,
-        context=CONTEXT,
-    )
-    created = await service.create_session(
-        PRINCIPAL,
-        WORKSPACE,
-        _session_command(active.meta.id),
-        CONTEXT,
-    )
-
-    with pytest.raises(InterviewConflict) as raised:
-        await service.delete_session(
-            PRINCIPAL,
-            WORKSPACE,
-            created.meta.id,
-            expected_revision=created.meta.revision,
-            context=CONTEXT,
-        )
-
-    assert raised.value.code == "interview_session.delete_forbidden"
-    assert created.meta.id in state.sessions
-
-
-@pytest.mark.asyncio
-async def test_in_memory_repository_deletes_session_owned_state_by_revision() -> None:
-    """@brief 内存仓储按 revision 删除会话拥有的状态 / In-memory persistence deletes Session-owned state by revision."""
-
-    state = State()
-    service, _worker, _gateway = _services(state)
-    scenario = await service.create_scenario(
-        PRINCIPAL,
-        WORKSPACE,
-        CreateInterviewScenarioCommand(_scenario_spec()),
-        CONTEXT,
-    )
-    active = await service.update_scenario(
-        PRINCIPAL,
-        WORKSPACE,
-        scenario.meta.id,
-        InterviewScenarioPatch({"status": InterviewScenarioStatus.ACTIVE}),
-        expected_revision=scenario.meta.revision,
-        context=CONTEXT,
-    )
-    created = await service.create_session(
-        PRINCIPAL,
-        WORKSPACE,
-        _session_command(active.meta.id),
-        CONTEXT,
-    )
-    terminal = (
-        state.sessions[created.meta.id]
-        .begin_end(
-            JobId("job_delete_repository01"),
-            EndInterviewReason.USER_CANCELLED,
-            at=NOW + timedelta(seconds=1),
-        )
-        .finish_end(at=NOW + timedelta(seconds=2))
-    )
-    store = InMemoryInterviewStore()
-    repository = InMemoryInterviewRepository(store)
-    await repository.add_session(terminal)
-
-    await repository.delete_session(
-        WORKSPACE,
-        terminal.meta.id,
-        expected_revision=terminal.meta.revision,
-    )
-
-    key = (WORKSPACE, terminal.meta.id)
-    assert key not in store.sessions
-    assert key not in store.transcript
-    assert key not in store.next_realtime_sequence
-    assert key not in store.next_transcript_sequence
-
-
-@pytest.mark.asyncio
 async def test_end_job_atomically_persists_media_analysis_for_report_evidence() -> None:
     """Audio-derived text is committed with its Artifact and consumed by the report."""
 
@@ -1385,19 +1203,8 @@ async def test_all_twelve_routes_and_workers_form_one_strict_lifecycle() -> None
         InterviewWorkerOperationId(f"interview.report:{report_job.meta.id}")
     ]
 
-    deletable = await service.get_session_for_delete(PRINCIPAL, WORKSPACE, session_id)
-    await service.delete_session(
-        PRINCIPAL,
-        WORKSPACE,
-        session_id,
-        expected_revision=deletable.meta.revision,
-        context=CONTEXT,
-    )
-    assert session_id not in state.sessions
-    assert report_id not in state.reports
-
-    assert len(V2_INTERVIEW_ENDPOINT_METHODS) == 13
-    assert len(set(V2_INTERVIEW_ENDPOINT_METHODS)) == 13
+    assert len(V2_INTERVIEW_ENDPOINT_METHODS) == 12
+    assert len(set(V2_INTERVIEW_ENDPOINT_METHODS)) == 12
     assert {request.permission for request in state.permissions} == set(InterviewPermission)
     assert all(request.workspace_id == WORKSPACE for request in state.permissions)
     assert state.active_transactions == 0

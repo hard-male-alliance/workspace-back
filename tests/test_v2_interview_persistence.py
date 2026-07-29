@@ -14,7 +14,6 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import psycopg
@@ -112,7 +111,6 @@ from backend.infrastructure.interview import (
     HmacInterviewRealtimeGateway,
     InterviewRealtimeSigningKey,
     InterviewRealtimeSigningKeyring,
-    PostgresInterviewRepository,
     PostgresInterviewUnitOfWorkFactory,
     _knowledge_grant_scopes,
 )
@@ -144,49 +142,6 @@ def test_interview_knowledge_scope_preserves_legacy_read_compatibility() -> None
         "interview_agent",
     )
     assert _knowledge_grant_scopes("resume_assistant") == ("resume_assistant",)
-
-
-@pytest.mark.asyncio
-async def test_postgres_delete_orders_dependants_before_the_terminal_session() -> None:
-    """@brief PostgreSQL 删除先清关联记录再按 revision 删除会话 / PostgreSQL deletion clears dependants before the revision-guarded Session."""
-
-    class RecordingSession:
-        """@brief 记录 SQL 语句的最小会话 / Minimal SQL-recording Session."""
-
-        def __init__(self) -> None:
-            """@brief 初始化语句列表 / Initialize the statement list."""
-            self.statements: list[Any] = []
-
-        async def execute(self, statement: Any) -> SimpleNamespace:
-            """@brief 记录语句并返回单行影响 / Record a statement and report one affected row."""
-            self.statements.append(statement)
-            return SimpleNamespace(rowcount=1)
-
-    class AllowScope:
-        """@brief 接受测试工作区的最小 scope / Minimal scope accepting the test Workspace."""
-
-        async def ensure_workspace(self, _workspace_id: WorkspaceId) -> None:
-            """@brief 接受工作区 / Accept the Workspace."""
-
-    sql = RecordingSession()
-    repository = PostgresInterviewRepository(sql, AllowScope())  # type: ignore[arg-type]
-
-    await repository.delete_session(
-        WorkspaceId("workspace_delete_session01"),
-        InterviewSessionId("session_delete_session01"),
-        expected_revision=4,
-    )
-
-    tables = [statement.table.fullname for statement in sql.statements]
-    assert tables == [
-        "interview.sessions",
-        "interview.report_evidence",
-        "interview.reports",
-        "interview.transcript_segments",
-        "interview.realtime_inputs",
-        "interview.realtime_connections",
-        "interview.sessions",
-    ]
 
 
 @dataclass(frozen=True, slots=True)
