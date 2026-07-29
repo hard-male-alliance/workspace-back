@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, cast
@@ -193,9 +194,14 @@ async def test_resume_search_timeout_returns_lexical_hits_within_online_budget(
         SearchFilters(MappingProxyType({})),
     )
 
-    with caplog.at_level("WARNING"):
-        async with asyncio.timeout(1):
-            response = await search.search(plan)
+    search_logger = logging.getLogger("backend.infrastructure.knowledge_search")
+    search_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level("WARNING", logger=search_logger.name):
+            async with asyncio.timeout(1):
+                response = await search.search(plan)
+    finally:
+        search_logger.removeHandler(caplog.handler)
 
     assert embedder.cancelled is True
     assert len(response.hits) == 1
