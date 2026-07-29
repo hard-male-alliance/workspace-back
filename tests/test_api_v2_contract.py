@@ -314,7 +314,7 @@ def test_openapi_contains_the_access_resume_platform_and_template_routes_impleme
     # vertical-slice gate deliberately checks its original slice as a subset; the dynamic
     # ``test_v2_route_contract`` gate is the single exact inventory derived from contract.md.
     assert expected_slice <= v2_methods
-    assert len(v2_methods) == 85
+    assert len(v2_methods) == 86
     assert paths["/api/v2/resume-templates"]["get"]["x-contract-response"] == "TemplateList"
     assert (
         paths["/api/v2/resume-templates/{template_id}"]["get"]["x-contract-response"]

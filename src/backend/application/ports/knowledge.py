@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import TracebackType
@@ -298,6 +300,21 @@ class UploadObjectStore(Protocol):
         @param upload_id 不透明上传标识 / Opaque upload identifier.
         @note 对象不存在必须视为成功；不得通过客户端 URL 或 ETag 定位删除目标 / A missing
             object is success; implementations must not locate deletion targets through client URLs or ETags.
+        """
+
+    def read(
+        self,
+        workspace_id: WorkspaceId,
+        upload_id: UploadSessionId,
+    ) -> AbstractAsyncContextManager[AsyncIterator[bytes]]:
+        """@brief 打开已验证上传对象的服务端字节流 / Open a server-side byte stream for a verified upload object.
+
+        @param workspace_id 对象所属 Workspace / Owning Workspace.
+        @param upload_id 不透明上传标识 / Opaque upload identifier.
+        @return 退出时关闭底层对象响应的异步上下文 / Async context closing the underlying object response on exit.
+        @note 调用者必须先完成 Workspace 与 KnowledgeSource 授权，不得由客户端 URL 定位对象 /
+            Callers must authorize the Workspace and KnowledgeSource first and never locate objects
+            through a client-supplied URL.
         """
 
 

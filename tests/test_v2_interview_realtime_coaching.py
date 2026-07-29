@@ -24,6 +24,7 @@ from backend.domain.knowledge_sources import (
 from backend.domain.principals import UserId, WorkspaceId
 from backend.infrastructure.interview_realtime_coaching import (
     ProviderRealtimeInterviewCoach,
+    RealtimeKnowledgeUse,
 )
 
 
@@ -112,7 +113,7 @@ async def test_followup_stream_uses_frozen_policy_and_visual_context() -> None:
         )
     ]
 
-    assert chunks == ["你如何", "验证该结论？"]
+    assert chunks == [RealtimeKnowledgeUse("not_selected", 0, 0), "你如何", "验证该结论？"]
     prompt, request = provider.calls[0]
     assert "慢查询日志" in prompt
     assert "候选人展示查询计划" in prompt
@@ -170,7 +171,10 @@ async def test_followup_stream_injects_authorized_knowledge_evidence() -> None:
         )
     ]
 
-    assert chunks == ["你如何", "验证该结论？"]
+    assert isinstance(chunks[0], RealtimeKnowledgeUse)
+    assert chunks[0].status == "hit"
+    assert chunks[0].hit_count == 1
+    assert chunks[1:] == ["你如何", "验证该结论？"]
     assert len(knowledge_search.plans) == 1
     assert knowledge_search.plans[0].agent_scope == "interview_coach"
     payload = json.loads(provider.calls[0][0])

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -22,9 +22,11 @@ from backend.application.knowledge import (
     CreateKnowledgeJobCommand,
     CreateKnowledgeSourceCommand,
     KnowledgeApplicationService,
+    KnowledgeOriginalContentDownload,
     UpdateKnowledgeSourceCommand,
 )
 from backend.application.ports.knowledge import KnowledgePage, KnowledgePageRequest
+from backend.application.ports.platform import ByteRangeRequest
 from backend.application.ports.v2_idempotency import (
     IdempotencyConflict,
     IdempotencyPreparationId,
@@ -496,6 +498,41 @@ class _FakeKnowledgeService:
         self._called("get_knowledge_source")
         return self.source
 
+    async def get_knowledge_source_original_content(
+        self,
+        principal: Any,
+        workspace_id: WorkspaceId,
+        source_id: KnowledgeSourceId,
+        *,
+        byte_range: ByteRangeRequest | None = None,
+    ) -> KnowledgeOriginalContentDownload:
+        """@brief 返回固定手工原文流 / Return a fixed manual original-content stream."""
+
+        del principal, workspace_id
+        self._called("get_knowledge_source_original_content")
+        source_input = self.source.source_input
+        assert isinstance(source_input, ManualSourceInput)
+        content = source_input.content.encode("utf-8")
+        selected = None if byte_range is None else byte_range.resolve(len(content))
+
+        async def chunks() -> AsyncIterator[bytes]:
+            """@brief 产出完整或选定正文 / Yield the complete or selected body."""
+
+            if selected is None:
+                yield content
+            else:
+                yield content[selected.first : selected.last_inclusive + 1]
+
+        return KnowledgeOriginalContentDownload(
+            source_id,
+            "manual-note.md",
+            "text/markdown; charset=utf-8",
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+            chunks(),
+            selected,
+        )
+
     async def get_knowledge_source_for_deletion(
         self,
         principal: Any,
@@ -894,7 +931,7 @@ def _evaluation_json() -> dict[str, object]:
 
 
 def test_router_exposes_exact_section_53_surface() -> None:
-    """@brief router 只暴露 5.3 冻结的 17 条路由 / Expose exactly the 17 frozen section-5.3 routes.
+    """@brief router 只暴露 5.3 冻结的 18 条路由 / Expose exactly the 18 frozen section-5.3 routes.
 
     @return 无返回值 / No return value.
     """
@@ -921,6 +958,10 @@ def test_router_exposes_exact_section_53_surface() -> None:
         (
             "GET",
             "/api/v2/workspaces/{workspace_id}/knowledge-sources/{source_id}",
+        ),
+        (
+            "GET",
+            "/api/v2/workspaces/{workspace_id}/knowledge-sources/{source_id}/original-content",
         ),
         (
             "PATCH",
@@ -1191,6 +1232,28 @@ def test_knowledge_source_crud_versions_cursor_binding_and_private_projection() 
         assert fetched.status_code == 200
         assert fetched.headers["etag"] == created.headers["etag"]
         harness.validator.validate_definition("KnowledgeSource", fetched.json())
+
+        original = harness.client.get(
+            f"/api/v2/workspaces/{WORKSPACE_ID}/knowledge-sources/{SOURCE_ID}/original-content",
+            headers=_headers(),
+        )
+        assert original.status_code == 200
+        assert original.content == private_content.encode("utf-8")
+        assert original.headers["accept-ranges"] == "bytes"
+        assert original.headers["cache-control"] == "private, no-store"
+        assert original.headers["content-type"] == "text/markdown; charset=utf-8"
+        assert original.headers["etag"].startswith('"sha256-')
+        assert "signature" not in original.text
+
+        original_range = harness.client.get(
+            f"/api/v2/workspaces/{WORKSPACE_ID}/knowledge-sources/{SOURCE_ID}/original-content",
+            headers={**_headers(), "Range": "bytes=7-12"},
+        )
+        assert original_range.status_code == 206
+        assert original_range.content == private_content.encode("utf-8")[7:13]
+        assert original_range.headers["content-range"] == (
+            f"bytes 7-12/{len(private_content.encode('utf-8'))}"
+        )
 
         patched = harness.client.patch(
             f"/api/v2/workspaces/{WORKSPACE_ID}/knowledge-sources/{SOURCE_ID}",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -551,6 +552,23 @@ class _UploadStore:
         """@brief 幂等删除测试上传对象 / Idempotently delete a test upload object."""
         del workspace_id, upload_id
 
+    @asynccontextmanager
+    async def read(
+        self,
+        workspace_id: WorkspaceId,
+        upload_id: UploadSessionId,
+    ) -> Any:
+        """@brief 打开固定测试原文字节流 / Open a fixed test original-content stream."""
+
+        del workspace_id, upload_id
+
+        async def chunks() -> Any:
+            """@brief 产出固定 12 字节正文 / Yield a fixed 12-byte body."""
+
+            yield b"hello world!"
+
+        yield chunks()
+
 
 @dataclass(slots=True)
 class _NetworkGuard:
@@ -814,8 +832,8 @@ def _service(environment: _Environment) -> KnowledgeApplicationService:
 
 
 @pytest.mark.asyncio
-async def test_all_seventeen_section_53_routes_have_working_application_use_cases() -> None:
-    """@brief 逐一执行 5.3 实际 17 个应用入口 / Execute every one of the 17 actual section-5.3 use cases.
+async def test_all_eighteen_section_53_routes_have_working_application_use_cases() -> None:
+    """@brief 逐一执行 5.3 实际 18 个应用入口 / Execute every one of the 18 actual section-5.3 use cases.
 
     @return 无返回值 / No return value.
     """
@@ -823,7 +841,7 @@ async def test_all_seventeen_section_53_routes_have_working_application_use_case
     service = _service(environment)
     principal = _principal()
 
-    assert len(V2_KNOWLEDGE_ENDPOINT_METHODS) == 17
+    assert len(V2_KNOWLEDGE_ENDPOINT_METHODS) == 18
     assert all(callable(getattr(service, method)) for method in V2_KNOWLEDGE_ENDPOINT_METHODS)
     assert (await service.list_connections(principal, _WORKSPACE_A)).items == ()
 
@@ -897,6 +915,12 @@ async def test_all_seventeen_section_53_routes_have_working_application_use_case
         _WORKSPACE_A,
         file_source.meta.id,
     )
+    original = await service.get_knowledge_source_original_content(
+        principal,
+        _WORKSPACE_A,
+        file_source.meta.id,
+    )
+    original_body = b"".join([chunk async for chunk in original.chunks])
     updated = await service.update_knowledge_source(
         principal,
         _WORKSPACE_A,
@@ -1010,6 +1034,7 @@ async def test_all_seventeen_section_53_routes_have_working_application_use_case
     assert completed_first.artifact_ref is not None
     assert listed_sources.items[0].workspace_id == _WORKSPACE_A
     assert fetched.meta.id == file_source.meta.id
+    assert original_body == b"hello world!"
     assert updated.name == "Interview notes v2"
     assert versions.items[0].snapshot.version_number == 1
     assert version_two.snapshot.version_number == 2

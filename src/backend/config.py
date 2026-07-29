@@ -401,6 +401,7 @@ class KnowledgeIndexSettings:
     chunk_max_characters: int
     chunk_overlap_characters: int
     embedding_batch_size: int
+    embedding_batch_maximum_attempts: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -570,6 +571,7 @@ class AISettings:
     embedding_dimension: int
     embedding_distance_metric: str
     embedding_normalization: str
+    embedding_read_timeout_ms: int
     provider_rate_limit: ProviderRateLimitSettings
     metering: MeteringSettings
 
@@ -816,6 +818,14 @@ class BackendSettings:
         embedding_provider = _require_string(ai, "embedding_provider")
         embedding_model = _require_string(ai, "embedding_model")
         embedding_model_revision = _require_string(ai, "embedding_model_revision")
+        embedding_read_timeout_ms = _bounded_positive_int(
+            ai,
+            "embedding_read_timeout_ms",
+            maximum=300_000,
+            label="ai",
+        )
+        if embedding_read_timeout_ms < 1_000:
+            raise ConfigurationError("ai.embedding_read_timeout_ms must be between 1000 and 300000")
         ai_base_url = _optional_string(ai.get("base_url"))
         api_key = _direct_optional_secret(ai, "api_key", "ai.api_key")
         if (ai_provider != "mock" or embedding_provider != "mock") and api_key is None:
@@ -929,6 +939,7 @@ class BackendSettings:
                 embedding_dimension=_require_positive_int(ai, "embedding_dimension"),
                 embedding_distance_metric=_require_string(ai, "embedding_distance_metric"),
                 embedding_normalization=_require_string(ai, "embedding_normalization"),
+                embedding_read_timeout_ms=embedding_read_timeout_ms,
                 provider_rate_limit=_provider_rate_limit_settings(
                     require_mapping(ai.get("provider_rate_limit"), "ai.provider_rate_limit")
                 ),
@@ -2675,6 +2686,7 @@ def _knowledge_index_settings(value: object) -> KnowledgeIndexSettings:
             "chunk_max_characters",
             "chunk_overlap_characters",
             "embedding_batch_size",
+            "embedding_batch_maximum_attempts",
         },
         "knowledge.index",
     )
@@ -2701,6 +2713,12 @@ def _knowledge_index_settings(value: object) -> KnowledgeIndexSettings:
         maximum=512,
         label="knowledge.index",
     )
+    embedding_batch_maximum_attempts = _bounded_positive_int(
+        mapping,
+        "embedding_batch_maximum_attempts",
+        maximum=5,
+        label="knowledge.index",
+    )
     if not 100 <= chunk_max_characters <= 50_000:
         raise ConfigurationError(
             "knowledge.index.chunk_max_characters must be between 100 and 50000"
@@ -2715,6 +2733,7 @@ def _knowledge_index_settings(value: object) -> KnowledgeIndexSettings:
         chunk_max_characters,
         chunk_overlap_characters,
         embedding_batch_size,
+        embedding_batch_maximum_attempts,
     )
 
 
