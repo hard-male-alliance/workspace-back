@@ -128,7 +128,9 @@
       "maximum_chunks": 10000,
       "chunk_max_characters": 800,
       "chunk_overlap_characters": 80,
-      "embedding_batch_size": 64
+      "embedding_batch_size": 64,
+      // 只重试当前 embedding 批次，避免一次瞬时失败重跑整个文档。
+      "embedding_batch_maximum_attempts": 2
     }
   },
   // Interview V2 realtime 凭据必须是独立、短期且绑定 audience 的 HMAC grant。
@@ -200,6 +202,8 @@
     "embedding_dimension": 1024,
     "embedding_distance_metric": "cosine",
     "embedding_normalization": "l2",
+    // embedding 批量请求通常比普通 API 慢；使用独立读取超时，避免放宽所有出站请求。
+    "embedding_read_timeout_ms": 60000,
     // 每个实际模型 endpoint 在单一 backend worker 内独立使用该并发/每分钟请求预算；超时返回可重试的 429。
     // 多 worker 部署需按 worker 数量向供应商申请配额，或在入口层补充全局配额。
     "provider_rate_limit": {

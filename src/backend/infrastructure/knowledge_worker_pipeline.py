@@ -6,8 +6,10 @@ embedding 均发生在事务外；未知来源没有隐式 fallback，必须由 
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Mapping
 from html.parser import HTMLParser
 from pathlib import PurePosixPath
@@ -49,6 +51,9 @@ from backend.infrastructure.knowledge_search import (
 )
 from backend.infrastructure.knowledge_uploads import UploadByteSource
 from backend.infrastructure.persistence.database import AsyncDatabase
+
+logger = logging.getLogger(__name__)
+"""@brief Knowledge 处理流水线的脱敏诊断 logger / Redacted diagnostics logger for the Knowledge pipeline."""
 
 
 class ExternalKnowledgeSourceAdapter(Protocol):
@@ -294,8 +299,13 @@ class KnowledgeIndexPipeline:
         chunk_max_characters: int,
         chunk_overlap_characters: int,
         embedding_batch_size: int = 64,
+        embedding_batch_maximum_attempts: int = 2,
     ) -> None:
-        """@brief 注入 parser、不可变模型身份与资源上限 / Inject parser, immutable model identity, and resource bounds."""
+        """@brief 注入 parser、不可变模型身份与资源上限 / Inject parser, immutable model identity, and resource bounds.
+
+        @param embedding_batch_maximum_attempts 单个 embedding 批次的瞬时失败尝试上限 /
+            Maximum attempts for transient failures of one embedding batch.
+        """
 
         if model_region not in {"cn", "global", "private_deployment"}:
             raise ValueError("Knowledge model region is invalid")
@@ -309,6 +319,8 @@ class KnowledgeIndexPipeline:
             raise ValueError("Knowledge chunk overlap is invalid")
         if not 1 <= embedding_batch_size <= 512:
             raise ValueError("Knowledge embedding batch size is invalid")
+        if not 1 <= embedding_batch_maximum_attempts <= 5:
+            raise ValueError("Knowledge embedding batch attempt count is invalid")
         self._parser = parser
         self._embedder = embedder
         self._selection = embedding_space
@@ -319,6 +331,7 @@ class KnowledgeIndexPipeline:
         self._chunk_max_characters = chunk_max_characters
         self._chunk_overlap_characters = chunk_overlap_characters
         self._embedding_batch_size = embedding_batch_size
+        self._embedding_batch_maximum_attempts = embedding_batch_maximum_attempts
 
     async def build(
         self,
@@ -352,7 +365,10 @@ class KnowledgeIndexPipeline:
         vectors: list[tuple[float, ...]] = []
         for offset in range(0, len(chunk_inputs), self._embedding_batch_size):
             texts = [item[0] for item in chunk_inputs[offset : offset + self._embedding_batch_size]]
-            batch = await self._embedder.embed(texts)
+            batch = await self._embed_batch_with_retry(
+                texts,
+                batch_ordinal=(offset // self._embedding_batch_size),
+            )
             if len(batch) != len(texts):
                 raise RuntimeError("embedding provider returned an incomplete batch")
             vectors.extend(
@@ -380,6 +396,46 @@ class KnowledgeIndexPipeline:
             chunks,
             space,
         )
+
+    async def _embed_batch_with_retry(
+        self,
+        texts: list[str],
+        *,
+        batch_ordinal: int,
+    ) -> list[tuple[float, ...]]:
+        """@brief 只重试当前瞬时失败批次 / Retry only the currently failing transient batch.
+
+        @param texts 当前批次的文本；永不写入日志 / Texts in the current batch; never logged.
+        @param batch_ordinal 从零开始的批次序号 / Zero-based batch ordinal.
+        @return 与输入顺序一致的向量 / Vectors preserving input order.
+        @raise DomainError 非瞬时失败或尝试耗尽时透传 / Propagated for non-transient failures
+            or exhausted attempts.
+        """
+
+        for attempt in range(1, self._embedding_batch_maximum_attempts + 1):
+            try:
+                return await self._embedder.embed(texts)
+            except DomainError as error:
+                if not error.problem.retryable or attempt >= self._embedding_batch_maximum_attempts:
+                    raise
+                logger.warning(
+                    "backend.knowledge.embedding_batch_retry",
+                    extra={
+                        "event_name": "backend.knowledge.embedding_batch_retry",
+                        "telemetry_attributes": {
+                            "operation": "knowledge_embedding",
+                            "outcome": "retried",
+                            "stage": "embedding",
+                            "error_code": error.problem.code,
+                            "attempt": attempt,
+                            "maximum_attempts": self._embedding_batch_maximum_attempts,
+                            "batch_ordinal": batch_ordinal,
+                            "batch_size": len(texts),
+                        },
+                    },
+                )
+                await asyncio.sleep(0.25 * attempt)
+        raise RuntimeError("Knowledge embedding retry loop terminated unexpectedly")
 
     async def _parse(self, material: KnowledgeMaterial) -> ParsedKnowledgeDocument:
         """@brief 对网页/feed/JSON 做安全文本化，其余交给文件 parser / Safely textify web/feed/JSON and delegate other formats to the file parser."""

@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from functools import wraps
 from typing import Concatenate, Protocol, cast
 
 from fastapi import APIRouter, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 from backend.api.v2_http import list_response
 from backend.api.v2_transport import (
@@ -35,6 +36,7 @@ from backend.api.v2_transport import (
     prepared_idempotent_response,
     problem_response,
     replayable_json,
+    request_id,
     require_idempotency_key,
     require_no_body,
     require_query,
@@ -53,6 +55,7 @@ from backend.application.knowledge import (
     KnowledgeApplicationError,
     KnowledgeApplicationService,
     KnowledgeConflict,
+    KnowledgeOriginalContentDownload,
     KnowledgePreconditionFailed,
     KnowledgeResourceNotFound,
     PreparedConnectionCreation,
@@ -63,6 +66,7 @@ from backend.application.knowledge import (
 )
 from backend.application.ports.access import AuthorizationDenied, UnknownPrincipal
 from backend.application.ports.knowledge import KnowledgePage, KnowledgePageRequest
+from backend.application.ports.platform import ByteRangeRequest, RangeNotSatisfiable
 from backend.application.ports.v2_idempotency import (
     IdempotencyPreparationId,
     ReplayableResponse,
@@ -141,6 +145,8 @@ _CONNECTION_SORT = ("id",)
 _SOURCE_SORT = ("id",)
 #: @brief KnowledgeSourceVersion 集合稳定排序 / Stable version collection ordering.
 _VERSION_SORT = ("version_number",)
+#: @brief 单 byte range 语法 / Single byte-range grammar.
+_BYTE_RANGE = re.compile(r"bytes=([0-9]*)-([0-9]*)\Z", flags=re.IGNORECASE | re.ASCII)
 #: @brief Knowledge boundary 可稳定映射的预期异常 / Expected errors with stable HTTP mappings.
 _KNOWLEDGE_BOUNDARY_ERRORS: tuple[type[Exception], ...] = (
     KnowledgeApplicationError,
@@ -333,6 +339,13 @@ class V2KnowledgeHttpAdapter:
                 self.get_knowledge_source,
                 None,
                 "KnowledgeSource",
+            ),
+            (
+                "GET",
+                "/api/v2/workspaces/{workspace_id}/knowledge-sources/{source_id}/original-content",
+                self.get_knowledge_source_original_content,
+                None,
+                None,
             ),
             (
                 "PATCH",
@@ -785,6 +798,59 @@ class V2KnowledgeHttpAdapter:
         payload = _knowledge_source(source)
         runtime.contracts_v2.validate_definition("KnowledgeSource", payload)
         return resource_response(request, payload)
+
+    @_translate_http_errors
+    async def get_knowledge_source_original_content(
+        self,
+        request: Request,
+        workspace_id: OpaquePath,
+        source_id: OpaquePath,
+    ) -> Response:
+        """@brief 流式读取调用者最初提交的 KnowledgeSource 内容 / Stream the originally submitted KnowledgeSource content.
+
+        @param request 已认证无 body request，可含唯一 Range / Authenticated bodyless request with an optional single Range.
+        @param workspace_id 路径 Workspace / Path Workspace.
+        @param source_id 来源标识 / Source identifier.
+        @return 完整 200、部分 206 或结构化 416 / Full 200, partial 206, or structured 416.
+        """
+
+        require_query(request)
+        await require_no_body(request)
+        runtime = self._resolve_runtime(request)
+        try:
+            download = await runtime.knowledge_v2.get_knowledge_source_original_content(
+                verified_principal(request),
+                WorkspaceId(workspace_id),
+                KnowledgeSourceId(source_id),
+                byte_range=_knowledge_byte_range(request),
+            )
+        except RangeNotSatisfiable as error:
+            response = problem_response(
+                request,
+                Problem(
+                    "http.range_not_satisfiable",
+                    416,
+                    "Requested byte range is not satisfiable",
+                ),
+                error=error,
+            )
+            response.headers["Accept-Ranges"] = "bytes"
+            response.headers["Content-Range"] = f"bytes */{error.total_size_bytes}"
+            return response
+
+        headers = _original_content_headers(request, download)
+        status_code = 200
+        if download.selected_range is not None:
+            selected = download.selected_range
+            status_code = 206
+            headers["Content-Range"] = (
+                f"bytes {selected.first}-{selected.last_inclusive}/{selected.total_size_bytes}"
+            )
+        return StreamingResponse(
+            download.chunks,
+            status_code=status_code,
+            headers=headers,
+        )
 
     @_translate_http_errors
     async def update_knowledge_source(
@@ -1545,6 +1611,70 @@ def _job_replay(runtime: V2KnowledgeRuntime, job: Job, workspace_id: str) -> Rep
         location=f"/api/v2/workspaces/{workspace_id}/jobs/{job.meta.id}",
         etag=True,
     )
+
+
+def _knowledge_byte_range(request: Request) -> ByteRangeRequest | None:
+    """@brief 严格解析 Knowledge 原文的唯一单 byte Range / Strictly parse one byte Range for Knowledge original content.
+
+    @param request 当前 request / Current request.
+    @return 未按内容长度解析的 range 或空 / Unresolved range or absence.
+    @raise DomainError Range 重复、多段或语法非法时抛出 / Raised for a duplicate, multipart, or malformed Range.
+    """
+
+    values = request.headers.getlist("Range")
+    if not values:
+        return None
+    if len(values) != 1 or len(values[0]) > 128:
+        raise _invalid_knowledge_range()
+    matched = _BYTE_RANGE.fullmatch(values[0])
+    if matched is None:
+        raise _invalid_knowledge_range()
+    first, last = matched.groups()
+    if not first and not last:
+        raise _invalid_knowledge_range()
+    try:
+        if not first:
+            return ByteRangeRequest(suffix_length=int(last))
+        return ByteRangeRequest(
+            first=int(first),
+            last_inclusive=int(last) if last else None,
+        )
+    except ValueError as error:
+        raise _invalid_knowledge_range() from error
+
+
+def _invalid_knowledge_range() -> DomainError:
+    """@brief 构造稳定 Range 语法错误 / Build a stable Range syntax error.
+
+    @return http.invalid_range DomainError / http.invalid_range DomainError.
+    """
+
+    return DomainError(Problem("http.invalid_range", 400, "Range header is invalid"))
+
+
+def _original_content_headers(
+    request: Request,
+    download: KnowledgeOriginalContentDownload,
+) -> dict[str, str]:
+    """@brief 构造原文流的安全响应头 / Build safe response headers for an original-content stream.
+
+    @param request 当前 request / Current request.
+    @param download 已授权下载描述 / Authorized download descriptor.
+    @return 不暴露对象存储地址的响应头 / Headers exposing no object-store address.
+    """
+
+    safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", download.filename, flags=re.ASCII)
+    safe_filename = safe_filename[:180] or f"{download.source_id}.bin"
+    return {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-store",
+        "Content-Disposition": f'inline; filename="{safe_filename}"',
+        "Content-Length": str(download.content_length),
+        "Content-Type": download.media_type,
+        "ETag": f'"sha256-{download.sha256}"',
+        "X-Content-Type-Options": "nosniff",
+        "X-Request-Id": request_id(request),
+    }
 
 
 def _knowledge_problem(error: BaseException) -> Problem:

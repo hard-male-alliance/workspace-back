@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 
 from backend.application.ports.knowledge_worker import (
@@ -39,6 +40,9 @@ _EVENT_PAYLOAD_FIELDS = frozenset({"actor_id", "subject", "data"})
 
 _SUBJECT_FIELDS = frozenset({"resource_type", "id", "revision"})
 """@brief payload subject 的封闭字段集 / Closed fields of a payload subject."""
+
+logger = logging.getLogger(__name__)
+"""@brief Knowledge worker 的脱敏阶段诊断 logger / Redacted stage diagnostics logger for the Knowledge worker."""
 
 
 class KnowledgeWorkerService:
@@ -146,9 +150,55 @@ class KnowledgeWorkerService:
             KnowledgeJobKind.KNOWLEDGE_SYNC,
         }:
             raise KnowledgeWorkerTerminalFailure("knowledge.job_kind_unsupported")
-        material = await self._material_loader.load(claim)
-        prepared = await self._index_builder.build(claim, material)
-        await self._store.complete_processing(claim, prepared)
+        try:
+            material = await self._material_loader.load(claim)
+        except Exception as error:
+            _record_stage_failure(claim, stage="material_load", error=error)
+            raise
+        try:
+            prepared = await self._index_builder.build(claim, material)
+        except Exception as error:
+            _record_stage_failure(claim, stage="index_build", error=error)
+            raise
+        try:
+            await self._store.complete_processing(claim, prepared)
+        except Exception as error:
+            _record_stage_failure(claim, stage="commit", error=error)
+            raise
+
+
+def _record_stage_failure(
+    claim: KnowledgeWorkerClaim,
+    *,
+    stage: str,
+    error: Exception,
+) -> None:
+    """@brief 记录不含来源内容的处理阶段失败 / Record a processing-stage failure without source content.
+
+    @param claim 已通过领域绑定校验的工作声明 / Worker claim validated against its domain binding.
+    @param stage 失败的封闭流水线阶段 / Closed pipeline stage that failed.
+    @param error 仅用于提取稳定错误码或异常类型 / Error used only for a stable code or type.
+    @return 无返回值 / No return value.
+    """
+
+    if isinstance(error, KnowledgeWorkerTerminalFailure):
+        error_code = error.code
+    else:
+        error_code = getattr(getattr(error, "problem", None), "code", type(error).__name__)
+    logger.warning(
+        "backend.knowledge.worker_stage_failed",
+        extra={
+            "event_name": "backend.knowledge.worker_stage_failed",
+            "telemetry_attributes": {
+                "operation": "knowledge_processing",
+                "outcome": "failed",
+                "stage": stage,
+                "error_code": error_code,
+                "job_id": str(claim.job_id),
+                "event_id": str(claim.event_id),
+            },
+        },
+    )
 
 
 def _job_id(dispatch: OutboxDispatchClaim) -> JobId:

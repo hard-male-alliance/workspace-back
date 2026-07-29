@@ -170,9 +170,7 @@ def _published_routes(contract_path: Path) -> tuple[_PublishedRoute, ...]:
         path, separator, query_template = target.partition("?")
         if separator:
             assert query_template, f"empty query template in {target}"
-        request_definition, response_definition, stream_definition = _binding_schemas(
-            binding
-        )
+        request_definition, response_definition, stream_definition = _binding_schemas(binding)
         owner = _SECTION_OWNER[section]
         if section == "5.2" and path.startswith("/api/v2/resume-templates"):
             owner = "templates"
@@ -341,24 +339,20 @@ def _duplicates[ItemT, KeyT: Hashable](
     return {item_key for item_key, count in counts.items() if count > 1}
 
 
-def test_published_contract_has_exactly_85_unique_routes_and_valid_schema_names() -> None:
-    """@brief 正式 Markdown 必须给出 85 条唯一且可解析的 schema route / Published Markdown exposes 85 unique schema-valid routes."""
+def test_published_contract_has_exactly_86_unique_routes_and_valid_schema_names() -> None:
+    """@brief 正式 Markdown 必须给出 86 条唯一且可解析的 schema route / Published Markdown exposes 86 unique schema-valid routes."""
 
     routes = _published_routes(_V2_DIRECTORY / "contract.md")
     definitions = _schema_definitions(_V2_DIRECTORY / "schema.jsonc")
-    assert len(routes) == 85
+    assert len(routes) == 86
     assert not _duplicates(routes, lambda route: route.key)
     assert Counter(route.method for route in routes) == {
-        "GET": 39,
+        "GET": 40,
         "POST": 32,
         "PATCH": 7,
         "DELETE": 7,
     }
-    mentioned = {
-        definition
-        for route in routes
-        for definition in route.mentioned_definitions
-    }
+    mentioned = {definition for route in routes for definition in route.mentioned_definitions}
     assert mentioned
     assert mentioned <= definitions
     assert {route.success_status for route in routes} == {200, 201, 202, 204}
@@ -372,21 +366,25 @@ def test_seven_routers_exactly_match_all_published_route_contracts() -> None:
     expected = {route.key: route for route in published}
     actual = {route.key: route for route in implemented}
 
-    assert len(implemented) == len(published) == 85
+    assert len(implemented) == len(published) == 86
     assert not _duplicates(implemented, lambda route: route.key)
     assert actual.keys() == expected.keys()
 
     expected_owner_counts = Counter(route.owner for route in published)
     actual_owner_counts = Counter(route.owner for route in implemented)
-    assert actual_owner_counts == expected_owner_counts == {
-        "templates": 2,
-        "access": 19,
-        "resumes": 14,
-        "knowledge": 17,
-        "agent": 12,
-        "interview": 12,
-        "platform": 9,
-    }
+    assert (
+        actual_owner_counts
+        == expected_owner_counts
+        == {
+            "templates": 2,
+            "access": 19,
+            "resumes": 14,
+            "knowledge": 18,
+            "agent": 12,
+            "interview": 12,
+            "platform": 9,
+        }
+    )
 
     for key, published_route in expected.items():
         implemented_route = actual[key]
@@ -401,9 +399,7 @@ def test_every_router_contract_extension_names_a_published_schema_definition() -
     definitions = _schema_definitions(_V2_DIRECTORY / "schema.jsonc")
     implemented = _implemented_routes(_routers())
     referenced = {
-        definition
-        for route in implemented
-        for definition in route.contract_metadata.values()
+        definition for route in implemented for definition in route.contract_metadata.values()
     }
     assert referenced
     assert referenced <= definitions
@@ -432,6 +428,6 @@ def test_application_mounts_each_published_v2_route_exactly_once() -> None:
     ]
     expected = [route.key for route in published]
 
-    assert len(mounted) == len(expected) == 85
+    assert len(mounted) == len(expected) == 86
     assert not _duplicates(mounted, lambda key: key)
     assert set(mounted) == set(expected)

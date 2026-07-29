@@ -41,7 +41,10 @@ from backend.domain.interview_v2 import (
 )
 from backend.domain.principals import WorkspaceId
 from backend.domain.resources import ResourceRef
-from backend.infrastructure.interview_realtime_coaching import RealtimeInterviewCoach
+from backend.infrastructure.interview_realtime_coaching import (
+    RealtimeInterviewCoach,
+    RealtimeKnowledgeUse,
+)
 from workspace_shared.ids import new_opaque_id
 
 router_interview_realtime = APIRouter()
@@ -651,13 +654,25 @@ async def _stream_followup(
         raise RuntimeError("realtime coaching context is invalid")
     await websocket.send_json({"type": "interviewer_start", "in_reply_to": str(input_id)})
     chunks: list[str] = []
-    async for chunk in coach.stream_followup(
+    async for event in coach.stream_followup(
         context,
         candidate_text,
         visual_observation,
         tuple(live_history[-40:]),
         operation_id=f"{input_id}:followup",
     ):
+        if isinstance(event, RealtimeKnowledgeUse):
+            await websocket.send_json(
+                {
+                    "type": "knowledge_retrieval",
+                    "in_reply_to": str(input_id),
+                    "status": event.status,
+                    "hit_count": event.hit_count,
+                    "elapsed_ms": event.elapsed_ms,
+                }
+            )
+            continue
+        chunk = event
         chunks.append(chunk)
         await websocket.send_json(
             {

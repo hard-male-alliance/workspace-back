@@ -12,7 +12,7 @@ import hashlib
 import hmac
 import re
 import secrets
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -34,6 +34,7 @@ from backend.application.ports.knowledge import (
     UploadObjectStore,
     UploadVerificationRejected,
 )
+from backend.application.ports.platform import ByteRangeRequest, ContentRange
 from backend.application.ports.v2_idempotency import (
     IdempotencyConflict,
     IdempotencyPreparationId,
@@ -87,6 +88,7 @@ from backend.domain.knowledge_sources import (
     KnowledgeSourceVersion,
     KnowledgeSourceVersionId,
     KnowledgeVisibilityPolicy,
+    ManualSourceInput,
     ResumeSourceInput,
     UrlSourceInput,
 )
@@ -120,6 +122,7 @@ V2_KNOWLEDGE_ENDPOINT_METHODS = (
     "list_knowledge_sources",
     "create_knowledge_source",
     "get_knowledge_source",
+    "get_knowledge_source_original_content",
     "update_knowledge_source",
     "delete_knowledge_source",
     "list_knowledge_source_versions",
@@ -131,7 +134,7 @@ V2_KNOWLEDGE_ENDPOINT_METHODS = (
     "search_knowledge",
     "evaluate_knowledge_access",
 )
-"""@brief 5.3 实际 17 个路由对应的应用方法 / Application methods for the 17 actual section-5.3 routes."""
+"""@brief 5.3 实际 18 个路由对应的应用方法 / Application methods for the 18 actual section-5.3 routes."""
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 """@brief 专用幂等摘要语法 / Dedicated-idempotency digest grammar."""
@@ -408,6 +411,52 @@ class PreparedUploadCompletion:
     operation_id: UploadVerificationId
     claim: UploadCompletionClaim = field(repr=False)
     evidence: VerifiedUpload = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeOriginalContentDownload:
+    """@brief 已授权 KnowledgeSource 原始内容下载 / Authorized KnowledgeSource original-content download.
+
+    @param source_id 已授权来源 / Authorized source.
+    @param filename 安全投影前的原文件名 / Original filename before safe header projection.
+    @param media_type 已验证媒体类型 / Verified media type.
+    @param total_size_bytes 完整原始内容字节数 / Complete original-content byte count.
+    @param sha256 完整内容摘要 / Complete-content digest.
+    @param chunks 当前响应范围的异步字节块 / Async byte chunks for the selected response range.
+    @param selected_range 实际单 byte range；完整响应为空 / Resolved single byte range, absent for a full response.
+    """
+
+    source_id: KnowledgeSourceId
+    filename: str
+    media_type: str
+    total_size_bytes: int
+    sha256: str
+    chunks: AsyncIterator[bytes] = field(repr=False)
+    selected_range: ContentRange | None = None
+
+    def __post_init__(self) -> None:
+        """@brief 校验下载描述不变量 / Validate download-descriptor invariants.
+
+        @raise ValueError 文件名、媒体类型、大小或摘要非法时抛出 / Raised for invalid filename, media type, size, or digest.
+        """
+
+        if (
+            not self.filename
+            or self.filename.strip() != self.filename
+            or not self.media_type
+            or self.total_size_bytes < 1
+            or _SHA256_HEX.fullmatch(self.sha256) is None
+        ):
+            raise ValueError("knowledge original-content download is invalid")
+
+    @property
+    def content_length(self) -> int:
+        """@brief 返回当前响应内容长度 / Return the selected response content length.
+
+        @return 完整大小或 range 长度 / Full size or selected-range length.
+        """
+
+        return self.total_size_bytes if self.selected_range is None else self.selected_range.length
 
 
 class KnowledgeApplicationService:
@@ -939,6 +988,104 @@ class KnowledgeApplicationService:
                 uow, principal, workspace_id, WorkspaceAction.READ_KNOWLEDGE_SOURCE
             )
             return await self._require_source(uow.repository, workspace_id, source_id)
+
+    async def get_knowledge_source_original_content(
+        self,
+        principal: TokenPrincipal,
+        workspace_id: WorkspaceId,
+        source_id: KnowledgeSourceId,
+        *,
+        byte_range: ByteRangeRequest | None = None,
+    ) -> KnowledgeOriginalContentDownload:
+        """@brief 授权并打开最初提交的手工正文或上传文件 / Authorize and open the originally submitted manual body or uploaded file.
+
+        @param principal 已验证 token principal / Verified token principal.
+        @param workspace_id 路径 Workspace / Path Workspace.
+        @param source_id 路径 KnowledgeSource / Path KnowledgeSource.
+        @param byte_range 可选唯一单 byte range / Optional unresolved single byte range.
+        @return 带强摘要、媒体类型与关闭安全流的下载描述 / Download descriptor with a strong digest, media type, and close-safe stream.
+        @raise KnowledgeConflict 来源类型不支持、正在删除或原对象不可用时抛出 /
+            Raised when the source type is unsupported, deleting, or its original object is unavailable.
+        """
+
+        async with self._uow_factory() as uow:
+            await self._authorize(
+                uow,
+                principal,
+                workspace_id,
+                WorkspaceAction.READ_KNOWLEDGE_SOURCE,
+            )
+            source = await self._require_source(uow.repository, workspace_id, source_id)
+            if source.ingestion.status in {
+                KnowledgeIngestionStatus.DELETING,
+                KnowledgeIngestionStatus.DELETED,
+            }:
+                raise KnowledgeConflict(
+                    "knowledge_source.original_content_unavailable",
+                    "knowledge source original content is unavailable during deletion",
+                )
+            if isinstance(source.source_input, ManualSourceInput):
+                content = source.source_input.content.encode("utf-8")
+                filename = f"{source.meta.id}.md"
+                media_type = "text/markdown; charset=utf-8"
+                digest = hashlib.sha256(content).hexdigest()
+                selected = None if byte_range is None else byte_range.resolve(len(content))
+                return KnowledgeOriginalContentDownload(
+                    source.meta.id,
+                    filename,
+                    media_type,
+                    len(content),
+                    digest,
+                    _single_content_chunk(content, selected),
+                    selected,
+                )
+            if not isinstance(source.source_input, FileSourceInput):
+                raise KnowledgeConflict(
+                    "knowledge_source.original_content_unsupported",
+                    "knowledge source type does not retain caller-submitted original content",
+                )
+            upload = await self._require_upload(
+                uow.repository,
+                workspace_id,
+                source.source_input.upload_session_id,
+            )
+            file_filename = source.public_config.filename
+            file_media_type = source.public_config.media_type
+            if file_filename is None or file_media_type is None:
+                raise AssertionError("file source must carry verified public file metadata")
+            declaration = upload.declaration
+            selected = None if byte_range is None else byte_range.resolve(declaration.size_bytes)
+
+        manager = self._upload_store.read(
+            workspace_id,
+            source.source_input.upload_session_id,
+        )
+        try:
+            chunks = await manager.__aenter__()
+        except UploadVerificationRejected as error:
+            raise KnowledgeConflict(
+                "knowledge_source.original_content_unavailable",
+                "knowledge source original content is unavailable",
+            ) from error
+
+        async def selected_chunks() -> AsyncIterator[bytes]:
+            """@brief 选择 range 并确保退出对象存储上下文 / Select the range and always exit the object-store context."""
+
+            try:
+                async for chunk in _selected_content_chunks(chunks, selected):
+                    yield chunk
+            finally:
+                await manager.__aexit__(None, None, None)
+
+        return KnowledgeOriginalContentDownload(
+            source.meta.id,
+            file_filename,
+            file_media_type,
+            declaration.size_bytes,
+            declaration.sha256,
+            selected_chunks(),
+            selected,
+        )
 
     async def update_knowledge_source(
         self,
@@ -1985,6 +2132,51 @@ class KnowledgeApplicationService:
             raise PermissionError("hybrid search returned a hit outside its authorized plan")
 
 
+async def _single_content_chunk(
+    content: bytes,
+    selected_range: ContentRange | None,
+) -> AsyncIterator[bytes]:
+    """@brief 产出手工正文的完整或选定字节 / Yield a complete or selected manual-note body.
+
+    @param content 完整 UTF-8 正文 / Complete UTF-8 body.
+    @param selected_range 可选已解析 range / Optional resolved range.
+    @return 单块异步字节流 / Single-chunk async byte stream.
+    """
+
+    if selected_range is None:
+        yield content
+        return
+    yield content[selected_range.first : selected_range.last_inclusive + 1]
+
+
+async def _selected_content_chunks(
+    chunks: AsyncIterator[bytes],
+    selected_range: ContentRange | None,
+) -> AsyncIterator[bytes]:
+    """@brief 从完整对象流选择连续 byte range / Select a contiguous byte range from a full object stream.
+
+    @param chunks 完整对象字节流 / Full-object byte stream.
+    @param selected_range 可选已解析 range / Optional resolved range.
+    @return 保持原字节次序的选定流 / Selected stream preserving original byte order.
+    """
+
+    first = 0 if selected_range is None else selected_range.first
+    last = None if selected_range is None else selected_range.last_inclusive
+    offset = 0
+    async for chunk in chunks:
+        next_offset = offset + len(chunk)
+        if next_offset <= first:
+            offset = next_offset
+            continue
+        start = max(first - offset, 0)
+        end = len(chunk) if last is None else min(len(chunk), last - offset + 1)
+        if start < end:
+            yield chunk[start:end]
+        offset = next_offset
+        if last is not None and offset > last:
+            return
+
+
 def _prepared_resource_id(prefix: str, operation_id: IdempotencyPreparationId) -> str:
     """@brief 从稳定准备 ID 派生确定性资源 ID / Derive a deterministic resource ID from a stable preparation ID.
 
@@ -2013,6 +2205,7 @@ __all__ = [
     "KnowledgeApplicationError",
     "KnowledgeApplicationService",
     "KnowledgeConflict",
+    "KnowledgeOriginalContentDownload",
     "KnowledgePreconditionFailed",
     "KnowledgeResourceNotFound",
     "PreparedConnectionCreation",
